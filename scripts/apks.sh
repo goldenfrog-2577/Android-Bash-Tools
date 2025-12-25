@@ -6,12 +6,28 @@
 # 'install-multiple' в системе.
 # Скрипт выполняется в среде Android (например, через adb shell).
 
+# Логика поиска директории. Обязательна перед запуском основной части скрипта
+echo "[?] Укажи директорию для поиска .apk / .apks файлов:"
+printf "[»] " && read -r USER_DIR
+
+# Пустой ввод — сразу ошибка
+if [ -z "$USER_DIR" ]; then
+	echo "[!] Директория не указана"
+	exit 1
+fi
+
+# Проверка существования
+if [ ! -d "$USER_DIR" ]; then
+	echo "[!] Такой директории не существует: $USER_DIR"
+	exit 1
+fi
+
 # --- Конфигурация Директорий ---
 # Директория для сохранения логов неудачных установок.
 # Использует скрытую папку на внутренней памяти.
 LOG_DIR="/sdcard/.My Folder/logs"
 # Исходная директория, откуда будут браться APK/APKS файлы.
-SRC_DIR="/storage/emulated/0/Download"
+SRC_DIR="${USER_DIR%/}"
 # Временная директория для копирования файлов перед установкой.
 # /data/local/tmp часто доступна для записи и предпочтительна для временных файлов.
 TMP_DIR="/data/local/tmp"
@@ -81,7 +97,7 @@ for file in "$SRC_DIR"/*.apk "$SRC_DIR"/*.apks; do
 
 			# Выполнение установки с использованием install-multiple.
 			# --staged: требуется для установки нескольких файлов, чтобы они применялись атомарно.
-			output=$(pm install-multiple --staged $apk_files 2>&1)
+			output=$(pm install-multiple $apk_files 2>&1)
 			# Очистка временной директории для извлеченных APK.
 			rm -rf "$TMP_DIR/apks_extract"
 		else
@@ -180,6 +196,7 @@ done
 # Проверка флага 'found', чтобы сообщить, если не было найдено ни одного файла.
 if ! $found; then
 	echo "[!] Нет файлов .apk или .apks в $SRC_DIR"
+	exit 1
 fi
 
 echo
