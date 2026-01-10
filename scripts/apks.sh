@@ -50,11 +50,83 @@ fi
 echo
 echo "[*] Поиск .apk и .apks файлов в $SRC_DIR..."
 
+# --- Подсчёт файлов ---
+# Ищем все файлы с расширениями .apk и .apks в исходной директории.
+# Ошибки (если файлов нет) перенаправляем в /dev/null, чтобы не мусорить в консоли.
+APK_LIST=$(ls "$SRC_DIR"/*.apk "$SRC_DIR"/*.apks 2>/dev/null)
+
+# Считаем количество строк в списке (количество файлов).
+# tr -d ' ' убирает лишние пробелы, которые может выдать wc на некоторых системах.
+APK_COUNT=$(echo "$APK_LIST" | wc -l | tr -d ' ')
+
+# Проверяем, не пуст ли список. Если файлов нет, выводим предупреждение и выходим.
+if [ "$APK_COUNT" -eq 0 ]; then
+    echo "[!] Нет файлов .apk или .apks в $SRC_DIR"
+    exit 1
+fi
+
+echo "[*] Найдено файлов: $APK_COUNT"
+
+# Устанавливаем режим установки по умолчанию и инициализируем переменную для выбранных файлов.
+INSTALL_MODE="all"
+SELECTED_FILES=""
+
+# Логика для случая, если найден всего ОДИН файл.
+if [ "$APK_COUNT" -eq 1 ]; then
+    echo "[?] Найден один файл. Установить? (y/n)"
+    printf "[»] " && read -r confirm
+    case "$confirm" in
+        y|Y) INSTALL_MODE="single" ;; # Подтверждено: ставим один файл.
+        *) echo "[!] Отменено пользователем."; exit 0 ;; # Отказ: завершаем работу.
+    esac
+else
+    # Логика для нескольких файлов: выводим список с номерами для выбора.
+    echo "[?] Найдено несколько файлов:"
+    i=1
+    for f in $APK_LIST; do
+        # basename "$f" выводит только имя файла, отсекая полный путь.
+        echo "  [$i] $(basename "$f")"
+        i=$((i+1))
+    done
+
+    echo
+    echo "[?] Установить все файлы? (y/n)"
+    printf "[»] " && read -r confirm_all
+
+    # Если пользователь хочет поставить всё сразу.
+    if [ "$confirm_all" = "y" ] || [ "$confirm_all" = "Y" ]; then
+        INSTALL_MODE="all"
+    else
+        # Режим выборочной установки.
+        INSTALL_MODE="select"
+        echo "[?] Введи номера файлов через пробел (например: 1 3 5):"
+        printf "[»] " && read -r nums
+
+        # Проходим циклом по введенным номерам.
+        for n in $nums; do
+            # Извлекаем n-ую строку из общего списка файлов и добавляем её в SELECTED_FILES.
+            SELECTED_FILES="$SELECTED_FILES $(echo "$APK_LIST" | sed -n "${n}p")"
+        done
+
+        # Если в итоге список выбранных файлов пуст (например, ввели буквы вместо цифр).
+        if [ -z "$SELECTED_FILES" ]; then
+            echo "[!] Ничего не выбрано."
+            exit 1
+        fi
+    fi
+fi
+
 found=false # Флаг для отслеживания, были ли найдены файлы
 
 # --- Основной Цикл Обработки Файлов ---
 # Итерация по всем .apk и .apks файлам в исходной директории.
-for file in "$SRC_DIR"/*.apk "$SRC_DIR"/*.apks; do
+if [ "$INSTALL_MODE" = "select" ]; then
+    FILES="$SELECTED_FILES"
+else
+    FILES="$APK_LIST"
+fi
+
+for file in $FILES; do
 	# Проверка, что файл существует. Важно для случая, когда шаблон не находит файлов.
 	[ -f "$file" ] || continue
 	found=true
