@@ -88,6 +88,8 @@ Options:
   -q, --quiet             Quiet mode: suppress terminal output (log file only)
   -n, --no-logcat         Skip Logcat error scanning (faster execution)
   -l, --loop <seconds>    Run monitor continuously with a delay of X seconds
+  -c, --clear-log         Clear the content of the log file without deleting it
+    
 
 Exit codes:
   0  OK (No issues detected)
@@ -136,10 +138,14 @@ print_header() {
 	slot="$(getprop ro.boot.slot_suffix)"
 	# Если слот пустой (-z), пишем "unknown".
 	[ -z "$slot" ] && slot="unknown"
+	
+	# Получаем кодовое имя устройства (например, alioth)
+	codename="$(getprop ro.product.device)"
+	[ -z "$codename" ] && codename="unknown"
 
 	echo "========================================"
 	echo "ANDROID ROOT SYSTEM MONITOR"
-	echo "Device: $(getprop ro.product.model)"       # Модель телефона
+	echo "Device: $(getprop ro.product.model) ($codename)"       # Модель телефона
 	echo "Android: $(getprop ro.build.version.release)" # Версия Android
 	echo "Kernel: $(uname -r)"                        # Версия ядра Linux
 	echo "Active slot: $slot"
@@ -155,24 +161,28 @@ quiet_hint() {
 
 # Проверка места на накопителе (/data).
 check_storage() {
+    local use size used avail percent _
 	echo
 	echo "=== STORAGE (/data) ==="
 	quiet_hint
 
-	# df -h /data показывает место. tail -1 берет последнюю строку (с цифрами).
-	# while read ... читает строку и разбивает её на переменные.
-	# _ (нижнее подчеркивание) используется для игнорирования ненужных колонок.
+	# Читаем вывод df.
 	df -h /data | tail -1 | while read -r _ size used avail percent _; do
-		use=${percent%\%} # Удаляем знак '%' из значения (например, "45%" -> "45").
-		log "Total: $size | Used: $used | Free: $avail"
+		use=${percent%\%} 
+		
+		# Красивое форматирование: заменяем 'G' на ' GB', чтобы было "106 GB" вместо "106G"
+		# Используем Bash-замену: ${переменная//что/на_что}
+		local f_size=${size//G/ GB}
+		local f_used=${used//G/ GB}
+		local f_avail=${avail//G/ GB}
 
-		# Сравниваем числа (-ge = greater or equal / больше или равно).
+		log "Total: $f_size | Used: $f_used | Free: $f_avail"
+
 		if [ "$use" -ge "$DISK_CRIT" ]; then
 			log "${RED}CRITICAL: Usage ${percent}${NC}"
 			SYSTEM_STATUS=$EXIT_CRITICAL
 		elif [ "$use" -ge "$DISK_WARN" ]; then
 			log "${YELLOW}WARNING: Usage ${percent}${NC}"
-			# Обновляем статус системы только если он еще не критический (чтобы не понизить статус).
 			[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
 		else
 			log "${GREEN}OK: Usage ${percent}${NC}"
@@ -182,20 +192,38 @@ check_storage() {
 
 # Проверка оперативной памяти (RAM).
 check_memory() {
+    local total avail used percent avail_mb total_gb
+    local z_total z_free z_used
 	echo
 	echo "=== MEMORY ==="
 	quiet_hint
 
-	# Читаем данные из системного файла /proc/meminfo с помощью awk.
+	# Читаем данные из системного файла /proc/meminfo
 	total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 	avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
 	
-	# Математические вычисления в bash делаются через $(( ... )).
-	used=$((total - avail))
-	percent=$((used * 100 / total)) # Вычисляем процент занятой памяти
-	avail_mb=$((avail / 1024))      # Переводим килобайты в мегабайты
+	# Вычисляем общий объем в ГБ (с одной цифрой после запятой через awk для красоты)
+	total_gb=$(awk "BEGIN {printf \"%.1f\", $total / 1024 / 1024}")
+	
+	# Выводим общую информацию
+	log "Total RAM: ${total_gb} GB"
+	
+    # Zram & Swap
+	z_total=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
+	z_free=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
+	
+	if [ "$z_total" -gt 0 ]; then
+		z_used=$(( (z_total - z_free) / 1024 ))
+		z_total_mb=$(( z_total / 1024 ))
+		log "ZRAM: ${z_used} MB used / ${z_total_mb} MB total"
+	fi
 
-	# Логика проверки порогов (аналогично диску).
+	# Математические вычисления
+	used=$((total - avail))
+	percent=$((used * 100 / total)) 
+	avail_mb=$((avail / 1024))      
+
+	# Логика проверки порогов
 	if [ "$percent" -ge "$RAM_CRIT" ]; then
 		log "${RED}CRITICAL: RAM ${percent}% (${avail_mb}MB free)${NC}"
 		SYSTEM_STATUS=$EXIT_CRITICAL
@@ -209,14 +237,23 @@ check_memory() {
 
 # Проверка загрузки процессора (CPU).
 check_cpu() {
+    local cores load warn crit
 	echo
 	echo "=== CPU ==="
 	quiet_hint
+	
+	# Получаем имя процессора из свойств системы
+	cpu_name=$(getprop ro.soc.model)
+	[ -z "$cpu_name" ] && cpu_name=$(getprop ro.board.platform)
+	
+	cores=$(grep -c processor /proc/cpuinfo)
+	load=$(awk '{print $1}' /proc/loadavg)
 
 	# Считаем количество ядер процессора. grep -c считает строки.
 	cores=$(grep -c processor /proc/cpuinfo)
 	# Читаем среднюю загрузку (Load Average) за последнюю минуту из /proc/loadavg.
 	load=$(awk '{print $1}' /proc/loadavg)
+	log "Model: $cpu_name"
 	log "Load: $load | Cores: $cores"
 
 	# Bash не умеет сравнивать дробные числа (float), поэтому используем awk.
@@ -237,6 +274,7 @@ check_cpu() {
 
 # Проверка температуры процессора.
 check_cpu_temp() {
+    local max=0 z type raw t b
 	echo
 	echo "=== CPU TEMP ==="
 	quiet_hint
@@ -385,14 +423,49 @@ check_gpu() {
 # Проверка батареи.
 check_battery() {
 	echo
-	echo "=== BATTERY ==="
+	echo "=== BATTERY & HEALTH ==="
 	quiet_hint
 
-	b=/sys/class/power_supply/battery
-	# Если папки нет, выходим.
-	[ ! -d "$b" ] && return
-	# Читаем сразу несколько файлов: емкость, статус, температуру (делим на 10), напряжение (делим на 1000 для мВ).
-	log "Battery: $(cat $b/capacity)% | $(cat $b/status) | $(( $(cat $b/temp)/10 ))°C | $(( $(cat $b/voltage_now)/1000 ))mV"
+	# Объявляем локальные переменные для безопасности
+	local b="/sys/class/power_supply/battery"
+	local cap status temp volt health cycles health_pct
+
+	# Если папка не существует, выходим
+	[ ! -d "$b" ] && log "Battery data: unavailable" && return
+
+	# Собираем базовые данные
+	cap=$(cat "$b/capacity" 2>/dev/null)
+	status=$(cat "$b/status" 2>/dev/null)
+	temp=$(( $(cat "$b/temp" 2>/dev/null) / 10 ))
+	volt=$(( $(cat "$b/voltage_now" 2>/dev/null) / 1000 ))
+	
+	# Собираем данные об износе
+	health=$(cat "$b/health" 2>/dev/null)
+	cycles=$(cat "$b/cycle_count" 2>/dev/null)
+	[ -z "$cycles" ] && cycles="N/A"
+
+	# Пытаемся рассчитать состояние в % (если система отдает данные о емкости)
+	# charge_full (текущая макс. емкость) / charge_full_design (заводская емкость)
+	local full=$(cat "$b/charge_full" 2>/dev/null)
+	local design=$(cat "$b/charge_full_design" 2>/dev/null)
+	
+	if [ -n "$full" ] && [ -n "$design" ] && [ "$design" -gt 0 ]; then
+		health_pct=$(( full * 100 / design ))
+		health="$health ($health_pct%)"
+	fi
+
+	# Вывод информации
+	log "Status:   $status ($cap%)"
+	log "Health:   $health"
+	log "Cycles:   $cycles"
+	log "Temp:     ${temp}°C"
+	log "Voltage:  ${volt}mV"
+
+	# Проверка на критический перегрев батареи
+	if [ "$temp" -gt 45 ]; then
+		log "${RED}WARNING: Battery overheating! (${temp}°C)${NC}"
+		[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
+	fi
 }
 
 # Проверка интернета.
@@ -413,6 +486,7 @@ check_network() {
 
 # Анализ ошибок в системном журнале Android (logcat).
 check_logcat() {
+    local c s
 	echo
 	echo "=== LOGCAT ERRORS ==="
 	> "$ERR_LOG" # Очищаем файл ошибок перед записью.
@@ -440,13 +514,16 @@ check_logcat() {
 	log "${YELLOW}⚠ Detected $c errors. Showing last $s:${NC}"
 	echo "----------------------------------------"
 	# Показываем последние s строк, добавляя "> " в начало каждой для красоты.
-	tail -n "$s" "$ERR_LOG" | awk '{print "  > " $0}'
+	tail -n "$s" "$ERR_LOG" | while read -r line; do
+        log "  > $line"
+    done
 	echo "----------------------------------------"
 	log "Full history: cat $ERR_LOG"
 }
 
 # Вывод топ процессов по потреблению CPU.
 print_top() {
+    local p c cpu m
 	echo
 	echo "=== TOP PROCESSES ==="
 	quiet_hint
@@ -469,10 +546,48 @@ print_top() {
 # Статистика ввода/вывода (I/O).
 print_io() {
 	echo
-	echo "=== I/O ==="
-	# Читаем /proc/diskstats. Это сырые данные ядра о дисках.
-	[ -f /proc/diskstats ] && awk '{print "Disk:",$3,"Reads:",$6,"Writes:",$10}' /proc/diskstats | head -5
+	echo "=== I/O (Storage Usage) ==="
+	quiet_hint
+
+	# Проверяем, существует ли файл статистики дисков ядра.
+	if [ ! -f /proc/diskstats ]; then
+		log "Error: /proc/diskstats not found"
+		return
+	fi
+
+	# Печатаем красивую шапку таблицы.
+	# %-10s означает "выделить 10 символов и выровнять по левому краю".
+	out_printf "%-10s %-12s %-12s\n" "DEVICE" "READ (MB)" "WRITE (MB)"
+	echo "----------------------------------------"
+
+	# Запускаем awk для обработки файла.
+	awk '
+	{
+		# $3 - это имя устройства (например, mmcblk0, loop1, dm-0).
+		
+		# Фильтрация (RegEx):
+		# ^(mmcblk[0-9]+ : Ищет основные чипы памяти (внутренняя память).
+		# |sd[a-z]+      : Ищет SCSI/UFS диски (иногда внутренняя память или OTG флешки).
+		# |dm-[0-9]+)    : Ищет Device Mapper (зашифрованные разделы Android, например Userdata).
+		# Мы специально НЕ ищем "p[0-9]", чтобы не выводить каждый мелкий раздел, а только диск целиком.
+		if ($3 ~ /^(mmcblk[0-9]+|sd[a-z]+|dm-[0-9]+)$/) {
+			
+			# $6 - количество прочитанных секторов.
+			# $10 - количество записанных секторов.
+			# Сектор обычно равен 512 байтам.
+			# Формула: (Секторы * 512) / 1024 / 1024 = Мегабайты.
+			# Упрощенно: Секторы / 2048 = Мегабайты.
+			
+			read_mb = $6 / 2048
+			write_mb = $10 / 2048
+			
+			# Печатаем данные. %.1f означает "число с одной цифрой после запятой".
+			printf "%-10s %-12.1f %-12.1f\n", $3, read_mb, write_mb
+		}
+	}
+	' /proc/diskstats
 }
+
 
 # Вспомогательная функция для получения "бэкенда" (реального устройства) точки монтирования.
 get_backend_from_mountinfo() {
@@ -642,8 +757,43 @@ print_system() {
 	log "ABI: $(getprop ro.product.cpu.abi)" # Архитектура процессора (например, arm64-v8a).
 }
 
+check_pixel_security() {
+	# Объявляем локальную переменную для вендора
+	local vendor
+	# Получаем производителя и переводим в нижний регистр для надежного сравнения
+	vendor=$(getprop ro.product.manufacturer | tr '[:upper:]' '[:lower:]')
+	
+	# Если в имени производителя нет "google", тихо выходим из функции
+	[[ "$vendor" != *"google"* ]] && return
+
+	echo
+	echo "=== GOOGLE TITAN SECURITY ==="
+	quiet_hint
+
+	# Объявляем локальные переменные для работы внутри функции
+	local titan_status hardware_level
+	
+	# Проверяем уровень аппаратной защиты Keymaster
+	hardware_level=$(getprop ro.hardware.keystore_impl 2>/dev/null)
+	[ -z "$hardware_level" ] && hardware_level="unknown"
+
+	# Проверка StrongBox через системный лог (признак активности Titan M/M2)
+	if logcat -d | grep -qi "StrongBox" ; then
+		titan_status="${GREEN}Active (StrongBox detected)${NC}"
+	else
+		titan_status="${YELLOW}Standby / Not detected${NC}"
+	fi
+
+	log "Titan Chip:      $titan_status"
+	log "Keystore Impl:   $hardware_level"
+	
+	# Проверяем состояние Verified Boot (green/yellow/orange/red)
+	log "Verified Boot:   $(getprop ro.boot.verifiedbootstate 2>/dev/null)"
+}
+
 # Главная функция (точка входа в логику).
 main() {
+    local root_method
 	SYSTEM_STATUS=$EXIT_OK
 	rotate_log
 	touch "$ERR_LOG" 2>/dev/null # Создаем пустой файл ошибок, если нет.
@@ -666,6 +816,7 @@ main() {
 	print_top
 	print_io
 	check_partitions
+	check_pixel_security
 	print_system
 
 	echo "========================================"
@@ -684,6 +835,14 @@ while [ $# -gt 0 ]; do
 		-q|--quiet) QUIET=1 ;; # Включаем тихий режим.
 		-n|--no-logcat) NO_LOGCAT=1 ;; # Отключаем сканирование logcat.
 		-l|--loop) shift; LOOP_INTERVAL="$1" ;; # Забираем следующее значение как интервал.
+		-c|--clear-log)
+			if [ -f "$LOG" ]; then
+				: > "$LOG"  # Магия Bash: очищает файл, не удаляя его
+				echo "Log file cleared: $LOG"
+			else
+				echo "Log file not found, nothing to clear."
+			fi
+			exit 0 ;; # Выходим, так как мы только чистили лог
 		
 		# Считываем кастомные пороги (флаг + следующее значение).
 		--disk-warn) shift; DISK_WARN="$1" ;;
