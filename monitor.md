@@ -12,17 +12,17 @@ CLI-утилита для мониторинга системного состо
 
 ## Installation
 
-git clone …
-chmod +x monitor.sh
+- git clone …
+- chmod +x monitor.sh
 
 ## Usage
 
 ./monitor.sh [options]
 
 ## Examples
-./monitor.sh
-./monitor.sh --quiet
-./monitor.sh --no-logcat
+- ./monitor.sh
+- ./monitor.sh --quiet
+- ./monitor.sh --no-logcat
 
 ## Exit Codes
 
