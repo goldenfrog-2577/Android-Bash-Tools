@@ -49,10 +49,10 @@ CLI-утилита для мониторинга системного состо
 
 ## Options
 
---help          Show help and exit
---quiet         Disable colored output
---no-logcat     Skip logcat analysis
---loop <seconds> Run script after X seconds
+- --help          Show help and exit
+- --quiet         Disable colored output
+- --no-logcat     Skip logcat analysis
+- --loop <seconds> Run script after X seconds
 
 ## Known Limitations
 
