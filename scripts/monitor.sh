@@ -12,6 +12,44 @@ set -o pipefail
 LOG="/data/media/0/.My Folder/logs/android_monitor.log"
 ERR_LOG="/data/media/0/.My Folder/logs/last_errors.log"
 
+# Преобразует числовой код выхода (exit code) в человекочитаемое описание.
+# Используется для наглядного вывода финального статуса работы скрипта
+# (например: "Exit code: 1 (WARNING)").
+#
+# Аргументы:
+#   $1 — числовой код выхода (например 0, 1, 2, 3)
+#
+# Возвращает (через stdout):
+#   Текстовое описание статуса.
+exit_code_label() {
+	case "$1" in
+		# Все проверки прошли успешно, проблем не обнаружено
+		$EXIT_OK)
+			echo "${GREEN}OK${NC}"
+			;;
+		
+		# Обнаружены предупреждения, но без критических сбоев
+		$EXIT_WARNING)
+			echo "${YELLOW}WARNING${NC}"
+			;;
+		
+		# Обнаружено критическое состояние системы
+		$EXIT_CRITICAL)
+			echo "${RED}CRITICAL${NC}"
+			;;
+		
+		# Внутренняя ошибка скрипта или некорректные аргументы
+		$EXIT_INTERNAL)
+			echo "${RED}INTERNAL ERROR${NC}"
+			;;
+		
+		# Неизвестный или неподдерживаемый код выхода
+		*)
+			echo "UNKNOWN"
+			;;
+	esac
+}
+
 # Коды выхода (Exit Codes). Это стандартизация того, как скрипт сообщает системе о результате работы.
 # 0 - все хорошо, >0 - ошибки или предупреждения.
 EXIT_OK=0
@@ -72,7 +110,7 @@ log() {
 	echo -e "$ts - $1" | sed 's/\x1b\[[0-9;]*m//g' >> "$LOG"
 }
 
-# Функция помощи (Help).
+# Функция помощи (show_help).
 # cat <<EOF ... EOF - это Here Document, позволяет вывести многострочный текст.
 show_help() {
 	cat <<EOF
@@ -89,7 +127,6 @@ Options:
   -n, --no-logcat         Skip Logcat error scanning (faster execution)
   -l, --loop <seconds>    Run monitor continuously with a delay of X seconds
   -c, --clear-log         Clear the content of the log file without deleting it
-    
 
 Exit codes:
   0  OK (No issues detected)
@@ -145,9 +182,9 @@ print_header() {
 
 	echo "========================================"
 	echo "ANDROID ROOT SYSTEM MONITOR"
-	echo "Device: $(getprop ro.product.model) ($codename)"       # Модель телефона
+	echo "Device: $(getprop ro.product.model) ($codename)" # Модель телефона
 	echo "Android: $(getprop ro.build.version.release)" # Версия Android
-	echo "Kernel: $(uname -r)"                        # Версия ядра Linux
+	echo "Kernel: $(uname -r)" # Версия ядра Linux
 	echo "Active slot: $slot"
 	echo "Time: $(date)"
 	echo "========================================"
@@ -161,12 +198,14 @@ quiet_hint() {
 
 # Проверка места на накопителе (/data).
 check_storage() {
-    local use size used avail percent _
+	local use size used avail percent _
 	echo
 	echo "=== STORAGE (/data) ==="
 	quiet_hint
 
-	# Читаем вывод df.
+	# df -h /data показывает место. tail -1 берет последнюю строку (с цифрами).
+	# while read ... читает строку и разбивает её на переменные.
+	# _ (нижнее подчеркивание) используется для игнорирования ненужных колонок.
 	df -h /data | tail -1 | while read -r _ size used avail percent _; do
 		use=${percent%\%} 
 		
@@ -178,11 +217,13 @@ check_storage() {
 
 		log "Total: $f_size | Used: $f_used | Free: $f_avail"
 
+		# Сравниваем числа (-ge = greater or equal / больше или равно).
 		if [ "$use" -ge "$DISK_CRIT" ]; then
 			log "${RED}CRITICAL: Usage ${percent}${NC}"
 			SYSTEM_STATUS=$EXIT_CRITICAL
 		elif [ "$use" -ge "$DISK_WARN" ]; then
 			log "${YELLOW}WARNING: Usage ${percent}${NC}"
+			# Обновляем статус системы только если он еще не критический (чтобы не понизить статус).
 			[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
 		else
 			log "${GREEN}OK: Usage ${percent}${NC}"
@@ -192,23 +233,23 @@ check_storage() {
 
 # Проверка оперативной памяти (RAM).
 check_memory() {
-    local total avail used percent avail_mb total_gb
-    local z_total z_free z_used
+	local total avail used percent avail_mb total_gb
+	local z_total z_free z_used
 	echo
 	echo "=== MEMORY ==="
 	quiet_hint
 
-	# Читаем данные из системного файла /proc/meminfo
+	# Читаем данные из системного файла /proc/meminfo с помощью awk.
 	total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 	avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-	
+
 	# Вычисляем общий объем в ГБ (с одной цифрой после запятой через awk для красоты)
 	total_gb=$(awk "BEGIN {printf \"%.1f\", $total / 1024 / 1024}")
-	
+
 	# Выводим общую информацию
 	log "Total RAM: ${total_gb} GB"
-	
-    # Zram & Swap
+
+	# ZRAM - модуль ядра Linux, создающий сжатое блочное устройство прямо в оперативной памяти (RAM), работая как виртуальная память или файл подкачки.
 	z_total=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
 	z_free=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
 	
@@ -220,24 +261,24 @@ check_memory() {
 
 	# Математические вычисления
 	used=$((total - avail))
-	percent=$((used * 100 / total)) 
-	avail_mb=$((avail / 1024))      
+	percent=$((used * 100 / total)) # Вычисляем процент занятой памяти
+	avail_mb=$((avail / 1024)) # Переводим килобайты в мегабайты
 
 	# Логика проверки порогов
 	if [ "$percent" -ge "$RAM_CRIT" ]; then
-		log "${RED}CRITICAL: RAM ${percent}% (${avail_mb}MB free)${NC}"
+		log "${RED}CRITICAL: RAM ${percent}% (${avail_mb} MB free)${NC}"
 		SYSTEM_STATUS=$EXIT_CRITICAL
 	elif [ "$percent" -ge "$RAM_WARN" ]; then
-		log "${YELLOW}WARNING: RAM ${percent}% (${avail_mb}MB free)${NC}"
+		log "${YELLOW}WARNING: RAM ${percent}% (${avail_mb} MB free)${NC}"
 		[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
 	else
-		log "${GREEN}OK: RAM ${percent}% (${avail_mb}MB free)${NC}"
+		log "${GREEN}OK: RAM ${percent}% (${avail_mb} MB free)${NC}"
 	fi
 }
 
 # Проверка загрузки процессора (CPU).
 check_cpu() {
-    local cores load warn crit
+	local cores load warn crit
 	echo
 	echo "=== CPU ==="
 	quiet_hint
@@ -274,7 +315,7 @@ check_cpu() {
 
 # Проверка температуры процессора.
 check_cpu_temp() {
-    local max=0 z type raw t b
+	local max=0 z type raw t b
 	echo
 	echo "=== CPU TEMP ==="
 	quiet_hint
@@ -486,7 +527,7 @@ check_network() {
 
 # Анализ ошибок в системном журнале Android (logcat).
 check_logcat() {
-    local c s
+	local c s
 	echo
 	echo "=== LOGCAT ERRORS ==="
 	> "$ERR_LOG" # Очищаем файл ошибок перед записью.
@@ -515,15 +556,15 @@ check_logcat() {
 	echo "----------------------------------------"
 	# Показываем последние s строк, добавляя "> " в начало каждой для красоты.
 	tail -n "$s" "$ERR_LOG" | while read -r line; do
-        log "  > $line"
-    done
+		log "  > $line"
+	done
 	echo "----------------------------------------"
 	log "Full history: cat $ERR_LOG"
 }
 
 # Вывод топ процессов по потреблению CPU.
 print_top() {
-    local p c cpu m
+	local p c cpu m
 	echo
 	echo "=== TOP PROCESSES ==="
 	quiet_hint
@@ -587,7 +628,6 @@ print_io() {
 	}
 	' /proc/diskstats
 }
-
 
 # Вспомогательная функция для получения "бэкенда" (реального устройства) точки монтирования.
 get_backend_from_mountinfo() {
@@ -726,10 +766,16 @@ get_magisk_version() {
 
 # Проверка статуса Zygisk (модуль Magisk для инъекции кода в процессы).
 get_zygisk_status() {
-	if [ "$(getprop persist.magisk.zygisk 2>/dev/null)" = "1" ]; then
+	local prop_status socket_exists
+
+	prop_status=$(getprop persist.magisk.zygisk 2>/dev/null)
+	# Ищем любые сокеты, начинающиеся на zygisk
+	socket_exists=$(ls /dev/socket/ 2>/dev/null | grep -c "zygisk")
+
+	if [ "$socket_exists" -gt 0 ]; then
 		echo "Enabled"
-	elif [ -d /data/adb/zygisk ]; then
-		echo "Enabled"
+	elif [ "$prop_status" = "1" ]; then
+		echo "Enabled (Reboot Required)"
 	else
 		echo "Disabled"
 	fi
@@ -745,7 +791,6 @@ print_system() {
 
 	# Если скрипт запущен от рута (id 0).
 	if [ "$(id -u)" -eq 0 ]; then
-		root_method="$(detect_root_method)"
 		log "Root: ${GREEN}YES${NC}"
 		log "System Access Level: $(detect_root_method) $(get_magisk_version)"
 		log "Zygisk: $(get_zygisk_status)"
@@ -757,6 +802,7 @@ print_system() {
 	log "ABI: $(getprop ro.product.cpu.abi)" # Архитектура процессора (например, arm64-v8a).
 }
 
+# Функция проверки безопасности. Работает только на устройствах Google Pixel. Вывод игнорируется, если это не вышеуказаное устройство.
 check_pixel_security() {
 	# Объявляем локальную переменную для вендора
 	local vendor
@@ -793,7 +839,6 @@ check_pixel_security() {
 
 # Главная функция (точка входа в логику).
 main() {
-    local root_method
 	SYSTEM_STATUS=$EXIT_OK
 	rotate_log
 	touch "$ERR_LOG" 2>/dev/null # Создаем пустой файл ошибок, если нет.
@@ -823,7 +868,7 @@ main() {
 	echo "Log file: $LOG"
 	echo "========================================"
 
-	log "Exit code: $SYSTEM_STATUS"
+	log "Exit code: $SYSTEM_STATUS ($(exit_code_label "$SYSTEM_STATUS"))"
 	return "$SYSTEM_STATUS"
 }
 
