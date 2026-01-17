@@ -1,117 +1,193 @@
-#!/data/data/com.termux/files/usr/bin/bash
-# ^ Это shebang. Он указывает системе, какой интерпретатор использовать для запуска скрипта. В данном случае это bash, находящийся в папке Termux.
+#!/data/user/0/bin.mt.plus/files/term/bin/bash
+# ^ Это shebang. Он указывает системе, какой интерпретатор использовать для запуска скрипта. В данном случае это bash, находящийся в папке MT Manager.
 
 # set -u: Заставляет скрипт завершаться с ошибкой, если мы пытаемся использовать переменную, которая не была задана. Это помогает избежать скрытых багов.
 set -u
 # set -o pipefail: Если в цепочке команд (pipeline, например cmd1 | cmd2) одна из команд упадет, то весь скрипт вернет ошибку, а не только последняя команда.
 set -o pipefail
 
-# Пути к файлам логов.
-# LOG: основной лог мониторинга.
-# ERR_LOG: временный файл для ошибок из системного журнала (logcat).
+# Путь к основному файлу лога и временно используемому файлу для ошибок (logcat)
+#  - LOG: основной лог-файл, в который дублируется всё, что выводится.
+#  - ERR_LOG: временный файл, куда записываются ошибки из logcat.
 LOG="/data/media/0/.My Folder/logs/android_monitor.log"
 ERR_LOG="/data/media/0/.My Folder/logs/last_errors.log"
 
-# Преобразует числовой код выхода (exit code) в человекочитаемое описание.
-# Используется для наглядного вывода финального статуса работы скрипта
-# (например: "Exit code: 1 (WARNING)").
-#
+# exit_code_label
+# Функция: преобразует числовой код возврата в удобочитаемую метку.
 # Аргументы:
-#   $1 — числовой код выхода (например 0, 1, 2, 3)
-#
-# Возвращает (через stdout):
-#   Текстовое описание статуса.
+#   $1 - числовой код возврата (0/1/2/3/...)
+# Выводит на stdout цветную метку (если терминал поддерживает цвета).
+# Не меняет переменные окружения.
 exit_code_label() {
 	case "$1" in
-		# Все проверки прошли успешно, проблем не обнаружено
+
 		$EXIT_OK)
 			echo "${GREEN}OK${NC}"
 			;;
 		
-		# Обнаружены предупреждения, но без критических сбоев
 		$EXIT_WARNING)
 			echo "${YELLOW}WARNING${NC}"
 			;;
 		
-		# Обнаружено критическое состояние системы
 		$EXIT_CRITICAL)
 			echo "${RED}CRITICAL${NC}"
 			;;
 		
-		# Внутренняя ошибка скрипта или некорректные аргументы
 		$EXIT_INTERNAL)
 			echo "${RED}INTERNAL ERROR${NC}"
 			;;
 		
-		# Неизвестный или неподдерживаемый код выхода
 		*)
 			echo "UNKNOWN"
 			;;
 	esac
 }
 
-# Коды выхода (Exit Codes). Это стандартизация того, как скрипт сообщает системе о результате работы.
-# 0 - все хорошо, >0 - ошибки или предупреждения.
+# check_dependencies
+# Функция: проверяет, установлены ли необходимые системные утилиты.
+# Возвращаемые коды:
+#   0 - все зависимости присутствуют
+#   EXIT_INTERNAL - обнаружены отсутствующие критические зависимости
+# Печатает рекомендации по установке в stderr, если чего-то не хватает.
+check_dependencies() {
+	local missing=()
+
+	# Критические утилиты, без которых скрипт не сможет корректно выполнять отдельные части логики (парсинг, вывод, получение списка процессов).
+	local critical_deps=("awk" "grep" "sed" "df" "ps")
+	for dep in "${critical_deps[@]}"; do
+		# command -v проверяет, доступна ли команда в PATH
+		if ! command -v "$dep" >/dev/null 2>&1; then
+			missing+=("$dep")
+		fi
+	done
+
+	# Если есть отсутствующие утилиты — сообщаем пользователю и прерываем.
+	if [ ${#missing[@]} -gt 0 ]; then
+		# Пишем в stderr (показательно для cron / автоматизации).
+		echo "ERROR: Missing required utilities: ${missing[*]}" >&2
+		# Подсказываем пакетный менеджер Termux (pkg). Пользователь на Android.
+		echo "Install them via: pkg install coreutils procps" >&2
+		return $EXIT_INTERNAL
+	fi
+
+	# 'bc' — не критичен, но удобен для сравнения дробных чисел (GPU проценты).
+	if ! command -v bc >/dev/null 2>&1; then
+		# NOTE выводим в stderr, но работа продолжается в integer-mode.
+		echo "NOTE: 'bc' calculator not found. GPU percentage checks will use integer math." >&2
+	fi
+	return $EXIT_OK
+}
+
+# check_already_running
+# Функция: предотвращает запуск двух экземпляров скрипта одновременно.
+# Логика:
+#   - размещает lock-файл /tmp/<scriptname>.lock с PID текущего процесса
+#   - если lock-файл существует и процесс жив — возвращает ошибку
+#   - при завершении (trap EXIT) lock-файл удаляется автоматически
+# Возвращает EXIT_OK либо EXIT_INTERNAL в случае уже запущенного экземпляра.
+check_already_running() {
+	local script_name=$(basename "$0")
+	local lock_file="/tmp/${script_name}.lock"
+	local pid
+
+	if [ -f "$lock_file" ]; then
+		pid=$(cat "$lock_file" 2>/dev/null)
+		# kill -0 проверяет, существует ли процесс с PID
+		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			echo "ERROR: Script is already running with PID $pid" >&2
+			echo "If this is wrong, delete: $lock_file" >&2
+			return $EXIT_INTERNAL
+		else
+			# stale lock — удаляем
+			rm -f "$lock_file"
+		fi
+	fi
+
+	# записываем текущий PID в lock
+	echo $$ > "$lock_file"
+
+	# гарантированно удалить lock при выходе любого типа
+	trap 'rm -f "$lock_file"' EXIT
+	return $EXIT_OK
+}
+
+# EXIT CODES — понятные имена для числовых кодов возврата
 EXIT_OK=0
 EXIT_WARNING=1
 EXIT_CRITICAL=2
 EXIT_INTERNAL=3
 
-# Переменная текущего статуса системы. По умолчанию считаем, что все хорошо (0).
+# Глобальные переменные состояния и флаги
+# - SYSTEM_STATUS: агрегированный статус после всех проверок
+# - QUIET: если 1 — не печатать в терминал, только писать в лог
+# - NO_LOGCAT: если 1 — пропустить длительный анализ logcat
+# - LOOP_INTERVAL: если >0 — запускать монитор в цикле каждые N секунд
+# - DRY_RUN: если 1 — проверить зависимости и вывести только заголовок
+# - BRIEF_MODE: если 1 — показывать только важные сообщения (WARNING/CRITICAL)
+# - EXTENDED: если 1 — в конце вывести расширенную информацию о системе
 SYSTEM_STATUS=$EXIT_OK
 
-# Настройки по умолчанию (флаги).
-# 0 означает "выключено" или "нет", 1 будет означать "включено".
-QUIET=0          # Тихий режим (без вывода в консоль)
-NO_LOGCAT=0      # Не сканировать ошибки logcat (для ускорения)
-LOOP_INTERVAL=0  # Интервал повторения скрипта (0 = запустить один раз)
+QUIET=0
+NO_LOGCAT=0
+LOOP_INTERVAL=0
+DRY_RUN=0
+BRIEF_MODE=0
+EXTENDED=0
 
-# Пороговые значения (Thresholds) для срабатывания предупреждений.
-# Если использование выше этих чисел, скрипт выдаст WARN или CRIT.
-DISK_WARN=80     # Диск: предупреждение при 80%
-DISK_CRIT=90     # Диск: критическое состояние при 90%
-RAM_WARN=80      # ОЗУ: предупреждение при 80%
-RAM_CRIT=90      # ОЗУ: критическое состояние при 90%
-CPU_WARN_MULT=1.5 # Множитель нагрузки ЦП для предупреждения
-CPU_CRIT_MULT=2.0 # Множитель нагрузки ЦП для критического состояния
-GPU_WARN=80      # GPU: предупреждение при 80%
-GPU_CRIT=95      # GPU: критическое состояние при 95%
+# Thresholds: параметры, при превышении которых срабатывают WARNING/CRITICAL
+# - DISK_WARN / DISK_CRIT: в процентах для дисковых разделов (/data)
+# - RAM_WARN / RAM_CRIT: в процентах для RAM
+# - CPU_WARN_MULT / CPU_CRIT_MULT: множители по отношению к числу ядер
+# - GPU_WARN / GPU_CRIT: проценты загрузки GPU
+DISK_WARN=80
+DISK_CRIT=90
+RAM_WARN=80
+RAM_CRIT=90
+CPU_WARN_MULT=1.5
+CPU_CRIT_MULT=2.0
+GPU_WARN=80
+GPU_CRIT=95
 
-# Проверяем, запущен ли скрипт в интерактивном терминале.
-# [ -t 1 ] проверяет, открыт ли стандартный вывод (дескриптор 1) в терминале.
+# Цвета: включаем escape-последовательности только если stdout — интерактивный терминал
+# Проверка [ -t 1 ] — true, если дескриптор 1 (stdout) привязан к терминалу.
 if [ -t 1 ]; then
-	# Если да, задаем переменные для цветов текста (ANSI escape codes).
-	RED='\033[0;31m'    # Красный
-	GREEN='\033[0;32m'  # Зеленый
-	YELLOW='\033[0;33m' # Желтый
-	NC='\033[0m'        # No Color (сброс цвета)
+	RED='\033[0;31m'
+	GREEN='\033[0;32m'
+	YELLOW='\033[1;33m'
+	NC='\033[0m'
 else
-	# Если скрипт запущен, например, через cron или перенаправлен в файл, отключаем цвета, чтобы в файле не было "мусора" из спецсимволов.
+	# В неинтерактивном режиме (cron/лог-файл) не добавляем мусор в лог
 	RED='' ; GREEN='' ; YELLOW='' ; NC=''
 fi
 
-# Функция для вывода текста на экран.
-# Используется вместо обычного echo/printf, чтобы учитывать настройку QUIET.
+# out_printf
+# Удобная обёртка вокруг printf, учитывающая QUIET и BRIEF_MODE.
+# Если BRIEF_MODE включен — функция фильтрует обычные информационные строки, оставляя только сообщения, содержащие "CRITICAL", "WARNING" или "ERROR".
 out_printf() {
-	# [ "$QUIET" -eq 0 ] - если тихий режим ВЫКЛЮЧЕН (равен 0),
-	# && (тогда) выполняем команду printf. "$@" означает "все переданные аргументы".
+	if [ "$BRIEF_MODE" -eq 1 ]; then
+		# Простейшая фильтрация по ключевым словам — подходит для быстрого режима.
+		if [[ "$*" != *"CRITICAL"* ]] && [[ "$*" != *"WARNING"* ]] && [[ "$*" != *"ERROR"* ]]; then
+			return
+		fi
+	fi
 	[ "$QUIET" -eq 0 ] && printf "$@"
 }
 
-# Функция логирования. Пишет и на экран, и в файл.
+# log
+# Универсальная функция логирования:
+#  - выводит строку в терминал (если QUIET=0),
+#  - записывает ту же строчку в файл $LOG (без управляющих цветовых кодов).
+# Формат строки: "HH:MM:SS - сообщение"
 log() {
-	# Получаем текущее время в формате ЧЧ:ММ:СС.
 	ts="$(date '+%H:%M:%S')"
-	# Если не тихий режим, выводим на экран с временем.
-	[ "$QUIET" -eq 0 ] && echo -e "$ts - $1"  
-	# Пишем в файл лога ($LOG).
-	# sed 's/\x1b\[[0-9;]*m//g' удаляет цветовые коды, чтобы лог был чистым текстом.
-	# >> означает "дописать в конец файла", а не перезаписать его.
+	[ "$QUIET" -eq 0 ] && echo -e "$ts - $1"
+	# sed удаляет ANSI escape-коды перед записью в файл
 	echo -e "$ts - $1" | sed 's/\x1b\[[0-9;]*m//g' >> "$LOG"
 }
 
-# Функция помощи (show_help).
-# cat <<EOF ... EOF - это Here Document, позволяет вывести многострочный текст.
+# show_help
+# Многострочная справка, показываемая при запуске с -h/--help.
+# Объясняет опции и примеры использования.
 show_help() {
 	cat <<EOF
 === ANDROID ROOT SYSTEM MONITOR ===
@@ -126,7 +202,10 @@ Options:
   -q, --quiet             Quiet mode: suppress terminal output (log file only)
   -n, --no-logcat         Skip Logcat error scanning (faster execution)
   -l, --loop <seconds>    Run monitor continuously with a delay of X seconds
-  -c, --clear-log         Clear the content of the log file without deleting it
+  -b, --brief             Brief mode: show only warnings and errors (good for quick checks)
+  -d, --dry-run           Test mode: verify dependencies and show basic info without full checks
+  -e, --extended          Show extended system information
+  -c, --clear-log         Clear content of log file without deleting it
 
 Exit codes:
   0  OK (No issues detected)
@@ -157,73 +236,71 @@ Threshold options (alert trigger levels):
 EOF
 }
 
-# Функция ротации логов.
-# Чтобы файл лога не стал бесконечно огромным, мы его очищаем, если он слишком длинный.
+# rotate_log
+# Простая ротация лога: если в файле больше 1000 строк — перезаписать его одной строкой.
+# Такой подход минимален и подходит для устройств с ограниченным дисковым пространством.
 rotate_log() {
-	# Если файл существует (-f) И количество строк (wc -l) больше 1000...
 	if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 1000 ]; then
-		# ...то перезаписываем файл (>) одной строкой.
 		echo "--- Log rotated ---" > "$LOG"
 	fi
 }
 
-# Вывод шапки с информацией об устройстве.
+# print_header
+# Выводит заголовок монитора: модель устройства, версия Android, ядро, активный слот, текущая дата/время. Использует свойства getprop — стандартный метод на Android.
 print_header() {
 	local slot
-	# getprop - команда Android для получения системных свойств.
-	# Здесь узнаем активный слот загрузки (A или B).
 	slot="$(getprop ro.boot.slot_suffix)"
-	# Если слот пустой (-z), пишем "unknown".
 	[ -z "$slot" ] && slot="unknown"
-	
-	# Получаем кодовое имя устройства (например, alioth)
+	  
 	codename="$(getprop ro.product.device)"
 	[ -z "$codename" ] && codename="unknown"
 
 	echo "========================================"
 	echo "ANDROID ROOT SYSTEM MONITOR"
-	echo "Device: $(getprop ro.product.model) ($codename)" # Модель телефона
-	echo "Android: $(getprop ro.build.version.release)" # Версия Android
-	echo "Kernel: $(uname -r)" # Версия ядра Linux
+	echo "Device: $(getprop ro.product.model) ($codename)"
+	echo "Android: $(getprop ro.build.version.release)"
+	echo "Kernel: $(uname -r)"
 	echo "Active slot: $slot"
 	echo "Time: $(date)"
 	echo "========================================"
 }
 
-# Подсказка для тихого режима.
+# quiet_hint
+# Если включён quiet-режим, печатает подсказку о том, где смотреть лог.
+# Используемая в разделах перед выдачей подробной информации.
 quiet_hint() {
-	# Если включен тихий режим, напоминаем пользователю проверить лог-файл.
 	[ "$QUIET" -eq 1 ] && echo "Check details in log file: $LOG" && echo
 }
 
-# Проверка места на накопителе (/data).
+# check_storage
+# Проверяет использование хранилища на /data:
+#  - читает df -h /data
+#  - парсит процент использования и сравнивает с порогами
+#  - логирует общий размер, использовано, свободно
+# Примечание: мы используем tail -1 и ожидаем, что последняя строка — это /data.
 check_storage() {
 	local use size used avail percent _
 	echo
-	echo "=== STORAGE (/data) ==="
+	echo "[ STORAGE ] (/data)"
 	quiet_hint
 
-	# df -h /data показывает место. tail -1 берет последнюю строку (с цифрами).
-	# while read ... читает строку и разбивает её на переменные.
-	# _ (нижнее подчеркивание) используется для игнорирования ненужных колонок.
 	df -h /data | tail -1 | while read -r _ size used avail percent _; do
-		use=${percent%\%} 
-		
-		# Красивое форматирование: заменяем 'G' на ' GB', чтобы было "106 GB" вместо "106G"
-		# Используем Bash-замену: ${переменная//что/на_что}
+		use=${percent%\%}
+
+		# Небольшая "косметика" — заменяем 'G' на ' GB' для читабельности
 		local f_size=${size//G/ GB}
 		local f_used=${used//G/ GB}
 		local f_avail=${avail//G/ GB}
 
 		log "Total: $f_size | Used: $f_used | Free: $f_avail"
 
-		# Сравниваем числа (-ge = greater or equal / больше или равно).
+		# Сравнение с порогами: сначала CRITICAL, затем WARNING
 		if [ "$use" -ge "$DISK_CRIT" ]; then
 			log "${RED}CRITICAL: Usage ${percent}${NC}"
 			SYSTEM_STATUS=$EXIT_CRITICAL
 		elif [ "$use" -ge "$DISK_WARN" ]; then
 			log "${YELLOW}WARNING: Usage ${percent}${NC}"
-			# Обновляем статус системы только если он еще не критический (чтобы не понизить статус).
+
 			[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
 		else
 			log "${GREEN}OK: Usage ${percent}${NC}"
@@ -231,40 +308,40 @@ check_storage() {
 	done
 }
 
-# Проверка оперативной памяти (RAM).
+# check_memory
+# Считывает /proc/meminfo, рассчитывает использованную память и проценты, проверяет наличие swap / zram и логирует информацию о ZRAM.
 check_memory() {
 	local total avail used percent avail_mb total_gb
 	local z_total z_free z_used
 	echo
-	echo "=== MEMORY ==="
+	echo "[ MEMORY ] (RAM)"
 	quiet_hint
 
-	# Читаем данные из системного файла /proc/meminfo с помощью awk.
+	# читаем значения в килобайтах
 	total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 	avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
 
-	# Вычисляем общий объем в ГБ (с одной цифрой после запятой через awk для красоты)
+	# prettify: показать общий объём в GB с одной цифрой
 	total_gb=$(awk "BEGIN {printf \"%.1f\", $total / 1024 / 1024}")
 
-	# Выводим общую информацию
 	log "Total RAM: ${total_gb} GB"
 
-	# ZRAM - модуль ядра Linux, создающий сжатое блочное устройство прямо в оперативной памяти (RAM), работая как виртуальная память или файл подкачки.
+	# Swap / ZRAM информация — читаем, если есть
 	z_total=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
 	z_free=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
-	
+	  
 	if [ "$z_total" -gt 0 ]; then
 		z_used=$(( (z_total - z_free) / 1024 ))
 		z_total_mb=$(( z_total / 1024 ))
 		log "ZRAM: ${z_used} MB used / ${z_total_mb} MB total"
 	fi
 
-	# Математические вычисления
+	# Считаем проценты занятости
 	used=$((total - avail))
-	percent=$((used * 100 / total)) # Вычисляем процент занятой памяти
-	avail_mb=$((avail / 1024)) # Переводим килобайты в мегабайты
+	percent=$((used * 100 / total))
+	avail_mb=$((avail / 1024))
 
-	# Логика проверки порогов
+	# Проверка порогов и выставление глобального статуса
 	if [ "$percent" -ge "$RAM_CRIT" ]; then
 		log "${RED}CRITICAL: RAM ${percent}% (${avail_mb} MB free)${NC}"
 		SYSTEM_STATUS=$EXIT_CRITICAL
@@ -276,29 +353,75 @@ check_memory() {
 	fi
 }
 
-# Проверка загрузки процессора (CPU).
+# get_cpu_freqs_detailed
+# Опрашивает каждое из 8 ядер процессора и выводит текущую частоту для каждого.
+# Если ядро отключено системой энергосбережения (Hotplug), выводит статус OFFLINE.
+# Использует форматирование %4s/%4d для сохранения идеальной структуры колонок.
+# Полезно для архитектур Big.LITTLE (как Snapdragon 870), где частоты кластеров различаются.
+get_cpu_freqs_detailed() {
+    local cpu_dir="/sys/devices/system/cpu"
+    local f i online_status
+    
+    log "CPU Frequencies:"
+
+    for i in {0..7}; do
+        # Проверяем, активно ли ядро (1 - online, 0 - offline)
+        # Ядро 0 обычно всегда online, поэтому файла может не быть — считаем его активным по умолчанию.
+        if [ -f "$cpu_dir/cpu$i/online" ]; then
+            online_status=$(cat "$cpu_dir/cpu$i/online" 2>/dev/null)
+        else
+            online_status=1
+        fi
+
+        if [ "$online_status" -eq 1 ]; then
+            f=$(cat "$cpu_dir/cpu$i/cpufreq/scaling_cur_freq" 2>/dev/null)
+            if [ -n "$f" ]; then
+                out_printf "              Core $i: %4d MHz\n" "$((f/1000))"
+            else
+                out_printf "              Core $i: %4s\n" "DATA_ERR"
+            fi
+        else
+            # Выделяем OFFLINE цветом, чтобы сразу бросалось в глаза
+            out_printf "              Core $i: ${RED}%4s${NC}\n" "OFFLINE"
+        fi
+    done
+}
+
+# check_cpu
+# Собирает информацию о CPU: модель, количество ядер, loadavg, governor и частоты.
+# - Использует вспомогательные функции get_board_name, get_cpu_governor, get_cpu_freqs
+# - Сравнивает среднюю нагрузку (loadavg) с порогами, используя множитель на число ядер
 check_cpu() {
 	local cores load warn crit
 	echo
-	echo "=== CPU ==="
+	echo "[ CPU ]"
 	quiet_hint
-	
-	# Получаем имя процессора из свойств системы
+
 	cpu_name=$(getprop ro.soc.model)
 	[ -z "$cpu_name" ] && cpu_name=$(getprop ro.board.platform)
-	
 	cores=$(grep -c processor /proc/cpuinfo)
 	load=$(awk '{print $1}' /proc/loadavg)
 
-	# Считаем количество ядер процессора. grep -c считает строки.
-	cores=$(grep -c processor /proc/cpuinfo)
-	# Читаем среднюю загрузку (Load Average) за последнюю минуту из /proc/loadavg.
-	load=$(awk '{print $1}' /proc/loadavg)
 	log "Model: $cpu_name"
+	log "Board: $(get_board_name)"
 	log "Load: $load | Cores: $cores"
+	log "CPU Governor: $(get_cpu_governor)"
+	get_cpu_freqs_detailed
+	
+	# Сравнение текущей макс. частоты с заводской макс. частотой
+    local cur_max_f factory_max_f base="/sys/devices/system/cpu/cpu0/cpufreq"
+    cur_max_f=$(cat "$base/scaling_max_freq" 2>/dev/null)
+    factory_max_f=$(cat "$base/cpuinfo_max_freq" 2>/dev/null)
 
-	# Bash не умеет сравнивать дробные числа (float), поэтому используем awk.
-	# Если load > cores * multiplier, возвращаем 1, иначе 0.
+    if [ -n "$cur_max_f" ] && [ -n "$factory_max_f" ]; then
+        if [ "$cur_max_f" -lt "$factory_max_f" ]; then
+            log "CPU Throttling: ${RED}ACTIVE${NC} (Limited to $((cur_max_f/1000)) MHz)"
+        else
+            log "CPU Throttling: ${GREEN}Inactive${NC}"
+        fi
+    fi
+
+	# сравниваем дробные значения с помощью awk (bash не поддерживает float)
 	warn=$(awk -v l="$load" -v c="$cores" -v m="$CPU_WARN_MULT" 'BEGIN{print (l > c*m)}')
 	crit=$(awk -v l="$load" -v c="$cores" -v m="$CPU_CRIT_MULT" 'BEGIN{print (l > c*m)}')
 
@@ -313,56 +436,55 @@ check_cpu() {
 	fi
 }
 
-# Проверка температуры процессора.
+# check_cpu_temp
+# Поиск и выбор максимальной валидной температуры среди датчиков thermal_zone*.
+# Если нет подходящих датчиков — пытаемся взять температуру батареи как прокси.
 check_cpu_temp() {
 	local max=0 z type raw t b
 	echo
-	echo "=== CPU TEMP ==="
+	echo "[ CPU TEMP ]"
 	quiet_hint
 
 	max=0
-	# Перебираем все термальные зоны в системе.
+
 	for z in /sys/class/thermal/thermal_zone*; do
-		# 2>/dev/null подавляет ошибки, если файл не читается.
+
 		type=$(cat "$z/type" 2>/dev/null)
 		raw=$(cat "$z/temp" 2>/dev/null)
-		
-		# Фильтруем только зоны, связанные с CPU или tsens.
-		# case ... esac - это аналог switch.
+
+		# Отбираем датчики по имени (tsens* или cpu*)
 		case "$type" in tsens*|cpu*) ;; *) continue ;; esac
-		
-		# Если данных нет, пропускаем шаг цикла.
+
 		[ -z "$raw" ] && continue
-		
-		# Обычно температура хранится в тысячных долях (45000 = 45C). Делим на 1000.
+
+		# Обычно датчики дают тысячные градусы (например 47000 -> 47C)
 		t=$((raw / 1000))
-		
-		# Отсеиваем нереалистичные значения (глюки датчиков): меньше 15 или больше 120 градусов.
+
+		# Отсеиваем глючные значения
 		[ "$t" -lt 15 ] || [ "$t" -gt 120 ] && continue
-		
-		# Ищем максимальную температуру среди всех ядер.
+
 		[ "$t" -gt "$max" ] && max="$t"
 	done
 
 	if [ "$max" -gt 0 ]; then
 		log "CPU Max Temp: ${max}°C"
 	else
-		# Если не нашли температуру CPU, пробуем взять температуру батареи как прокси.
 		log "CPU Temp: unavailable"
 		b=$(cat /sys/class/power_supply/battery/temp 2>/dev/null)
-		# Температура батареи часто хранится в десятых долях (350 = 35.0C). Делим на 10.
 		[ -n "$b" ] && log "SoC Temp (battery proxy): $((b/10))°C"
 	fi
 }
 
-# Проверка видеоядра (GPU). Самая сложная часть, так как пути зависят от производителя (Qualcomm vs MediaTek и др.).
+# check_gpu
+# Поддерживает Qualcomm (Adreno) и Mali (MediaTek / Exynos / Tensor).
+# Собирает модель, частоту, governor и загрузку GPU; сравнивает с порогами.
+# Примечание: чтение путей /sys может отличаться между устройствами, поэтому здесь предусмотрено несколько вариантов файлов.
 check_gpu() {
 	echo
-	echo "=== GPU MONITOR ==="
+	echo "[ GPU MONITOR ]"
 	quiet_hint
 
 	local BC_INSTALLED gpu_model gpu_freq gpu_load gpu_gov
-	# Проверяем, установлена ли утилита 'bc' (калькулятор), нужна для точных вычислений.
 	BC_INSTALLED=$(command -v bc 2>/dev/null)
 
 	gpu_model="Unknown"
@@ -370,30 +492,27 @@ check_gpu() {
 	gpu_load="N/A"
 	gpu_gov="N/A"
 
-	# --- Ветка для Adreno (процессоры Qualcomm Snapdragon) ---
+	# Adreno (Qualcomm)
 	if [ -d /sys/class/kgsl/kgsl-3d0 ]; then
 		gpu_model="Adreno (Qualcomm)"
 		local path="/sys/class/kgsl/kgsl-3d0"
 
 		local raw_freq
 		raw_freq=$(cat "$path/gpuclk" 2>/dev/null)
-		# Конвертируем Гц в МГц.
 		[ -n "$raw_freq" ] && gpu_freq="$((raw_freq / 1000000)) MHz"
 
-		# Вычисляем нагрузку через файл gpubusy (время работы / общее время).
+		# gpubusy обычно содержит busy и total — вычисляем процент
 		gpu_load=$(awk '{if($2>0) printf "%.1f%%", ($1/$2)*100; else print "0%"}' "$path/gpubusy" 2>/dev/null)
 		gpu_gov=$(cat "$path/devfreq/governor" 2>/dev/null)
 
-	# --- Ветка для Mali (процессоры MediaTek, Exynos, Google Tensor) ---
+	# Mali (MediaTek / Exynos / Google Tensor)
 	elif ls /sys/devices/platform/*mali* >/dev/null 2>&1 || [ -d /sys/module/mali_kbase ]; then
 		gpu_model="Mali (MediaTek / Exynos / Tensor)"
 
 		local mali_path
-		# Пытаемся найти папку драйвера Mali.
 		mali_path=$(ls -d /sys/devices/platform/*mali* 2>/dev/null | head -1)
 		[ -z "$mali_path" ] && mali_path="/sys/class/misc/mali0/device"
 
-		# Ищем файл с частотой (перебираем возможные варианты путей).
 		for f in \
 			"$mali_path/cur_freq" \
 			"$mali_path/clock" \
@@ -407,7 +526,6 @@ check_gpu() {
 			fi
 		done
 
-		# Ищем файл с загрузкой (utilization).
 		for f in \
 			"$mali_path/utilization" \
 			"/sys/module/mali_kbase/parameters/mali_gpu_utilization" \
@@ -424,27 +542,26 @@ check_gpu() {
 		gpu_gov=$(cat "$mali_path/devfreq/governor" 2>/dev/null)
 	fi
 
-	# Если модель не определена, выходим из функции.
+	# Если не определили модель — считаем GPU недоступным
 	[ "$gpu_model" = "Unknown" ] && { log "GPU: unavailable"; return; }
 
 	log "Model:    $gpu_model"
 	log "Freq:     $gpu_freq"
 	log "Governor: $gpu_gov"
 
-	# Обработка порогов нагрузки GPU.
 	local load_val gpu_warn gpu_crit
-	load_val=$(echo "$gpu_load" | tr -d '%') # Убираем знак %
+	load_val=$(echo "$gpu_load" | tr -d '%')
 	gpu_warn=0
 	gpu_crit=0
 
-	# Проверяем, является ли значение числом (включая дробные).
+	# Проверяем, является ли load_val числом (включая дробные)
 	if [[ "$load_val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
 		if [ -n "$BC_INSTALLED" ]; then
-			# Если есть bc, сравниваем дробные числа.
+			# Используем bc для сравнения дробных чисел
 			gpu_warn=$(echo "$load_val > $GPU_WARN" | bc)
 			gpu_crit=$(echo "$load_val > $GPU_CRIT" | bc)
 		else
-			# Иначе сравниваем целую часть (отбрасываем дробь через ${var%.*}).
+			# fallback: сравниваем целую часть
 			[ "${load_val%.*}" -gt "$GPU_WARN" ] && gpu_warn=1
 			[ "${load_val%.*}" -gt "$GPU_CRIT" ] && gpu_crit=1
 		fi
@@ -461,100 +578,171 @@ check_gpu() {
 	fi
 }
 
-# Проверка батареи.
+# check_battery
+# Читает свойства батареи в /sys/class/power_supply/battery и выводит:
+#  - статус (Charging/Discharging)
+#  - health (Good/Unknown)
+#  - cycles (если доступны)
+#  - температуру в градусах Цельсия
+#  - напряжение в mV
+# Также вычисляет процент износа, если доступны charge_full и charge_full_design.
 check_battery() {
-	echo
-	echo "=== BATTERY & HEALTH ==="
-	quiet_hint
+    echo
+    echo "[ BATTERY & HEALTH ]"
+    quiet_hint
 
-	# Объявляем локальные переменные для безопасности
-	local b="/sys/class/power_supply/battery"
-	local cap status temp volt health cycles health_pct
+    local b="/sys/class/power_supply/battery"
+    local cap status temp volt health cycles health_pct current_now power_w
 
-	# Если папка не существует, выходим
-	[ ! -d "$b" ] && log "Battery data: unavailable" && return
+    [ ! -d "$b" ] && log "Battery data: unavailable" && return
 
-	# Собираем базовые данные
-	cap=$(cat "$b/capacity" 2>/dev/null)
-	status=$(cat "$b/status" 2>/dev/null)
-	temp=$(( $(cat "$b/temp" 2>/dev/null) / 10 ))
-	volt=$(( $(cat "$b/voltage_now" 2>/dev/null) / 1000 ))
-	
-	# Собираем данные об износе
-	health=$(cat "$b/health" 2>/dev/null)
-	cycles=$(cat "$b/cycle_count" 2>/dev/null)
-	[ -z "$cycles" ] && cycles="N/A"
+    # Основные параметры
+    cap=$(cat "$b/capacity" 2>/dev/null)
+    status=$(cat "$b/status" 2>/dev/null)
+    temp=$(( $(cat "$b/temp" 2>/dev/null) / 10 ))
+    volt=$(( $(cat "$b/voltage_now" 2>/dev/null) / 1000 ))
+    
+    # Расчет мгновенной мощности
+    current_now=$(cat "$b/current_now" 2>/dev/null) # обычно в микроамперах
+    if [ -n "$current_now" ] && [ "$volt" -gt 0 ]; then
+        # Ток в мА (с сохранением знака)
+        local i_ma=$((current_now / 1000))
+        # Мощность в Ваттах через awk (v в мВ, i в мА)
+        power_w=$(awk -v v=$volt -v i=$i_ma 'BEGIN { printf "%.2f", (v * i) / 1000000 }')
+        # Для отображения в логе убираем минус, так как статус (Charging/Discharging) и так понятен
+        display_power="${power_w#-}W"
+        display_current="${i_ma#-}mA"
+    else
+        display_power="N/A"
+        display_current="N/A"
+    fi
 
-	# Пытаемся рассчитать состояние в % (если система отдает данные о емкости)
-	# charge_full (текущая макс. емкость) / charge_full_design (заводская емкость)
-	local full=$(cat "$b/charge_full" 2>/dev/null)
-	local design=$(cat "$b/charge_full_design" 2>/dev/null)
-	
-	if [ -n "$full" ] && [ -n "$design" ] && [ "$design" -gt 0 ]; then
-		health_pct=$(( full * 100 / design ))
-		health="$health ($health_pct%)"
-	fi
+    # Здоровье и циклы
+    health=$(cat "$b/health" 2>/dev/null)
+    cycles=$(cat "$b/cycle_count" 2>/dev/null)
+    [ -z "$cycles" ] && cycles="N/A"
 
-	# Вывод информации
-	log "Status:   $status ($cap%)"
-	log "Health:   $health"
-	log "Cycles:   $cycles"
-	log "Temp:     ${temp}°C"
-	log "Voltage:  ${volt}mV"
+    local full=$(cat "$b/charge_full" 2>/dev/null)
+    local design=$(cat "$b/charge_full_design" 2>/dev/null)
+    
+    if [ -n "$full" ] && [ -n "$design" ] && [ "$design" -gt 0 ]; then
+        health_pct=$(( full * 100 / design ))
+        # Ограничиваем 100%, если калибровка сбита
+        [ "$health_pct" -gt 100 ] && health_pct=100
+        health="$health ($health_pct%)"
+    fi
 
-	# Проверка на критический перегрев батареи
-	if [ "$temp" -gt 45 ]; then
-		log "${RED}WARNING: Battery overheating! (${temp}°C)${NC}"
-		[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
-	fi
+    log "Status:   $status ($cap%)"
+    log "Health:   $health"
+    log "Cycles:   $cycles"
+    log "Temp:     ${temp}°C"
+    log "Current:  $display_current"
+    log "Power:    $display_power"
+    log "Voltage:  ${volt}mV"
+
+    # Предупреждения
+    if [ "$temp" -gt 45 ]; then
+        log "${RED}WARNING: Battery overheating! (${temp}°C)${NC}"
+        [ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
+    fi
 }
 
-# Проверка интернета.
+# check_thermal_status
+# Проверяет системный статус троттлинга (Android 10+)
+check_thermal_status() {
+    local status temp
+    # 1. Пытаемся взять стандартный проп
+    status=$(getprop sys.thermal.status 2>/dev/null)
+    
+    # 2. Если пусто, пробуем найти критические зоны в ядре
+    if [ -z "$status" ]; then
+        # Ищем зону с типом 'skin' или 'cpu-thermal'
+        for z in /sys/class/thermal/thermal_zone*; do
+            type=$(cat "$z/type" 2>/dev/null)
+            if [[ "$type" == *"skin"* ]] || [[ "$type" == *"cpu"* ]]; then
+                temp=$(cat "$z/temp" 2>/dev/null)
+                # Если температура выше 45 градусов, помечаем как Moderate
+                if [ "$temp" -gt 55000 ]; then status=3; 
+                elif [ "$temp" -gt 45000 ]; then status=2; 
+                else status=0; fi
+                break
+            fi
+        done
+    fi
+
+    [ -z "$status" ] && return
+
+    case "$status" in
+        0) log "Thermal Status: ${GREEN}NONE (Cool)${NC}" ;;
+        1) log "Thermal Status: ${GREEN}LIGHT${NC}" ;;
+        2) log "Thermal Status: ${YELLOW}MODERATE${NC}" ;;
+        3) log "Thermal Status: ${YELLOW}SEVERE (Throttling)${NC}" ;;
+        4|5) log "Thermal Status: ${RED}CRITICAL/EMERGENCY${NC}" ;;
+    esac
+}
+
+# check_network
+# Попытка подключения к нескольким проверочным хостам.
+# - Перечисляем hosts; если хоть один reachable — считаем интернет доступным.
+# - Если нет и исполняемся от root, печатаем сетевые интерфейсы для диагностики.
 check_network() {
-	echo
-	echo "=== NETWORK ==="
-	quiet_hint
+    echo
+    echo "[ NETWORK ]"
+    quiet_hint
 
-	# Пингуем Google DNS (8.8.8.8).
-	# -c1: один пакет. -W1: ждать ответа максимум 1 секунду.
-	# &>/dev/null: скрываем весь вывод команды ping.
-	if ping -c1 -W1 8.8.8.8 &>/dev/null; then
-		log "${GREEN}✓ Internet OK${NC}"
-	else
-		log "${RED}✗ No Internet${NC}"
-	fi
+    local conn_type local_ip
+    # Пытаемся определить активный интерфейс (wlan0 = Wi-Fi, rmnet* = Mobile)
+    conn_type=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5}')
+    local_ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7}')
+
+    if [ -n "$conn_type" ]; then
+        case "$conn_type" in
+            wlan*) log "Connection: ${GREEN}Wi-Fi${NC} ($conn_type)" ;;
+            rmnet*|ccmni*) log "Connection: ${GREEN}Mobile Data${NC} ($conn_type)" ;;
+            *) log "Connection: $conn_type" ;;
+        esac
+        log "Local IP:   $local_ip"
+    fi
+
+    # Дальше твоя стандартная проверка пингом
+    local hosts=("8.8.8.8" "google.com")
+    local success=0
+    for host in "${hosts[@]}"; do
+        if ping -c1 -W2 "$host" >/dev/null 2>&1; then
+            success=1
+            log "${GREEN}✓ Internet connectivity: OK ($host)${NC}"
+            break
+        fi
+    done
+
+    [ "$success" -eq 0 ] && log "${RED}✗ No Internet connectivity${NC}"
 }
 
-# Анализ ошибок в системном журнале Android (logcat).
+# check_logcat
+# Снимает дамп ошибок (Error и выше) из буферов main, system, crash:
+# - сохраняет последние 500 строк в ERR_LOG
+# - выводит превью (до 5 последних строк)
+# - выставляет SYSTEM_STATUS при большом числе ошибок
 check_logcat() {
 	local c s
 	echo
-	echo "=== LOGCAT ERRORS ==="
-	> "$ERR_LOG" # Очищаем файл ошибок перед записью.
+	echo "[ LOGCAT ERRORS ]"
+	> "$ERR_LOG"
 
-	# Если включен флаг пропуска (-n), выходим.
 	[ "$NO_LOGCAT" -eq 1 ] && log "Logcat: skipped (--no-logcat)" && return
 
-	# logcat -d: дамп (вывод текущего состояния и выход).
-	# *:E означает "все теги с приоритетом Error или выше".
-	# tail -n 500: берем последние 500 ошибок.
 	logcat -b main,system,crash -d *:E | tail -n 500 > "$ERR_LOG"
 
-	# Если файл пустой (-s проверяет, что размер > 0), значит ошибок нет.
 	[ ! -s "$ERR_LOG" ] && log "${GREEN}No critical logcat errors detected${NC}" && return
 
-	# Считаем количество строк ошибок.
 	c=$(wc -l < "$ERR_LOG")
-	# Если ошибок очень много (>200), ставим статус Critical.
 	[ "$c" -gt 200 ] && SYSTEM_STATUS=$EXIT_CRITICAL
 	[ "$c" -gt 50 ] && [ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
-	
-	# Определяем, сколько строк показать в превью (максимум 5 или сколько есть, если меньше).
+
 	s=5; [ "$c" -lt 5 ] && s="$c"
 
 	log "${YELLOW}⚠ Detected $c errors. Showing last $s:${NC}"
 	echo "----------------------------------------"
-	# Показываем последние s строк, добавляя "> " в начало каждой для красоты.
 	tail -n "$s" "$ERR_LOG" | while read -r line; do
 		log "  > $line"
 	done
@@ -562,78 +750,106 @@ check_logcat() {
 	log "Full history: cat $ERR_LOG"
 }
 
-# Вывод топ процессов по потреблению CPU.
+# print_top
+# Выводит топ-процессов по использованию CPU (заголовок + 5 процессов)
+# Если команда — стандартный app_process, пытается вытащить имя пакета из /proc/PID/cmdline.
+# Форматирование колонок делаем через printf/out_printf.
 print_top() {
-	local p c cpu m
+	local p c cpu m real_name
 	echo
-	echo "=== TOP PROCESSES ==="
+	echo "[ TOP PROCESSES ]"
 	quiet_hint
 
-	# Форматированный вывод заголовка таблицы.
-	out_printf "%-6s %-15s %-6s %-6s\n" "PID" "COMMAND" "%CPU" "%MEM"
-	echo "----------------------------------------"
-	# ps: команда для списка процессов.
-	# -Ao ...: задаем нужные колонки.
-	# --sort=-%cpu: сортируем по убыванию CPU.
-	# head -n 6: берем топ 6 (1 заголовок + 5 процессов).
-	# tail -n +2: пропускаем первую строку (заголовок ps), так как мы напечатали свой.
+	out_printf "%-6s %-20s %-6s %-6s\n" "PID" "COMMAND/PACKAGE" "%CPU" "%MEM"
+	echo "------------------------------------------------"
+	
+	# Получаем топ 5 процессов по CPU
 	ps -Ao pid,comm,%cpu,%mem --sort=-%cpu | head -n 6 | tail -n +2 |
 	while read -r p c cpu m; do
-		# Печатаем каждую строку красиво выровненной.
-		out_printf "%-6s %-15.15s %-6s %-6s\n" "$p" "$c" "$cpu" "$m"
+		# Если процесс - стандартная обертка Android, лезем глубже
+		if [[ "$c" == "app_process"* ]] || [[ "$c" == "base" ]]; then
+			if [ -f "/proc/$p/cmdline" ]; then
+				# Читаем cmdline, заменяя нулевые байты на пробелы
+				real_name=$(tr '\0' ' ' < "/proc/$p/cmdline" | awk '{print $1}')
+				# Оставляем только последнюю часть пакета для краткости (напр. com.android.vending -> vending)
+				# Если хочешь полное имя, удали часть с 'sed' ниже
+				c=$(echo "$real_name" | sed 's/.*\.//')
+			fi
+		fi
+		
+		# Печатаем строку (увеличили ширину колонки имени до 20 символов)
+		out_printf "%-6s %-20.20s %-6s %-6s\n" "$p" "$c" "$cpu" "$m"
 	done
 }
 
-# Статистика ввода/вывода (I/O).
+
+# print_io
+# Обрабатывает /proc/diskstats и печатает прочитанные/записанные мегабайты для основных устройств (mmcblk*, sd*, dm-*). Сектора -> МБ через деление на 2048.
 print_io() {
-	echo
-	echo "=== I/O (Storage Usage) ==="
-	quiet_hint
+    echo
+    echo "[ I/O ] (Active Storage)"
+    quiet_hint
 
-	# Проверяем, существует ли файл статистики дисков ядра.
-	if [ ! -f /proc/diskstats ]; then
-		log "Error: /proc/diskstats not found"
-		return
-	fi
+    if [ ! -f /proc/diskstats ]; then
+        log "Error: /proc/diskstats not found"
+        return
+    fi
 
-	# Печатаем красивую шапку таблицы.
-	# %-10s означает "выделить 10 символов и выровнять по левому краю".
-	out_printf "%-10s %-12s %-12s\n" "DEVICE" "READ (MB)" "WRITE (MB)"
-	echo "----------------------------------------"
+    out_printf "%-10s %-18s %-10s %-10s\n" "DEVICE" "MOUNT" "READ(MB)" "WRITE(MB)"
+    echo "------------------------------------------------------------"
 
-	# Запускаем awk для обработки файла.
-	awk '
-	{
-		# $3 - это имя устройства (например, mmcblk0, loop1, dm-0).
-		
-		# Фильтрация (RegEx):
-		# ^(mmcblk[0-9]+ : Ищет основные чипы памяти (внутренняя память).
-		# |sd[a-z]+      : Ищет SCSI/UFS диски (иногда внутренняя память или OTG флешки).
-		# |dm-[0-9]+)    : Ищет Device Mapper (зашифрованные разделы Android, например Userdata).
-		# Мы специально НЕ ищем "p[0-9]", чтобы не выводить каждый мелкий раздел, а только диск целиком.
-		if ($3 ~ /^(mmcblk[0-9]+|sd[a-z]+|dm-[0-9]+)$/) {
-			
-			# $6 - количество прочитанных секторов.
-			# $10 - количество записанных секторов.
-			# Сектор обычно равен 512 байтам.
-			# Формула: (Секторы * 512) / 1024 / 1024 = Мегабайты.
-			# Упрощенно: Секторы / 2048 = Мегабайты.
-			
-			read_mb = $6 / 2048
-			write_mb = $10 / 2048
-			
-			# Печатаем данные. %.1f означает "число с одной цифрой после запятой".
-			printf "%-10s %-12.1f %-12.1f\n", $3, read_mb, write_mb
-		}
-	}
-	' /proc/diskstats
+    # Создаем временный файл со списком монтирований для AWK
+    local tmp_mnt="/tmp/mnt_map"
+    mount | awk '{print $1, $3}' > "$tmp_mnt"
+
+    awk -v m_file="$tmp_mnt" '
+    BEGIN {
+        # Сначала загружаем карту монтирований в память AWK из файла
+        while ((getline < m_file) > 0) {
+            mnt_map[$1] = $2
+        }
+        close(m_file)
+    }
+    {
+        if ($3 ~ /^(mmcblk[0-9]+|sd[a-z]+|dm-[0-9]+)$/) {
+            read_mb = $6 / 2048
+            write_mb = $10 / 2048
+            
+            if (read_mb > 0.1 || write_mb > 0.1) {
+                dev_path = "/dev/block/" $3
+                mnt = "system/other"
+                
+                # Ищем точное совпадение или по имени устройства
+                if (dev_path in mnt_map) {
+                    mnt = mnt_map[dev_path]
+                } else {
+                    for (d in mnt_map) {
+                        if (d ~ "/" $3 "$") {
+                            mnt = mnt_map[d]
+                            break
+                        }
+                    }
+                }
+
+                # Сокращаем длинные пути для читабельности
+                sub(/^\/mnt\/vendor\//, "v:", mnt)
+                sub(/^\/data\/media\/0/, "storage", mnt)
+                sub(/^\/apex\/.*/, "apex", mnt)
+
+                printf "%-10s %-18.18s %-10.1f %-10.1f\n", $3, mnt, read_mb, write_mb
+            }
+        }
+    }
+    ' /proc/diskstats
+
+    # Удаляем временный файл
+    rm -f "$tmp_mnt"
 }
 
-# Вспомогательная функция для получения "бэкенда" (реального устройства) точки монтирования.
+# get_backend_from_mountinfo
+# Парсит /proc/self/mountinfo, чтобы определить реальный источник (device) для заданной точки монтирования. Возвращает строку-идентификатор, например '/dev/block/dm-2' или '/dev/block/by-name/userdata'.
 get_backend_from_mountinfo() {
 	local mp="$1"
-
-	# Парсим /proc/self/mountinfo, чтобы найти, какое физическое устройство смонтировано в эту папку.
 	awk -v m="$mp" '
 		$5 == m {
 			for (i = 1; i <= NF; i++) {
@@ -646,15 +862,13 @@ get_backend_from_mountinfo() {
 	' /proc/self/mountinfo
 }
 
-# Функция поиска реальной точки монтирования для имени раздела (например, system).
+# find_mountpoint
+# По имени раздела (например "system") пытается найти его точку монтирования в /proc/self/mountinfo. Учитывает нынешние Android-особенности, такие как "system-as-root" (system_root). Возвращает путь монтирования или 1 (ошибка) — как обычный Unix-паттерн.
 find_mountpoint() {
 	local part="$1"
-
-	# Сначала ищем простое совпадение (например /data).
 	mp=$(awk -v p="/$part" '$5 == p {print $5}' /proc/self/mountinfo | head -1)
 	[ -n "$mp" ] && echo "$mp" && return
 
-	# Если это раздел system, тут все сложнее из-за system-as-root в новых Android.
 	if [ "$part" = "system" ]; then
 		mp=$(awk '
 			$5 ~ /system_root/ {
@@ -668,20 +882,24 @@ find_mountpoint() {
 		' /proc/self/mountinfo)
 		[ -n "$mp" ] && echo "$mp" && return
 	fi
-
 	return 1
 }
 
-# Детальная проверка разделов системы.
+# check_partitions
+# Формирует табличный вывод часто используемых разделов:
+#   system, system_ext, product, vendor, odm, cache, data, metadata, apex, persist
+# Для каждого:
+#   - находит точку монтирования (find_mountpoint)
+#   - берет строку df -h и парсит size/used/free
+#   - определяет "backend" (реальное блочное устройство) через mountinfo
 check_partitions() {
 	echo
-	echo "=== SYSTEM PARTITIONS ==="
+	echo "[ SYSTEM PARTITIONS ]"
 	quiet_hint
 
 	out_printf "%-12s %-28s %8s %8s %8s\n" "PARTITION" "MOUNT POINT" "SIZE" "USED" "FREE"
 	out_printf "%-12s %-28s %8s %8s %8s\n" "----------" "----------------------------" "--------" "--------" "--------"
 
-	# Список разделов для проверки.
 	local parts=(
 		system
 		system_ext
@@ -698,11 +916,9 @@ check_partitions() {
 	for part in "${parts[@]}"; do
 	local mp df_line size used free backend
 
-	# Ищем, куда смонтирован раздел.
 	mp=$(find_mountpoint "$part")
-	[ -z "$mp" ] && continue # Если не нашли, пропускаем.
+	[ -z "$mp" ] && continue
 
-	# Получаем данные df (disk free) для этой точки.
 	df_line=$(df -h "$mp" 2>/dev/null | awk 'NR==2')
 	[ -z "$df_line" ] && continue
 
@@ -710,34 +926,63 @@ check_partitions() {
 	used=$(echo "$df_line" | awk '{print $3}')
 	free=$(echo "$df_line" | awk '{print $4}')
 
-	# Получаем техническое имя устройства.
 	backend="$(get_backend_from_mountinfo "$mp")"
 	[ -z "$backend" ] && backend="unknown"
 
-	# Выводим в таблицу.
 	out_printf "%-12s %-28s %8s %8s %8s\n" \
 		"$part" "$mp" "$size" "$used" "$free"
 
-	# Пишем в лог.
 	log "Mounted at $mp -> $backend | Size: $size | Used: $used | Free: $free"
 	done
 }
 
-# Определение метода Root-прав.
+# check_pixel_security
+# Специфична для устройств Google Pixel.
+# Пытается определить наличие Titan/StrongBox и состояние Verified Boot.
+check_pixel_security() {
+	local vendor
+	vendor=$(getprop ro.product.manufacturer | tr '[:upper:]' '[:lower:]')
+
+	# Если устройство не от Google — пропускаем функцию без шума
+	[[ "$vendor" != *"google"* ]] && return
+
+	echo
+	echo "[ GOOGLE TITAN SECURITY ]"
+	quiet_hint
+
+	local titan_status hardware_level
+
+	hardware_level=$(getprop ro.hardware.keystore_impl 2>/dev/null)
+	[ -z "$hardware_level" ] && hardware_level="unknown"
+
+	if logcat -d | grep -qi "StrongBox" ; then
+		titan_status="${GREEN}Active (StrongBox detected)${NC}"
+	else
+		titan_status="${YELLOW}Standby / Not detected${NC}"
+	fi
+
+	log "Titan Chip:      $titan_status"
+	log "Keystore Impl:   $hardware_level"
+	log "Verified Boot:   $(getprop ro.boot.verifiedbootstate 2>/dev/null)"
+}
+
+# detect_root_method
+# Определяет метод получения root:
+#   - Magisk (проверки команд и каталогов)
+#   - KernelSU (файлы/символы)
+#   - Root (unknown) — если uid=0, но явных признаков Magisk/Kernelsu нет
+# Результат печатается в stdout (например, "Magisk").
 detect_root_method() {
-	# Проверяем наличие команды magisk.
 	if command -v magisk >/dev/null 2>&1; then
 		echo "Magisk"
 		return
 	fi
 
-	# Проверяем стандартные папки Magisk.
 	if [ -d /sbin/.magisk ] || [ -d /data/adb/magisk ]; then
 		echo "Magisk"
 		return
 	fi
 
-	# Проверяем признаки KernelSU (файлы устройств или версия ядра).
 	if [ -e /dev/kernelsu ] || \
 		[ -e /sys/kernel/kernelsu ] || \
 		grep -q kernelsu /proc/version 2>/dev/null; then
@@ -745,11 +990,13 @@ detect_root_method() {
 		return
 	fi
 
-	# Если ничего не нашли, но uid=0 (суперпользователь), значит рут есть, но неизвестный.
 	[ "$(id -u)" -eq 0 ] && echo "Root (unknown)" || echo "No Root"
 }
 
-# Получение версии Magisk.
+# get_magisk_version
+# Пытается получить версию Magisk:
+#   - через утилиту magisk (если доступна)
+#   - через файл /data/adb/magisk/magisk_version (если есть)
 get_magisk_version() {
 	if command -v magisk >/dev/null 2>&1; then
 		magisk -v 2>/dev/null | cut -d':' -f1
@@ -764,32 +1011,141 @@ get_magisk_version() {
 	echo "unknown"
 }
 
-# Проверка статуса Zygisk (модуль Magisk для инъекции кода в процессы).
+# get_zygisk_status
+# Проверяет, включён ли Zygisk:
+#  - смотрит свойство persist.magisk.zygisk
+#  - ищет сокеты в /dev/socket/, связанные с zygisk
+# Возвращает "Enabled", "Enabled (Reboot Required)" или "Disabled".
 get_zygisk_status() {
-	local prop_status socket_exists
+    local prop_status socket_exists env_check magisk_ver zygote_check
+    
+    # 1. Проверка через свойства Magisk
+    prop_status=$(getprop persist.magisk.zygisk 2>/dev/null)
+    
+    # 2. Проверка активных сокетов (динамический показатель)
+    socket_exists=$(ls /dev/socket/ 2>/dev/null | grep -c "zygisk")
+    
+    # 3. Проверка через переменные окружения Zygote (самый точный метод)
+    # Zygisk внедряет свои переменные в процесс zygote
+    zygote_check=$(grep -E "zygisk|magisk" /proc/$(pidof zygote | awk '{print $1}')/environ 2>/dev/null)
+    
+    # 4. Проверка через наличие внедренной библиотеки в памяти
+    # Если в картах памяти zygote есть zygisk.so — он 100% активен
+    local mem_check=0
+    if [ -f "/proc/$(pidof zygote | awk '{print $1}')/maps" ]; then
+        if grep -q "zygisk" "/proc/$(pidof zygote | awk '{print $1}')/maps" 2>/dev/null; then
+            mem_check=1
+        fi
+    fi
 
-	prop_status=$(getprop persist.magisk.zygisk 2>/dev/null)
-	# Ищем любые сокеты, начинающиеся на zygisk
-	socket_exists=$(ls /dev/socket/ 2>/dev/null | grep -c "zygisk")
-
-	if [ "$socket_exists" -gt 0 ]; then
-		echo "Enabled"
-	elif [ "$prop_status" = "1" ]; then
-		echo "Enabled (Reboot Required)"
-	else
-		echo "Disabled"
-	fi
+    if [ "$mem_check" -eq 1 ] || [ -n "$zygote_check" ]; then
+        echo -e "${GREEN}Enabled (Active)${NC}"
+    elif [ "$socket_exists" -gt 0 ]; then
+        echo -e "${YELLOW}Enabled (Standby/Socket detected)${NC}"
+    elif [ "$prop_status" = "1" ]; then
+        echo -e "${YELLOW}Enabled (Reboot Required)${NC}"
+    else
+        echo -e "${RED}Disabled${NC}"
+    fi
 }
 
-# Вывод общей информации о системе.
+# get_system_locale
+# Возвращает системную локаль — сначала persist.sys.locale, затем ro.product.locale
+get_system_locale() {
+	getprop persist.sys.locale \ || getprop ro.product.locale
+}
+
+# get_build_description
+# Возвращает строку ROM части прошивки (ro.build.display.id)
+get_build_description() {
+	getprop ro.build.display.id
+}
+
+# get_firmware_description
+# Возвращает строку firmware части прошивки (ro.build.description)
+get_firmware_description() {
+	getprop ro.build.description
+}
+
+# get_board_name
+# Возвращает кодовое имя платы (ro.product.board)
+get_board_name() {
+	getprop ro.product.board
+}
+
+# get_cpu_governor
+# Возвращает текущий governor для cpu0 (scaling_governor)
+get_cpu_governor() {
+	local gov
+	gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
+	[ -n "$gov" ] && echo "$gov"
+}
+
+# get_screen_resolution
+# Использует утилиту wm (window manager) для получения размеров экрана
+# Формат результата: "WIDTHxHEIGHT" (например "1080x2400")
+get_screen_resolution() {
+	wm size 2>/dev/null | awk -F': ' 'NR==1 {print $2}'
+}
+
+# print_magisk_modules
+# Возвращает список установленных модулей Magisk.
+# Проверяет наличие каталога /data/adb/modules и выводит имена модулей, исключая служебный каталог lost+found.
+# Используется для формирования расширенного (EXTENDED) вывода.
+print_magisk_modules() {
+	local modules_dir="/data/adb/modules"
+	[ -d "$modules_dir" ] || return
+
+	echo
+	echo "[ MAGISK MODULES ]"
+
+	local found=0
+
+	for m in "$modules_dir"/*; do
+		[ -d "$m" ] || continue
+		[ "$(basename "$m")" = "lost+found" ] && continue
+
+		found=1
+
+		local name version desc state
+
+		# Имя модуля
+		if [ -f "$m/module.prop" ]; then
+			name=$(grep -m1 '^name=' "$m/module.prop" | cut -d= -f2)
+			version=$(grep -m1 '^version=' "$m/module.prop" | cut -d= -f2)
+			desc=$(grep -m1 '^description=' "$m/module.prop" | cut -d= -f2)
+		fi
+
+		# Статус модуля
+		if [ -f "$m/disable" ]; then
+			state="Disabled"
+		else
+			state="Enabled"
+		fi
+
+		printf "%s - %s\n" "$(date +%H:%M:%S)" "${name:-$(basename "$m")}"
+		[ -n "$version" ] && printf "           Version: %s\n" "$version"
+		[ -n "$desc" ]    && printf "           Desc:    %s\n" "$desc"
+		printf "           Status:  %s\n\n" "$state"
+	done
+
+	[ "$found" -eq 0 ] && echo "$(date +%H:%M:%S) - No Magisk modules installed"
+}
+
+# print_system
+# Выводит базовую информацию о системе:
+#  - uptime
+#  - root: YES/NO
+#  - system access level + версия Magisk (если есть)
+#  - Zygisk статус
+#  - SELinux state и ABI
 print_system() {
 	echo
-	echo "=== SYSTEM INFO ==="
+	echo "[ SYSTEM INFO ]"
 	quiet_hint
 
-	log "Uptime: $(uptime -p)" # Время работы без перезагрузки.
+	log "Uptime: $(uptime -p)"
 
-	# Если скрипт запущен от рута (id 0).
 	if [ "$(id -u)" -eq 0 ]; then
 		log "Root: ${GREEN}YES${NC}"
 		log "System Access Level: $(detect_root_method) $(get_magisk_version)"
@@ -798,62 +1154,74 @@ print_system() {
 		log "Root: ${RED}NO${NC}"
 	fi
 
-	log "SELinux: $(getenforce 2>/dev/null)" # Статус безопасности SELinux (Enforcing/Permissive).
-	log "ABI: $(getprop ro.product.cpu.abi)" # Архитектура процессора (например, arm64-v8a).
+	log "SELinux: $(getenforce 2>/dev/null)"
+	log "ABI: $(getprop ro.product.cpu.abi)"
 }
 
-# Функция проверки безопасности. Работает только на устройствах Google Pixel. Вывод игнорируется, если это не вышеуказаное устройство.
-check_pixel_security() {
-	# Объявляем локальную переменную для вендора
-	local vendor
-	# Получаем производителя и переводим в нижний регистр для надежного сравнения
-	vendor=$(getprop ro.product.manufacturer | tr '[:upper:]' '[:lower:]')
-	
-	# Если в имени производителя нет "google", тихо выходим из функции
-	[[ "$vendor" != *"google"* ]] && return
-
+# print_system_extended
+# Расширенный блок system info — содержит язык, описание прошивки и разрешение экрана, помимо стандартной информации из print_system.
+print_system_extended() {
 	echo
-	echo "=== GOOGLE TITAN SECURITY ==="
+	echo "[ SYSTEM INFO ] (EXTENDED)"
 	quiet_hint
 
-	# Объявляем локальные переменные для работы внутри функции
-	local titan_status hardware_level
-	
-	# Проверяем уровень аппаратной защиты Keymaster
-	hardware_level=$(getprop ro.hardware.keystore_impl 2>/dev/null)
-	[ -z "$hardware_level" ] && hardware_level="unknown"
+	log "Uptime: $(uptime -p)"
+	log "Locale: $(get_system_locale)"
+	log "Build: $(get_build_description)"
+	log "Firmware: $(get_firmware_description)"
 
-	# Проверка StrongBox через системный лог (признак активности Titan M/M2)
-	if logcat -d | grep -qi "StrongBox" ; then
-		titan_status="${GREEN}Active (StrongBox detected)${NC}"
+	# Проверка версии графического API
+    log "Vulkan Driver: $(bootstrap.sh getprop ro.hardware.vulkan 2>/dev/null || echo "default")"
+    log "OpenGL Vendor: $(getprop ro.hardware.egl 2>/dev/null || echo "default")"
+
+    log "Screen Resolution: $(get_screen_resolution)"
+
+	if [ "$(id -u)" -eq 0 ]; then
+		log "Root: ${GREEN}YES${NC}"
+		log "System Access Level: $(detect_root_method) $(get_magisk_version)"
+		log "Zygisk: $(get_zygisk_status)"
 	else
-		titan_status="${YELLOW}Standby / Not detected${NC}"
+		log "Root: ${RED}NO${NC}"
 	fi
 
-	log "Titan Chip:      $titan_status"
-	log "Keystore Impl:   $hardware_level"
-	
-	# Проверяем состояние Verified Boot (green/yellow/orange/red)
-	log "Verified Boot:   $(getprop ro.boot.verifiedbootstate 2>/dev/null)"
+	log "SELinux: $(getenforce 2>/dev/null)"
+	log "ABI: $(getprop ro.product.cpu.abi)"
 }
 
-# Главная функция (точка входа в логику).
-main() {
+# run_monitor
+# Основная последовательность запуска:
+#  - проверка зависимостей
+#  - dry-run режим (только инфо) при DRY_RUN=1
+#  - подготовка логов (rotate_log, touch ERR_LOG)
+#  - запуск всех блоков проверки по очереди
+#  - вывод standard/extended system info в зависимости от флага EXTENDED
+#  - запись финального exit code в лог
+run_monitor() {
+	check_dependencies || return $?
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "[ DRY RUN MODE ] — Only showing system info"
+		echo
+		print_header
+		print_system
+		log "DRY RUN completed successfully"
+		return $EXIT_OK
+	fi
+
 	SYSTEM_STATUS=$EXIT_OK
 	rotate_log
-	touch "$ERR_LOG" 2>/dev/null # Создаем пустой файл ошибок, если нет.
+	touch "$ERR_LOG" 2>/dev/null
 
-	# Пишем разделитель начала сессии в лог.
 	echo "___________________________________________________" >> "$LOG"
 	echo "LOG SESSION START: $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG"
 	echo "___________________________________________________" >> "$LOG"
 
-	# Запускаем все проверки по очереди.
 	print_header
 	check_storage
 	check_memory
 	check_cpu
 	check_cpu_temp
+	check_thermal_status
 	check_gpu
 	check_battery
 	check_network
@@ -862,7 +1230,16 @@ main() {
 	print_io
 	check_partitions
 	check_pixel_security
-	print_system
+
+	if [ "$EXTENDED" -eq 1 ]; then
+		print_system_extended
+	else
+		print_system
+	fi
+	
+	if [ "$EXTENDED" -eq 1 ]; then
+	    print_magisk_modules
+	fi
 
 	echo "========================================"
 	echo "Log file: $LOG"
@@ -872,49 +1249,65 @@ main() {
 	return "$SYSTEM_STATUS"
 }
 
-# Обработка аргументов командной строки.
-# $# - количество переданных аргументов. Пока их больше 0, крутим цикл.
+# Обработка аргументов командной строки (CLI).
+# Поддерживаются опции, описанные в show_help. После обработки — сдвигаем аргументы с помощью shift, чтобы перейти к следующему.
 while [ $# -gt 0 ]; do
 	case "$1" in
 		-h|--help) show_help; exit 0 ;;
-		-q|--quiet) QUIET=1 ;; # Включаем тихий режим.
-		-n|--no-logcat) NO_LOGCAT=1 ;; # Отключаем сканирование logcat.
-		-l|--loop) shift; LOOP_INTERVAL="$1" ;; # Забираем следующее значение как интервал.
+		-q|--quiet) QUIET=1 ;;
+		-n|--no-logcat) NO_LOGCAT=1 ;;
+		-l|--loop) shift; LOOP_INTERVAL="$1" ;;
+		-d|--dry-run) DRY_RUN=1 ;;
+		-b|--brief) BRIEF_MODE=1 ;;
+		-e|--extended) EXTENDED=1 ;;
 		-c|--clear-log)
 			if [ -f "$LOG" ]; then
-				: > "$LOG"  # Магия Bash: очищает файл, не удаляя его
+				: > "$LOG"
 				echo "Log file cleared: $LOG"
 			else
-				echo "Log file not found, nothing to clear."
+				echo "Log file not found, nothing to clear"
 			fi
-			exit 0 ;; # Выходим, так как мы только чистили лог
-		
-		# Считываем кастомные пороги (флаг + следующее значение).
+			exit 0 ;;
+
 		--disk-warn) shift; DISK_WARN="$1" ;;
 		--disk-crit) shift; DISK_CRIT="$1" ;;
 		--ram-warn) shift; RAM_WARN="$1" ;;
 		--ram-crit) shift; RAM_CRIT="$1" ;;
 		--gpu-warn) shift; GPU_WARN="$1" ;;
 		--gpu-crit) shift; GPU_CRIT="$1" ;;
-		
-		# Если аргумент неизвестен, выводим ошибку и выходим.
+
 		*) echo "Unknown option: $1"; exit $EXIT_INTERNAL ;;
 	esac
-	shift # Сдвигаем список аргументов влево (удаляем обработанный $1).
+	shift
 done
 
-# Если не тихий режим, очищаем экран консоли перед выводом.
+# Перед началом вывода очищаем экран (если не quiet), чтобы лог выглядел аккуратно.
 [ "$QUIET" -eq 0 ] && clear
 
-# Логика цикла. Если задан интервал (--loop).
+# Главная логика цикла.
+# Если задан LOOP_INTERVAL (>0), запускаем run_monitor в бесконечном цикле, защищаясь от повторных запусков через check_already_running (lock-file).
+# В цикле считаем время выполнения и при необходимости ждём остаток интервала.
 if [ "$LOOP_INTERVAL" -gt 0 ]; then
-	while true; do # Бесконечный цикл.
+	check_already_running || exit $?
+
+	while true; do
 		clear
-		main # Запускаем главную функцию.
-		sleep "$LOOP_INTERVAL" # Ждем указанное время.
+		run_monitor
+
+		local start_time=$(date +%s)
+		local end_time=$(date +%s)
+		local elapsed=$((end_time - start_time))
+
+		if [ "$elapsed" -lt "$LOOP_INTERVAL" ]; then
+			sleep $((LOOP_INTERVAL - elapsed))
+		else
+			# Если выполнение заняло дольше, чем указанный интервал — предупреждение.
+			echo "WARNING: Execution time ($elapsed s) exceeded loop interval ($LOOP_INTERVAL s)" >&2
+			sleep "$LOOP_INTERVAL"
+		fi
 	done
 else
-	# Запуск один раз.
-	main
-	exit $? # Выходим с кодом возврата функции main.
+	# Одиночный запуск: выполняем монитор и выходим с кодом результата.
+	run_monitor
+	exit $?
 fi
