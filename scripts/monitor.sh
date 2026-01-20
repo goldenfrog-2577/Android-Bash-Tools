@@ -93,15 +93,17 @@ check_already_running() {
 
 	if [ -f "$lock_file" ]; then
 		pid=$(cat "$lock_file" 2>/dev/null)
+		# kill -0 проверяет, существует ли процесс с PID
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
 			echo "ERROR: Script is already running with PID $pid" >&2
 			echo "If this is wrong, delete: $lock_file" >&2
 			return $EXIT_INTERNAL
 		else
+			# stale lock — удаляем
 			rm -f "$lock_file"
 		fi
 	fi
-
+	# записываем текущий PID в lock
 	echo $$ > "$lock_file"
 
 	# trap устанавливается один раз на весь жизненный цикл скрипта
@@ -367,7 +369,7 @@ check_memory() {
 # Полезно для архитектур Big.LITTLE (как Snapdragon 870), где частоты кластеров различаются.
 get_cpu_freqs_detailed() {
 	local cpu_dir="/sys/devices/system/cpu"
-	local f i online_status
+	local f i online_status core_info
 
 	log "CPU Frequencies:"
 
@@ -383,13 +385,15 @@ get_cpu_freqs_detailed() {
 		if [ "$online_status" -eq 1 ]; then
 			f=$(cat "$cpu_dir/cpu$i/cpufreq/scaling_cur_freq" 2>/dev/null)
 			if [ -n "$f" ]; then
-				out_printf "              Core $i: %4d MHz\n" "$((f/1000))"
+				# Формируем строку и отправляем в log
+				core_info=$(printf "Core %d: %4d MHz" "$i" "$((f/1000))")
+				log "              $core_info"
 			else
-				out_printf "              Core $i: %4s\n" "DATA_ERR"
+				log "              Core $i: DATA_ERR"
 			fi
 		else
-			# Выделяем OFFLINE цветом, чтобы сразу бросалось в глаза
-			out_printf "              Core $i: ${RED}%4s${NC}\n" "OFFLINE"
+			# Выделяем OFFLINE для терминала, log сам очистит цвета для файла
+			log "              Core $i: ${RED}OFFLINE${NC}"
 		fi
 	done
 }
@@ -498,7 +502,7 @@ check_cpu_temp() {
 	fi
 }
 
-# check_gpu
+# 
 # Поддерживает Qualcomm (Adreno) и Mali (MediaTek / Exynos / Tensor).
 # Собирает модель, частоту, governor и загрузку GPU; сравнивает с порогами.
 # Примечание: чтение путей /sys может отличаться между устройствами, поэтому здесь предусмотрено несколько вариантов файлов.
@@ -598,6 +602,21 @@ check_gpu() {
 		[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
 	else
 		log "Load:     $gpu_load"
+	fi
+
+	# Добавляем в блок [ GPU MONITOR ]
+	local fps_data
+
+	# Получаем текущий FPS через SurfaceFlinger
+	# Мы берем задержку между кадрами и пересчитываем в FPS
+	fps_data=$(dumpsys SurfaceFlinger --latency | head -1 | awk '{if($1>0) printf "%.0f", 1000000000/$1}')
+
+	if [ "$fps_data" -lt 40 ]; then
+		log "FPS:      ${RED}${fps_data}${NC} (Lagging)"
+	elif [ "$fps_data" -lt 90 ]; then
+		log "FPS:      ${YELLOW}${fps_data}${NC}"
+	else
+		log "FPS:      ${GREEN}${fps_data}${NC}"
 	fi
 }
 
@@ -754,7 +773,9 @@ check_logcat() {
 
 	[ "$NO_LOGCAT" -eq 1 ] && log "Logcat: skipped (--no-logcat)" && return
 
-	logcat -b main,system,crash -d *:E | tail -n 500 > "$ERR_LOG"
+	logcat -b main,system,crash -d *:E \
+	| grep -v "^--------- beginning of" \
+	| tail -n 500 > "$ERR_LOG"
 
 	[ ! -s "$ERR_LOG" ] && log "${GREEN}No critical logcat errors detected${NC}" && return
 
@@ -1148,7 +1169,7 @@ print_magisk_modules() {
 
 		printf "%s - %s\n" "$(date +%H:%M:%S)" "${name:-$(basename "$m")}"
 		[ -n "$version" ] && printf "           Version: %s\n" "$version"
-		[ -n "$desc" ]    && printf "           Desc:    %s\n" "$desc"
+		[ -n "$desc" ]    && printf "           Description:    %s\n" "$desc"
 		printf "           Status:  %s\n\n" "$state"
 	done
 
@@ -1392,7 +1413,7 @@ if [ "$LOOP_INTERVAL" -gt 0 ]; then
 		if [ "$elapsed" -lt "$LOOP_INTERVAL" ]; then
 			# Спим остаток времени
 			sleep_time=$((LOOP_INTERVAL - elapsed))
-			echo -e "\nWaiting ${sleep_time}s for next cycle..."
+			echo -e "\nWaiting ${sleep_time}s for next cycle... Ctrl + C to exit"
 			sleep "$sleep_time"
 		else
 			# Если выполнение заняло дольше, чем указанный интервал
@@ -1402,7 +1423,7 @@ if [ "$LOOP_INTERVAL" -gt 0 ]; then
 		fi
 	done
 else
-	# Одиночный запуск
+	# Одиночный запуск: выполняем монитор и выходим с кодом результата.
 	run_monitor
 	exit $?
 fi
