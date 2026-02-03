@@ -125,7 +125,8 @@ EXIT_INTERNAL=3
 # - DRY_RUN: если 1 — проверить зависимости и вывести только заголовок
 # - BRIEF_MODE: если 1 — показывать только важные сообщения (WARNING/CRITICAL)
 # - EXTENDED: если 1 — в конце вывести расширенную информацию о системе
-# NO_FILE_LOG: если 1 — разрешить запись логов в файл $LOG
+# - NO_FILE_LOG: если 1 — разрешить запись логов в файл $LOG
+# - ENABLE_NET_TEST: если 1 — разрешить выполнение функци check_iperf3_speed
 SYSTEM_STATUS=$EXIT_OK
 
 NO_LOGCAT=0
@@ -135,6 +136,7 @@ EXTENDED=0
 DRY_RUN=0
 QUIET=0
 LOOP_INTERVAL=0
+ENABLE_NET_TEST=0
 
 # Thresholds: параметры, при превышении которых срабатывают WARNING/CRITICAL
 # - DISK_WARN / DISK_CRIT: в процентах для дисковых разделов (/data)
@@ -148,7 +150,7 @@ RAM_CRIT=90
 CPU_WARN_MULT=1.5
 CPU_CRIT_MULT=2.0
 GPU_WARN=80
-GPU_CRIT=95
+GPU_CRIT=90
 
 # Цвета: включаем escape-последовательности только если stdout — интерактивный терминал
 # Проверка [ -t 1 ] — true, если дескриптор 1 (stdout) привязан к терминалу.
@@ -209,7 +211,7 @@ Options:
   -h, --help              Show this help message and exit
   -q, --quiet             Quiet mode: suppress terminal output (log file only)
   -n, --no-logcat         Skip Logcat error scanning (faster execution)
-  -f, --no-file             Disable writing output to the .log file (Terminal only)
+  -f, --no-file           Disable writing output to the .log file (Terminal only)
   -l, --loop <seconds>    Run monitor continuously with a delay of X seconds
   -b, --brief             Brief mode: show only warnings and errors (good for quick checks)
   -d, --dry-run           Test mode: verify dependencies and show basic info without full checks
@@ -242,6 +244,8 @@ Threshold options (alert trigger levels):
   --ram-crit <percent>    RAM usage critical threshold (default: 90)
   --gpu-warn <percent>    GPU load warning threshold (default: 80)
   --gpu-crit <percent>    GPU load critical threshold (default: 95)
+
+===================================
 EOF
 }
 
@@ -266,11 +270,13 @@ print_header() {
 
 	echo "========================================"
 	echo "ANDROID ROOT SYSTEM MONITOR"
+	echo
 	echo "Device: $(getprop ro.product.model) ($codename)"
 	echo "Android: $(getprop ro.build.version.release)"
 	echo "Kernel: $(uname -r)"
 	echo "Active slot: $slot"
 	echo "Time: $(date)"
+	echo
 	echo "========================================"
 }
 
@@ -326,7 +332,7 @@ check_memory() {
 	echo "[ MEMORY ] (RAM)"
 	quiet_hint
 
-	# читаем значения в килобайтах
+	# Читаем значения в килобайтах
 	total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 	avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
 
@@ -363,19 +369,16 @@ check_memory() {
 }
 
 # get_cpu_freqs_detailed
-# Опрашивает каждое из 8 ядер процессора и выводит текущую частоту для каждого.
-# Если ядро отключено системой энергосбережения (Hotplug), выводит статус OFFLINE.
-# Использует форматирование %4s/%4d для сохранения идеальной структуры колонок.
-# Полезно для архитектур Big.LITTLE (как Snapdragon 870), где частоты кластеров различаются.
+# Опрашивает каждое ядро: выводит текущую и максимальную частоты (cur/max).
+# Помогает отследить архитектуру Big.LITTLE и понять лимиты каждого ядра.
 get_cpu_freqs_detailed() {
 	local cpu_dir="/sys/devices/system/cpu"
-	local f i online_status core_info
+	local f_cur f_max i online_status core_info
 
-	log "CPU Frequencies:"
+	log "CPU Frequencies (Current/Max):"
 
 	for i in {0..7}; do
-		# Проверяем, активно ли ядро (1 - online, 0 - offline)
-		# Ядро 0 обычно всегда online, поэтому файла может не быть — считаем его активным по умолчанию.
+		# Проверяем статус ядра (0 - offline, 1 - online)
 		if [ -f "$cpu_dir/cpu$i/online" ]; then
 			online_status=$(cat "$cpu_dir/cpu$i/online" 2>/dev/null)
 		else
@@ -383,16 +386,18 @@ get_cpu_freqs_detailed() {
 		fi
 
 		if [ "$online_status" -eq 1 ]; then
-			f=$(cat "$cpu_dir/cpu$i/cpufreq/scaling_cur_freq" 2>/dev/null)
-			if [ -n "$f" ]; then
-				# Формируем строку и отправляем в log
-				core_info=$(printf "Core %d: %4d MHz" "$i" "$((f/1000))")
+			f_cur=$(cat "$cpu_dir/cpu$i/cpufreq/scaling_cur_freq" 2>/dev/null)
+			f_max=$(cat "$cpu_dir/cpu$i/cpufreq/scaling_max_freq" 2>/dev/null)
+			
+			if [ -n "$f_cur" ] && [ -n "$f_max" ]; then
+				# Форматируем как "1804/2419 MHz"
+				# %4d гарантирует, что числа не "поплывут", если частота станет трехзначной
+				core_info=$(printf "Core %d: %4d / %4d MHz" "$i" "$((f_cur/1000))" "$((f_max/1000))")
 				log "              $core_info"
 			else
 				log "              Core $i: DATA_ERR"
 			fi
 		else
-			# Выделяем OFFLINE для терминала, log сам очистит цвета для файла
 			log "              Core $i: ${RED}OFFLINE${NC}"
 		fi
 	done
@@ -432,7 +437,7 @@ check_cpu() {
 		fi
 	fi
 
-	# сравниваем дробные значения с помощью awk (bash не поддерживает float)
+	# Сравниваем дробные значения с помощью awk (bash не поддерживает float)
 	warn=$(awk -v l="$load" -v c="$cores" -v m="$CPU_WARN_MULT" 'BEGIN{print (l > c*m)}')
 	crit=$(awk -v l="$load" -v c="$cores" -v m="$CPU_CRIT_MULT" 'BEGIN{print (l > c*m)}')
 
@@ -452,6 +457,8 @@ check_cpu() {
 # Если нет подходящих датчиков — пытаемся взять температуру батареи как прокси.
 check_cpu_temp() {
 	local max=0 z type raw t b
+	local zones=0 denied=0 valid=0
+
 	echo
 	echo "[ CPU TEMP ]"
 	quiet_hint
@@ -460,49 +467,62 @@ check_cpu_temp() {
 	# tsens, cpu, soc, msm_therm, core - покрывает 99% Android устройств
 	for z in /sys/class/thermal/thermal_zone*; do
 		[ -f "$z/type" ] || continue
-		type=$(cat "$z/type" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-		raw=$(cat "$z/temp" 2>/dev/null)
+
+		type=$(cat "$z/type" 2>/dev/null) || { denied=1; continue; }
+		type=$(echo "$type" | tr '[:upper:]' '[:lower:]')
 
 		# Фильтр типов зон
-		case "$type" in 
-			*tsens*|*cpu*|*soc*|*core*|*msm_therm*) ;; 
-			*) continue ;; 
+		case "$type" in
+			*tsens*|*cpu*|*soc*|*core*|*msm_therm*) ;;
+			*) continue ;;
 		esac
 
+		zones=$((zones + 1))
+		# Авто-определение формата: 45000 (ms) или 45 (градусы)
+		raw=$(cat "$z/temp" 2>/dev/null) || { denied=1; continue; }
 		[ -z "$raw" ] || [ "$raw" -le 0 ] && continue
 
-		# Авто-определение формата: 45000 (ms) или 45 (градусы)
 		if [ "$raw" -gt 1000 ]; then
 			t=$((raw / 1000))
 		else
 			t=$raw
 		fi
-
 		# Валидация: 15°C (минимум) до 115°C (порог троттлинга)
 		if [ "$t" -ge 15 ] && [ "$t" -le 115 ]; then
+			valid=1
 			[ "$t" -gt "$max" ] && max="$t"
 		fi
 	done
 
+	# Добавляем цветовой индикатор (желтый если > 60, красный если > 80)
 	if [ "$max" -gt 0 ]; then
-		# Добавляем цветовой индикатор (желтый если > 60, красный если > 80)
 		local color=$NC
 		[ "$max" -gt 60 ] && color=$YELLOW
 		[ "$max" -gt 80 ] && color=$RED
-
 		log "CPU Max Temp: ${color}${max}°C${NC}"
+		return
+	fi
+
+	# Пояснительная секция, если определение температуры CPU по какой-то причине недоступно
+	if [ "$zones" -eq 0 ]; then
+		log "CPU Temp: ${RED}unavailable${NC} (no thermal zones)"
+	elif [ "$denied" -eq 1 ]; then
+		log "CPU Temp: ${RED}unavailable${NC} (permission denied)"
+	elif [ "$valid" -eq 0 ]; then
+		log "CPU Temp: ${RED}unavailable${NC} (invalid sensor data)"
 	else
-		# План Б: Если датчики CPU молчат, берем батарею
 		log "CPU Temp: ${RED}unavailable${NC}"
-		b=$(cat /sys/class/power_supply/battery/temp 2>/dev/null)
-		if [ -n "$b" ]; then
-			# У батарей делитель обычно 10 (например 365 -> 36.5C)
-			log "SoC Temp (battery proxy): $((b/10))°C"
-		fi
+	fi
+
+	# План Б: Если датчики CPU молчат, берем батарею
+	b=$(cat /sys/class/power_supply/battery/temp 2>/dev/null)
+	if [ -n "$b" ]; then
+		# У батарей делитель обычно 10 (например 365 -> 36.5C)
+		log "SoC Temp (battery proxy): $((b/10))°C"
 	fi
 }
 
-# 
+# check_gpu
 # Поддерживает Qualcomm (Adreno) и Mali (MediaTek / Exynos / Tensor).
 # Собирает модель, частоту, governor и загрузку GPU; сравнивает с порогами.
 # Примечание: чтение путей /sys может отличаться между устройствами, поэтому здесь предусмотрено несколько вариантов файлов.
@@ -693,7 +713,7 @@ check_battery() {
 # Проверяет системный статус троттлинга (Android 10+)
 check_thermal_status() {
 	local status temp
-	# 1. Пытаемся взять стандартный проп
+	# 1. Пытаемся взять стандартный prop
 	status=$(getprop sys.thermal.status 2>/dev/null)
 
 	# 2. Если пусто, пробуем найти критические зоны в ядре
@@ -723,6 +743,201 @@ check_thermal_status() {
 	esac
 }
 
+# first_csv_value
+# Назначение:
+#   Возвращает первое "валидное" значение из CSV-строки.
+#
+# Контекст:
+#   Многие Android getprop возвращают значения в формате:
+#     "Operator1,Operator2" или "Unknown,Unknown"
+#   Эта функция позволяет корректно извлечь первое осмысленное значение.
+#
+# Логика:
+#   - Разбивает входную строку по запятым
+#   - Последовательно проверяет каждый элемент
+#   - Возвращает первый элемент, который:
+#       * не равен "Unknown"
+#       * не является пустой строкой
+#   - После первого совпадения завершает выполнение
+#
+# Аргументы:
+#   $1 — строка в формате CSV
+#
+# Возврат:
+#   stdout — первое валидное значение или пусто, если ничего не найдено
+first_csv_value() {
+	echo "$1" | awk -F',' '{for(i=1;i<=NF;i++) if($i!="Unknown" && $i!="") {print $i; exit}}'
+}
+
+# get_mobile_info
+# Назначение:
+#   Определяет информацию о мобильной сети:
+#     - имя оператора (Carrier)
+#     - тип радиосети (RAT: LTE, NR, HSPA и т.д.)
+#
+# Контекст:
+#   Android может возвращать несколько значений для SIM:
+#     - Dual SIM
+#     - виртуальные / inactive SIM
+#     - значения в формате CSV
+#
+#   Поэтому:
+#     - делаются fallback-запросы
+#     - используется фильтрация через first_csv_value
+#
+# Используемые getprop:
+#   gsm.operator.alpha        — имя оператора
+#   gsm.sim.operator.alpha    — fallback для имени оператора
+#   gsm.network.type          — тип сети (RAT)
+#   gsm.network.type.1        — fallback для второй SIM
+#
+# Возврат:
+#   stdout — строка формата:
+#     "<carrier>|<rat>"
+get_mobile_info() {
+	local carrier_raw rat_raw carrier rat
+
+	# Получаем "сырое" имя оператора
+	carrier_raw=$(getprop gsm.operator.alpha)
+
+	# Fallback, если значение отсутствует
+	[ -z "$carrier_raw" ] && carrier_raw=$(getprop gsm.sim.operator.alpha)
+
+	# Получаем "сырой" тип сети (RAT)
+	rat_raw=$(getprop gsm.network.type)
+
+	# Fallback для dual-SIM или альтернативных слотов
+	[ -z "$rat_raw" ] && rat_raw=$(getprop gsm.network.type.1)
+
+	# Извлекаем первое валидное значение из CSV
+	carrier=$(first_csv_value "$carrier_raw")
+	rat=$(first_csv_value "$rat_raw")
+
+	# Гарантируем ненулевой вывод
+	[ -z "$carrier" ] && carrier="Unknown"
+	[ -z "$rat" ] && rat="Unknown"
+
+	# Вывод в формате, удобном для read / IFS
+	echo "$carrier|$rat"
+}
+
+# measure_latency
+# Назначение:
+#   Измеряет:
+#     - среднюю задержку (latency)
+#     - вариацию задержки (jitter)
+#   до указанного хоста.
+#
+# Контекст:
+#   Используется ICMP ping как наиболее универсальный способ
+#   измерения сетевых характеристик на Android.
+#
+# Аргументы:
+#   $1 — целевой хост (IP или DNS-имя)
+#
+# Возврат:
+#   stdout — две числовые величины:
+#     "<avg_latency_ms> <jitter_ms>"
+#
+#   return 1 — если измерения не удалось выполнить
+measure_latency() {
+	local host="$1"
+	local times
+
+	# Выполняем 5 ping-запросов с таймаутом 2 секунды
+	# Из вывода извлекаем значения времени отклика (time=XX ms)
+	times=$(ping -c5 -W2 "$host" 2>/dev/null | \
+		awk -F'time=' '/time=/{print $2}' | awk '{print $1}')
+
+	# Если нет ни одного значения — измерение не удалось
+	[ -z "$times" ] && return 1
+
+	# Инициализация статистических переменных
+	local min=999999 max=0 sum=0 count=0 t
+
+	# Перебор всех значений задержки
+	for t in $times; do
+		# Отбрасываем дробную часть (работаем в целых ms)
+		t=${t%.*}
+
+		# Минимальное значение
+		[ "$t" -lt "$min" ] && min="$t"
+
+		# Максимальное значение
+		[ "$t" -gt "$max" ] && max="$t"
+
+		# Сумма и счётчик
+		sum=$((sum + t))
+		count=$((count + 1))
+	done
+
+	# Среднее значение задержки
+	local avg=$((sum / count))
+
+	# Jitter как разница max - min
+	local jitter=$((max - min))
+
+	# Вывод результата
+	echo "$avg $jitter"
+}
+
+# check_iperf3_speed
+# Тестирование пропускной способности сети (iperf3).
+# - Игнорируется в BRIEF_MODE и если не передан флаг ENABLE_NET_TEST.
+# - Обходит список серверов, используя быстрый TCP-чек порта 5201.
+check_iperf3_speed() {
+	# 1. Жесткое условие: не тормозим систему в кратком режиме
+	[ "$BRIEF_MODE" = "1" ] && return
+
+	# 2. Опциональность: запускаем только если пользователь этого хочет
+	# Либо добавь проверку счетчика циклов, чтобы не спамить тестами
+	if [ "$ENABLE_NET_TEST" != "1" ]; then
+		# Можно просто вывести статус готовности, если iperf3 есть
+		command -v iperf3 >/dev/null 2>&1 && log "iPerf3:     Ready (use --net-speed to test)"
+		return
+	fi
+
+	if ! command -v iperf3 >/dev/null 2>&1; then
+		log "iPerf3:     Not installed"
+		return
+	fi
+
+	echo
+	echo "[ NETWORK SPEED ] (iperf3)"
+	log "Status:     Testing speed (please wait...)"
+
+	local servers=("iperf.he.net" "ping.online.net" "bouygues.iperf.fr" "speedtest.uztelecom.uz" "speedtest.serverius.net")
+	local timeout_sec=10 
+	local server ok=0
+
+	for server in "${servers[@]}"; do
+		# Проверка порта (2 секунды таймаут — это максимум, что мы можем позволить)
+		if ! timeout 2 sh -c "echo >/dev/tcp/$server/5201" 2>/dev/null; then
+			continue
+		fi
+
+		# Тест Download
+		local down
+		down=$(timeout "$timeout_sec" iperf3 -c "$server" -R 2>/dev/null | awk '/receiver/{print $(NF-2),$(NF-1)}')
+
+		if [ -n "$down" ] && [ "$down" != "0 " ]; then
+			ok=1
+			log "Server:     $server"
+			log "Download:   $down"
+
+			# Тест Upload (только если Download удался)
+			local up
+			up=$(timeout "$timeout_sec" iperf3 -c "$server" 2>/dev/null | awk '/receiver/{print $(NF-2),$(NF-1)}')
+
+			# Если upload не удался (как было в твоем логе), пишем "Failed/Blocked"
+			[ -n "$up" ] && [ "$up" != "0 " ] && log "Upload:     $up" || log "Upload:     Blocked/Failed"
+			break
+		fi
+	done
+
+	[ "$ok" -eq 0 ] && log "iPerf3:     ${RED}All servers unreachable${NC}"
+}
+
 # check_network
 # Попытка подключения к нескольким проверочным хостам.
 # - Перечисляем hosts; если хоть один reachable — считаем интернет доступным.
@@ -733,31 +948,80 @@ check_network() {
 	quiet_hint
 
 	local conn_type local_ip
-	# Пытаемся определить активный интерфейс (wlan0 = Wi-Fi, rmnet* = Mobile)
-	conn_type=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5}')
-	local_ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7}')
+
+	local route_info
+	route_info=$(timeout 2 ip route get 8.8.8.8 2>/dev/null)
+
+	# Пытаемся определить активный интерфейс (wlan0 = Wi-Fi, rmnet* = Mobile)  
+	conn_type=$(echo "$route_info" | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+	local_ip=$(echo "$route_info" | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
 
 	if [ -n "$conn_type" ]; then
 		case "$conn_type" in
-			wlan*) log "Connection: ${GREEN}Wi-Fi${NC} ($conn_type)" ;;
-			rmnet*|ccmni*) log "Connection: ${GREEN}Mobile Data${NC} ($conn_type)" ;;
-			*) log "Connection: $conn_type" ;;
+			wlan*)
+				log "Connection: ${GREEN}Wi-Fi${NC} ($conn_type)"
+			;;
+			rmnet*|ccmni*)
+				log "Connection: ${GREEN}Mobile Data${NC} ($conn_type)"
+				IFS="|" read -r carrier rat <<< "$(get_mobile_info)"
+				log "Carrier:    $carrier"
+				log "RAT:        $rat"
+			;;
+			rndis*|usb*)
+				log "Connection: ${GREEN}USB Tethering${NC} ($conn_type)"
+			;;
+			tun*|wg*)
+				log "Connection: ${GREEN}VPN${NC} ($conn_type)"
+			;;
+			*) 
+				log "Connection: $conn_type"
+			;;
 		esac
 		log "Local IP:   $local_ip"
 	fi
+	
+	# DNS resolvers
+	local dns_servers=()
+	local d
+	for p in net.dns1 net.dns2 net.dns3 net.dns4; do
+		d=$(getprop "$p")
+		[ -n "$d" ] && dns_servers+=("$d")
+	done
+	[ "${#dns_servers[@]}" -gt 0 ] && log "DNS:        ${dns_servers[*]}"
 
-	# Дальше твоя стандартная проверка пингом
-	local hosts=("8.8.8.8" "google.com")
+	local hosts=("8.8.8.8" "1.1.1.1" "google.com")
 	local success=0
+
 	for host in "${hosts[@]}"; do
 		if ping -c1 -W2 "$host" >/dev/null 2>&1; then
-			success=1
-			log "${GREEN}✓ Internet connectivity: OK ($host)${NC}"
-			break
+	success=1
+		log "${GREEN}✓ Internet connectivity: OK ($host)${NC}"
+
+		if latency=$(measure_latency "$host"); then
+			set -- $latency
+			log "Latency:    ${1} ms"
+			log "Jitter:     ${2} ms"
 		fi
+		break
+	fi
 	done
 
-	[ "$success" -eq 0 ] && log "${RED}✗ No Internet connectivity${NC}"
+	# HTTP fallback
+	if [ "$success" -eq 0 ] && command -v curl >/dev/null; then
+		if curl -s --connect-timeout 3 http://clients3.google.com/generate_204 >/dev/null; then
+			success=1
+			log "${GREEN}✓ Internet connectivity: OK (HTTP probe)${NC}"
+		fi
+	fi
+
+	if [ "$success" -eq 0 ]; then
+		log "${RED}✗ No Internet connectivity${NC}"
+
+		if [ "$(id -u)" -eq 0 ]; then
+			log "Active interfaces:"
+			ip -br addr show | sed 's/^/  /'
+		fi
+	fi
 }
 
 # check_logcat
@@ -770,6 +1034,7 @@ check_logcat() {
 	echo
 	echo "[ LOGCAT ERRORS ]"
 	> "$ERR_LOG"
+	quiet_hint
 
 	[ "$NO_LOGCAT" -eq 1 ] && log "Logcat: skipped (--no-logcat)" && return
 
@@ -795,40 +1060,60 @@ check_logcat() {
 }
 
 # print_top
-# Выводит топ-процессов по использованию CPU (заголовок + 5 процессов)
-# Если команда — стандартный app_process, пытается вытащить имя пакета из /proc/PID/cmdline.
-# Форматирование колонок делаем через printf/out_printf.
+# Выводит список топ-5 процессов в стиле Card UI.
+# - Автоматически декодирует имена пакетов Android.
+# - Динамически подстраивается под BRIEF_MODE.
 print_top() {
 	local p c cpu m real_name
+	local separator="----------------------------------------"
+
+	# Берем топ-5 процессов по потреблению CPU
+	local top_data
+	top_data=$(ps -Ao pid,comm,%cpu,%mem --sort=-%cpu 2>/dev/null | head -n 6 | tail -n +2)
+	[ -z "$top_data" ] && return
+
+	# Логика BRIEF_MODE
+	if [ "$BRIEF_MODE" = "1" ]; then
+		local top_cpu
+		top_cpu=$(echo "$top_data" | awk '{print int($3); exit}')
+		[ "$top_cpu" -lt 20 ] && return
+		log "${YELLOW}Warning: High CPU usage detected (${top_cpu}%)${NC}"
+	fi
+
 	echo
 	echo "[ TOP PROCESSES ]"
+	[ "$BRIEF_MODE" = "1" ] && echo "(!) High load detected:"
 	quiet_hint
-
-	out_printf "%-6s %-20s %-6s %-6s\n" "PID" "COMMAND/PACKAGE" "%CPU" "%MEM"
-	echo "------------------------------------------------"
 	
-	# Получаем топ 5 процессов по CPU
-	ps -Ao pid,comm,%cpu,%mem --sort=-%cpu | head -n 6 | tail -n +2 |
-	while read -r p c cpu m; do
-		# Если процесс - стандартная обертка Android, лезем глубже
-		if [[ "$c" == "app_process"* ]] || [[ "$c" == "base" ]]; then
+	echo "$separator"
+
+	echo "$top_data" | while read -r p c cpu m; do
+		# Продвинутое определение имени (оставляем твою логику, она крутая)
+		if [[ "$c" == "app_process"* ]] || [[ "$c" == "base" ]] || [[ "$c" == "sh" ]]; then
 			if [ -f "/proc/$p/cmdline" ]; then
-				# Читаем cmdline, заменяя нулевые байты на пробелы
-				real_name=$(tr '\0' ' ' < "/proc/$p/cmdline" | awk '{print $1}')
-				# Оставляем только последнюю часть пакета для краткости (напр. com.android.vending -> vending)
-				# Если хочешь полное имя, удали часть с 'sed' ниже
-				c=$(echo "$real_name" | sed 's/.*\.//')
+				real_name=$(tr '\0' '\n' < "/proc/$p/cmdline" | head -n 1)
+				real_name=${real_name##*/}
+				c=${real_name##*.}
 			fi
 		fi
+		[ -z "$c" ] && c="unknown"
+
+		# Вывод в стиле карточки
+		out_printf "Process:   %s\n" "$c"
+		out_printf "Details:   PID: %-8s | CPU: %-6s | MEM: %s\n" "$p" "$cpu%" "$m%"
 		
-		# Печатаем строку (увеличили ширину колонки имени до 20 символов)
-		out_printf "%-6s %-20.20s %-6s %-6s\n" "$p" "$c" "$cpu" "$m"
+		# Логируем в файл одной строкой
+		log "TOP: PID=$p | CMD=$c | CPU=$cpu% | MEM=$m%"
+
+		echo "$separator"
 	done
 }
 
-
 # print_io
-# Обрабатывает /proc/diskstats и печатает прочитанные/записанные мегабайты для основных устройств (mmcblk*, sd*, dm-*). Сектора -> МБ через деление на 2048.
+# Анализ активности ввода-вывода (I/O) для блочных устройств.
+# - Выводит полные пути монтирования без обрезки.
+# - Использует "карточный" стиль для удобства чтения на мобильных экранах.
+# - Фильтрует устройства с активностью менее 0.1 MB.
 print_io() {
 	echo
 	echo "[ I/O ] (Active Storage)"
@@ -839,54 +1124,60 @@ print_io() {
 		return
 	fi
 
-	out_printf "%-10s %-18s %-10s %-10s\n" "DEVICE" "MOUNT" "READ(MB)" "WRITE(MB)"
-	echo "-----------------------------------------------------"
-
-	# Создаем временный файл со списком монтирований для AWK
 	local tmp_mnt="/tmp/mnt_map"
+	# Собираем актуальную карту монтирований
 	mount | awk '{print $1, $3}' > "$tmp_mnt"
 
-	awk -v m_file="$tmp_mnt" '
+	# Обрабатываем diskstats и сопоставляем с точками монтирования
+	local io_raw
+	io_raw=$(awk -v m_file="$tmp_mnt" '
 	BEGIN {
-		# Сначала загружаем карту монтирований в память AWK из файла
-		while ((getline < m_file) > 0) {
-			mnt_map[$1] = $2
-		}
+		while ((getline < m_file) > 0) mnt_map[$1] = $2
 		close(m_file)
 	}
 	{
+		# Фильтр основных блочных устройств (mmc, sd, dm)
 		if ($3 ~ /^(mmcblk[0-9]+|sd[a-z]+|dm-[0-9]+)$/) {
 			read_mb = $6 / 2048
 			write_mb = $10 / 2048
 
+			# Порог активности 0.1 MB
 			if (read_mb > 0.1 || write_mb > 0.1) {
 				dev_path = "/dev/block/" $3
-				mnt = "system/other"
+				mnt = "unmapped/other"
 
-				# Ищем точное совпадение или по имени устройства
 				if (dev_path in mnt_map) {
 					mnt = mnt_map[dev_path]
 				} else {
 					for (d in mnt_map) {
-						if (d ~ "/" $3 "$") {
-							mnt = mnt_map[d]
-							break
-						}
+						if (d ~ "/" $3 "$") { mnt = mnt_map[d]; break }
 					}
 				}
-
-				# Сокращаем длинные пути для читабельности
-				sub(/^\/mnt\/vendor\//, "v:", mnt)
-				sub(/^\/data\/media\/0/, "storage", mnt)
-				sub(/^\/apex\/.*/, "apex", mnt)
-
-				printf "%-10s %-18.18s %-10.1f %-10.1f\n", $3, mnt, read_mb, write_mb
+				# Выводим сырые данные для последующей обработки циклом
+				printf "%s|%s|%.1f|%.1f\n", $3, mnt, read_mb, write_mb
 			}
 		}
 	}
-	' /proc/diskstats
+	' /proc/diskstats)
 
-	# Удаляем временный файл
+	if [ -n "$io_raw" ]; then
+		echo "----------------------------------------"
+		while IFS="|" read -r dev mnt r_mb w_mb; do
+			# Вывод в консоль: Устройство и его полный путь
+			out_printf "Device:    %-10s\n" "$dev"
+			out_printf "Mount:     %s\n" "$mnt"
+			out_printf "Activity:  READ: %s MB | WRITE: %s MB\n" "$r_mb" "$w_mb"
+			
+			# Дублируем подробности в лог
+			log "I/O: Dev=$dev | Mount=$mnt | R=${r_mb}MB | W=${w_mb}MB"
+			
+			echo "----------------------------------------"
+		done <<< "$io_raw"
+	else
+		log "No active I/O detected (>0.1MB)"
+		echo "----------------------------------------"
+	fi
+
 	rm -f "$tmp_mnt"
 }
 
@@ -930,53 +1221,48 @@ find_mountpoint() {
 }
 
 # check_partitions
-# Формирует табличный вывод часто используемых разделов:
-#   system, system_ext, product, vendor, odm, cache, data, metadata, apex, persist
-# Для каждого:
-#   - находит точку монтирования (find_mountpoint)
-#   - берет строку df -h и парсит size/used/free
-#   - определяет "backend" (реальное блочное устройство) через mountinfo
+# Анализирует разделы системы в формате списка (Card UI).
+# - Показывает тип ФС, точку монтирования, объем и источник (блочное устройство).
+# - Единый стиль с блоками I/O и TOP PROCESSES.
 check_partitions() {
 	echo
 	echo "[ SYSTEM PARTITIONS ]"
 	quiet_hint
 
-	out_printf "%-12s %-28s %8s %8s %8s\n" "PARTITION" "MOUNT POINT" "SIZE" "USED" "FREE"
-	out_printf "%-12s %-28s %8s %8s %8s\n" "----------" "----------------------------" "--------" "--------" "--------"
+	local parts=(system system_ext product vendor odm cache data metadata apex persist)
+	local separator="----------------------------------------"
 
-	local parts=(
-		system
-		system_ext
-		product
-		vendor
-		odm
-		cache
-		data
-		metadata
-		apex
-		persist
-	)
+	echo "$separator"
 
 	for part in "${parts[@]}"; do
-	local mp df_line size used free backend
+		local mp info size used free fstype backend
+		
+		mp=$(find_mountpoint "$part")
+		[ -z "$mp" ] && continue
 
-	mp=$(find_mountpoint "$part")
-	[ -z "$mp" ] && continue
+		# Получаем данные о размере
+		info=$(df -h "$mp" 2>/dev/null | awk 'NR==2 {print $2,$3,$4}')
+		[ -z "$info" ] && continue
+		read -r size used free <<< "$info"
 
-	df_line=$(df -h "$mp" 2>/dev/null | awk 'NR==2')
-	[ -z "$df_line" ] && continue
+		# Определяем тип ФС
+		fstype=$(awk -v m="$mp" '$2==m {print $3}' /proc/mounts | head -n1)
+		[ -z "$fstype" ] && fstype="unknown"
 
-	size=$(echo "$df_line" | awk '{print $2}')
-	used=$(echo "$df_line" | awk '{print $3}')
-	free=$(echo "$df_line" | awk '{print $4}')
+		# Определяем источник (backend)
+		backend="$(get_backend_from_mountinfo "$mp")"
+		[ -z "$backend" ] && backend="unknown"
 
-	backend="$(get_backend_from_mountinfo "$mp")"
-	[ -z "$backend" ] && backend="unknown"
+		# Вывод в стиле "карточки"
+		out_printf "Partition: %-12s [%s]\n" "$part" "$fstype"
+		out_printf "Mount:     %s\n" "$mp"
+		out_printf "Device:    %s\n" "$backend"
+		out_printf "Storage:   Total: %s | Used: %s | Free: %s\n" "$size" "$used" "$free"
 
-	out_printf "%-12s %-28s %8s %8s %8s\n" \
-		"$part" "$mp" "$size" "$used" "$free"
+		# Логируем всё одной строкой для истории
+		log "[$part] Type: $fstype | Mount: $mp | Source: $backend | Size: $size | Used: $used | Free: $free"
 
-	log "Mounted at $mp -> $backend | Size: $size | Used: $used | Free: $free"
+		echo "$separator"
 	done
 }
 
@@ -1168,9 +1454,9 @@ print_magisk_modules() {
 		fi
 
 		printf "%s - %s\n" "$(date +%H:%M:%S)" "${name:-$(basename "$m")}"
-		[ -n "$version" ] && printf "           Version: %s\n" "$version"
-		[ -n "$desc" ]    && printf "           Description:    %s\n" "$desc"
-		printf "           Status:  %s\n\n" "$state"
+		[ -n "$version" ] && printf "           Version:      %s\n" "$version"
+		[ -n "$desc" ]    && printf "           Description:  %s\n" "$desc"
+		printf "           Status:       %s\n\n" "$state"
 	done
 
 	[ "$found" -eq 0 ] && echo "$(date +%H:%M:%S) - No Magisk modules installed"
@@ -1181,7 +1467,7 @@ print_magisk_modules() {
 get_deep_sleep_stats() {
 	local uptime_ms=0 sleep_ms=0 deep_sleep_pct=0
 	local total_idle_us=0 i=0 s_val=0
-	local last_state_idx=0
+	local last_state_idx=0 cpu_count=0
 
 	# 1. Находим индекс самого глубокого состояния сна (макс. число в названии папки)
 	# Это универсально для всех ядер: от 3.18 до 6.x
@@ -1193,11 +1479,15 @@ get_deep_sleep_stats() {
 		return
 	fi
 
-	# 2. Получаем аптайм
+	# 2. Получаем аптайм системы
 	uptime_ms=$(awk '{print int($1 * 1000)}' /proc/uptime)
+	
+	# 3. Получаем количество ядер
+	cpu_count=$(ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null | wc -l)
+	[ "$cpu_count" -eq 0 ] && cpu_count=1
 
-	# 3. Суммируем время этого "самого глубокого" состояния по всем ядрам
-	for i in {0..7}; do
+	# 4. Суммируем время этого "самого глубокого" состояния по всем ядрам
+	for i in $(seq 0 $((cpu_count - 1))); do
 		local target_path="/sys/devices/system/cpu/cpu$i/cpuidle/state${last_state_idx}/time"
 		if [ -f "$target_path" ]; then
 			s_val=$(cat "$target_path" 2>/dev/null)
@@ -1205,9 +1495,9 @@ get_deep_sleep_stats() {
 		fi
 	done
 
-	# 4. Расчеты
+	# 5. Расчеты
 	# Делим на количество ядер (обычно 8) и переводим из мкс в мс
-	sleep_ms=$((total_idle_us / 8 / 1000))
+	sleep_ms=$((total_idle_us / cpu_count / 1000))
 
 	if [ "$sleep_ms" -gt 0 ] && [ "$uptime_ms" -gt 0 ]; then
 		deep_sleep_pct=$(( sleep_ms * 100 / uptime_ms ))
@@ -1225,8 +1515,8 @@ get_deep_sleep_stats() {
 #  - uptime
 #  - root: YES/NO
 #  - system access level + версия Magisk (если есть)
-#  - Zygisk статус
-#  - SELinux state и ABI
+#  - статус Zygisk
+#  - статус SELinux и ABI
 print_system() {
 	echo
 	echo "[ SYSTEM INFO ]"
@@ -1327,6 +1617,7 @@ run_monitor() {
 	check_gpu
 	check_battery
 	check_network
+	check_iperf3_speed
 	check_logcat
 	print_top
 	print_io
@@ -1368,6 +1659,7 @@ while [ $# -gt 0 ]; do
 		-b|--brief) BRIEF_MODE=1 ;;
 		-e|--extended) EXTENDED=1 ;;
 		-f|--no-file) NO_FILE_LOG=1;;
+		--net-speed) ENABLE_NET_TEST=1;;
 		-c|--clear-log)
 			if [ -f "$LOG" ]; then
 				: > "$LOG"
