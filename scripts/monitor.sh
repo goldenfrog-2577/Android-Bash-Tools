@@ -12,6 +12,60 @@ set -o pipefail
 LOG="/data/media/0/.My Folder/logs/android_monitor.log"
 ERR_LOG="/data/media/0/.My Folder/logs/last_errors.log"
 
+# EXIT CODES — понятные имена для числовых кодов возврата
+EXIT_OK=0
+EXIT_WARNING=1
+EXIT_CRITICAL=2
+EXIT_INTERNAL=3
+
+# Глобальные переменные состояния и флаги
+# - SYSTEM_STATUS: агрегированный статус после всех проверок
+# - QUIET: если 1 — не печатать в терминал, только писать в лог
+# - NO_LOGCAT: если 1 — пропустить длительный анализ logcat
+# - LOOP_INTERVAL: если >0 — запускать монитор в цикле каждые N секунд
+# - DRY_RUN: если 1 — проверить зависимости и вывести только заголовок
+# - BRIEF_MODE: если 1 — показывать только важные сообщения (WARNING/CRITICAL)
+# - EXTENDED: если 1 — в конце вывести расширенную информацию о системе
+# - NO_FILE_LOG: если 1 — разрешить запись логов в файл $LOG
+# - ENABLE_NET_TEST: если 1 — разрешить выполнение функци check_iperf3_speed
+
+SYSTEM_STATUS=$EXIT_OK
+
+NO_LOGCAT=0
+NO_FILE_LOG=0
+BRIEF_MODE=0
+EXTENDED=0
+DRY_RUN=0
+QUIET=0
+LOOP_INTERVAL=0
+ENABLE_NET_TEST=0
+
+# Thresholds: параметры, при превышении которых срабатывают WARNING/CRITICAL
+# - DISK_WARN / DISK_CRIT: в процентах для дисковых разделов (/data)
+# - RAM_WARN / RAM_CRIT: в процентах для RAM
+# - CPU_WARN_MULT / CPU_CRIT_MULT: множители по отношению к числу ядер
+# - GPU_WARN / GPU_CRIT: проценты загрузки GPU
+DISK_WARN=80
+DISK_CRIT=90
+RAM_WARN=80
+RAM_CRIT=90
+CPU_WARN_MULT=1.5
+CPU_CRIT_MULT=2.0
+GPU_WARN=80
+GPU_CRIT=90
+
+# Цвета: включаем escape-последовательности только если stdout — интерактивный терминал
+# Проверка [ -t 1 ] — true, если дескриптор 1 (stdout) привязан к терминалу.
+if [ -t 1 ]; then
+	RED='\033[1;31m'
+	GREEN='\033[1;32m'
+	YELLOW='\033[1;33m'
+	NC='\033[0m'
+else
+	# В неинтерактивном режиме (cron/лог-файл) не добавляем мусор в лог
+	RED='' ; GREEN='' ; YELLOW='' ; NC=''
+fi
+
 # exit_code_label
 # Функция: преобразует числовой код возврата в удобочитаемую метку.
 # Аргументы:
@@ -51,30 +105,43 @@ exit_code_label() {
 # Печатает рекомендации по установке в stderr, если чего-то не хватает.
 check_dependencies() {
 	local missing=()
+	local fail=0
 
-	# Критические утилиты, без которых скрипт не сможет корректно выполнять отдельные части логики (парсинг, вывод, получение списка процессов).
-	local critical_deps=("awk" "grep" "sed" "df" "ps")
+	# 1. Список жизненно важных утилит
+	local critical_deps=(
+		"awk" "grep" "sed" "df" "ps"
+		"dumpsys" "getprop" "logcat"
+		"find" "cat" "sleep"
+	)
+
+	# Тихая проверка наличия команд
 	for dep in "${critical_deps[@]}"; do
-		# command -v проверяет, доступна ли команда в PATH
 		if ! command -v "$dep" >/dev/null 2>&1; then
 			missing+=("$dep")
+			fail=1
 		fi
 	done
 
-	# Если есть отсутствующие утилиты — сообщаем пользователю и прерываем.
-	if [ ${#missing[@]} -gt 0 ]; then
-		# Пишем в stderr (показательно для cron / автоматизации).
-		echo "ERROR: Missing required utilities: ${missing[*]}" >&2
-		# Подсказываем пакетный менеджер Termux (pkg). Пользователь на Android.
-		echo "Install them via: pkg install coreutils procps" >&2
+	# 2. Проверка прав (Root) — только фатальная ошибка в stderr
+	if [ "$(id -u)" -ne 0 ]; then
+		echo -e "${RED}FATAL: This script MUST be run as ROOT (su)${NC}" >&2
 		return $EXIT_INTERNAL
 	fi
 
-	# 'bc' — не критичен, но удобен для сравнения дробных чисел (GPU проценты).
-	if ! command -v bc >/dev/null 2>&1; then
-		# NOTE выводим в stderr, но работа продолжается в integer-mode.
-		echo "NOTE: 'bc' calculator not found. GPU percentage checks will use integer math." >&2
+	# 3. Сообщение об отсутствующих утилитах
+	if [ "$fail" -eq 1 ]; then
+		echo -e "${RED}ERROR: Missing critical system utilities: ${missing[*]}${NC}" >&2
+		echo "Please install them or ensure they are in your PATH" >&2
+		return $EXIT_INTERNAL
 	fi
+
+	# 4. Проверка 'bc' — пишем только в основной лог, без вывода на экран
+	if ! command -v bc >/dev/null 2>&1; then
+		# Используем твою функцию log, которая пишет в файл/переменную, но не засоряет stdout при инициализации
+		log "Note: 'bc' missing. Using Integer mode for math"
+	fi
+
+	# Возвращаем успех без лишнего шума в консоли
 	return $EXIT_OK
 }
 
@@ -88,7 +155,7 @@ check_dependencies() {
 check_already_running() {
 	local script_name=$(basename "$0")
 	# Убираем 'local' для lock_file, чтобы trap видел её при выходе из скрипта
-	lock_file="/tmp/${script_name}.lock"
+	lock_file="/data/local/tmp/${script_name}.lock"
 	local pid
 
 	if [ -f "$lock_file" ]; then
@@ -111,59 +178,6 @@ check_already_running() {
 	return $EXIT_OK
 }
 
-# EXIT CODES — понятные имена для числовых кодов возврата
-EXIT_OK=0
-EXIT_WARNING=1
-EXIT_CRITICAL=2
-EXIT_INTERNAL=3
-
-# Глобальные переменные состояния и флаги
-# - SYSTEM_STATUS: агрегированный статус после всех проверок
-# - QUIET: если 1 — не печатать в терминал, только писать в лог
-# - NO_LOGCAT: если 1 — пропустить длительный анализ logcat
-# - LOOP_INTERVAL: если >0 — запускать монитор в цикле каждые N секунд
-# - DRY_RUN: если 1 — проверить зависимости и вывести только заголовок
-# - BRIEF_MODE: если 1 — показывать только важные сообщения (WARNING/CRITICAL)
-# - EXTENDED: если 1 — в конце вывести расширенную информацию о системе
-# - NO_FILE_LOG: если 1 — разрешить запись логов в файл $LOG
-# - ENABLE_NET_TEST: если 1 — разрешить выполнение функци check_iperf3_speed
-SYSTEM_STATUS=$EXIT_OK
-
-NO_LOGCAT=0
-NO_FILE_LOG=0
-BRIEF_MODE=0
-EXTENDED=0
-DRY_RUN=0
-QUIET=0
-LOOP_INTERVAL=0
-ENABLE_NET_TEST=0
-
-# Thresholds: параметры, при превышении которых срабатывают WARNING/CRITICAL
-# - DISK_WARN / DISK_CRIT: в процентах для дисковых разделов (/data)
-# - RAM_WARN / RAM_CRIT: в процентах для RAM
-# - CPU_WARN_MULT / CPU_CRIT_MULT: множители по отношению к числу ядер
-# - GPU_WARN / GPU_CRIT: проценты загрузки GPU
-DISK_WARN=80
-DISK_CRIT=90
-RAM_WARN=80
-RAM_CRIT=90
-CPU_WARN_MULT=1.5
-CPU_CRIT_MULT=2.0
-GPU_WARN=80
-GPU_CRIT=90
-
-# Цвета: включаем escape-последовательности только если stdout — интерактивный терминал
-# Проверка [ -t 1 ] — true, если дескриптор 1 (stdout) привязан к терминалу.
-if [ -t 1 ]; then
-	RED='\033[1;31m'
-	GREEN='\033[1;32m'
-	YELLOW='\033[1;33m'
-	NC='\033[0m'
-else
-	# В неинтерактивном режиме (cron/лог-файл) не добавляем мусор в лог
-	RED='' ; GREEN='' ; YELLOW='' ; NC=''
-fi
-
 # out_printf
 # Удобная обёртка вокруг printf, учитывающая QUIET и BRIEF_MODE.
 # Если BRIEF_MODE включен — функция фильтрует обычные информационные строки, оставляя только сообщения, содержащие "CRITICAL", "WARNING" или "ERROR".
@@ -175,6 +189,13 @@ out_printf() {
 		fi
 	fi
 	[ "$QUIET" -eq 0 ] && printf "$@"
+}
+
+# quiet_hint
+# Если включён quiet-режим, печатает подсказку о том, где смотреть лог.
+# Используемая в разделах перед выдачей подробной информации.
+quiet_hint() {
+	[ "$QUIET" -eq 1 ] && echo "Check details in log file: $LOG" && echo
 }
 
 # log
@@ -192,6 +213,15 @@ log() {
 	if [ "$NO_FILE_LOG" -eq 0 ]; then
 		# sed удаляет ANSI escape-коды перед записью в файл
 		echo -e "$ts - $1" | sed 's/\x1b\[[0-9;]*m//g' >> "$LOG"
+	fi
+}
+
+# rotate_log
+# Простая ротация лога: если в файле больше 1000 строк — перезаписать его одной строкой.
+# Такой подход минимален и подходит для устройств с ограниченным дисковым пространством.
+rotate_log() {
+	if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 1000 ]; then
+		echo "--- Log rotated ---" > "$LOG"
 	fi
 }
 
@@ -249,15 +279,6 @@ Threshold options (alert trigger levels):
 EOF
 }
 
-# rotate_log
-# Простая ротация лога: если в файле больше 1000 строк — перезаписать его одной строкой.
-# Такой подход минимален и подходит для устройств с ограниченным дисковым пространством.
-rotate_log() {
-	if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 1000 ]; then
-		echo "--- Log rotated ---" > "$LOG"
-	fi
-}
-
 # print_header
 # Выводит заголовок монитора: модель устройства, версия Android, ядро, активный слот, текущая дата/время. Использует свойства getprop — стандартный метод на Android.
 print_header() {
@@ -275,16 +296,10 @@ print_header() {
 	echo "Android: $(getprop ro.build.version.release)"
 	echo "Kernel: $(uname -r)"
 	echo "Active slot: $slot"
+	echo "Bootloader: $(get_bootloader_status)"
 	echo "Time: $(date)"
 	echo
 	echo "========================================"
-}
-
-# quiet_hint
-# Если включён quiet-режим, печатает подсказку о том, где смотреть лог.
-# Используемая в разделах перед выдачей подробной информации.
-quiet_hint() {
-	[ "$QUIET" -eq 1 ] && echo "Check details in log file: $LOG" && echo
 }
 
 # check_storage
@@ -299,73 +314,118 @@ check_storage() {
 	echo "[ STORAGE ] (/data)"
 	quiet_hint
 
+	local storage_info="Unknown"
+	local health_info=""
+	local ufs_ver="UFS"
+
+	# 1. Определяем тип, вендор и модель
+	if [ -d "/sys/class/block/sda" ]; then
+		local vendor=$(cat /sys/class/block/sda/device/vendor 2>/dev/null | xargs)
+		local model=$(cat /sys/class/block/sda/device/model 2>/dev/null | xargs)
+
+		# Определяем версию: Alioth (SM8250) это всегда 3.1
+		# Но для универсальности проверим пропсы
+		local prop_ver=$(getprop sys.storage.ufs_version)
+		if [ -n "$prop_ver" ]; then
+			ufs_ver="UFS $prop_ver"
+		elif [[ "$(getprop ro.board.platform)" == "kona" ]]; then
+			ufs_ver="UFS 3.1"
+		fi
+
+		storage_info="$ufs_ver ($vendor $model)"
+
+		# 2. Поиск здоровья (Life Time)
+		# Путь 1: Прямой поиск файла health_descriptor
+		local h_file=$(find /sys/devices/platform/soc -name "health_descriptor" 2>/dev/null | head -n 1)
+
+		# Путь 2: Если первый пуст, ищем в узлах контроллера (часто на Xiaomi)
+		[ -z "$h_file" ] && h_file=$(find /sys/class/ufs-bsg -name "health_descriptor" 2>/dev/null | head -n 1)
+
+		if [ -f "$h_file" ]; then
+			# Читаем 3-й и 4-й байты (Estimation A и B)
+			# Обычно это HEX значения. 0x01 = 0-10% износа.
+			local life_a=$(grep "Device Life Time Estimation A" "$h_file" | awk '{print $NF}' | tr -d '[]')
+			if [ -n "$life_a" ]; then
+				# Конвертируем HEX в DEC для расчета
+				local life_dec=$((life_a))
+				# Если 0x01 -> 10%, 0x02 -> 20%...
+				local pct=$(( (life_dec - 1) * 10 ))
+				[ "$pct" -lt 0 ] && pct=0
+
+				local h_color=$GREEN
+				[ "$pct" -gt 50 ] && h_color=$YELLOW
+				[ "$pct" -gt 80 ] && h_color=$RED
+				health_info="${h_color}${pct}% used${NC}"
+			fi
+		fi
+	elif [ -d "/sys/block/mmcblk0" ]; then
+		storage_info="eMMC"
+		local life_time=$(cat /sys/block/mmcblk0/device/life_time 2>/dev/null | xargs)
+		[ -n "$life_time" ] && health_info="$life_time used"
+	fi
+
+	log "Type:   $storage_info"
+	[ -n "$health_info" ] && log "Health: $health_info"
+
+	# 3. Информация о разделах
 	df -h /data | tail -1 | while read -r _ size used avail percent _; do
 		use=${percent%\%}
+		log "Total:  ${size//G/ GB} | Used: ${used//G/ GB} | Free: ${avail//G/ GB}"
 
-		# Небольшая "косметика" — заменяем 'G' на ' GB' для читабельности
-		local f_size=${size//G/ GB}
-		local f_used=${used//G/ GB}
-		local f_avail=${avail//G/ GB}
-
-		log "Total: $f_size | Used: $f_used | Free: $f_avail"
-
-		# Сравнение с порогами: сначала CRITICAL, затем WARNING
-		if [ "$use" -ge "$DISK_CRIT" ]; then
-			log "${RED}CRITICAL: Usage ${percent}${NC}"
-			SYSTEM_STATUS=$EXIT_CRITICAL
-		elif [ "$use" -ge "$DISK_WARN" ]; then
-			log "${YELLOW}WARNING: Usage ${percent}${NC}"
-
-			[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
-		else
-			log "${GREEN}OK: Usage ${percent}${NC}"
-		fi
+		local s_color=$GREEN
+		[ "$use" -ge "$DISK_WARN" ] && s_color=$YELLOW
+		[ "$use" -ge "$DISK_CRIT" ] && s_color=$RED
+		log "Status: ${s_color}OK (${percent} used)${NC}"
 	done
 }
 
 # check_memory
-# Считывает /proc/meminfo, рассчитывает использованную память и проценты, проверяет наличие swap / zram и логирует информацию о ZRAM.
+# Анализирует состояние оперативной памяти и ZRAM, выводит вердикт в строке Status.
 check_memory() {
 	local total avail used percent avail_mb total_gb
-	local z_total z_free z_used
+	local z_total z_free z_used z_total_mb
 	echo
 	echo "[ MEMORY ] (RAM)"
 	quiet_hint
 
-	# Читаем значения в килобайтах
+	# 1. Читаем MemInfo
 	total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
 	avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
 
-	# prettify: показать общий объём в GB с одной цифрой
+	# 2. Форматируем общий объем
 	total_gb=$(awk "BEGIN {printf \"%.1f\", $total / 1024 / 1024}")
+	log "Total:  ${total_gb} GB"
 
-	log "Total RAM: ${total_gb} GB"
-
-	# Swap / ZRAM информация — читаем, если есть
+	# 3. Обработка ZRAM
 	z_total=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
 	z_free=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
-	  
+
 	if [ "$z_total" -gt 0 ]; then
 		z_used=$(( (z_total - z_free) / 1024 ))
 		z_total_mb=$(( z_total / 1024 ))
-		log "ZRAM: ${z_used} MB used / ${z_total_mb} MB total"
+		log "ZRAM:   ${z_used} MB used / ${z_total_mb} MB total"
 	fi
 
-	# Считаем проценты занятости
+	# 4. Расчет нагрузки
 	used=$((total - avail))
 	percent=$((used * 100 / total))
 	avail_mb=$((avail / 1024))
 
-	# Проверка порогов и выставление глобального статуса
+	# 5. Выставление статуса согласно новой концепции
+	local s_color=$GREEN
+	local s_label="OK"
+
 	if [ "$percent" -ge "$RAM_CRIT" ]; then
-		log "${RED}CRITICAL: RAM ${percent}% (${avail_mb} MB free)${NC}"
+		s_color=$RED
+		s_label="CRITICAL"
 		SYSTEM_STATUS=$EXIT_CRITICAL
 	elif [ "$percent" -ge "$RAM_WARN" ]; then
-		log "${YELLOW}WARNING: RAM ${percent}% (${avail_mb} MB free)${NC}"
+		s_color=$YELLOW
+		s_label="WARNING"
 		[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
-	else
-		log "${GREEN}OK: RAM ${percent}% (${avail_mb} MB free)${NC}"
 	fi
+
+	log "Status: ${s_color}${s_label} (${percent}% used, ${avail_mb} MB free)${NC}"
 }
 
 # get_cpu_freqs_detailed
@@ -375,7 +435,7 @@ get_cpu_freqs_detailed() {
 	local cpu_dir="/sys/devices/system/cpu"
 	local f_cur f_max i online_status core_info
 
-	log "CPU Frequencies (Current/Max):"
+	log "CPU Frequencies (Current / Max):"
 
 	for i in {0..7}; do
 		# Проверяем статус ядра (0 - offline, 1 - online)
@@ -404,121 +464,186 @@ get_cpu_freqs_detailed() {
 }
 
 # check_cpu
-# Собирает информацию о CPU: модель, количество ядер, loadavg, governor и частоты.
-# - Использует вспомогательные функции get_board_name, get_cpu_governor, get_cpu_freqs
-# - Сравнивает среднюю нагрузку (loadavg) с порогами, используя множитель на число ядер
+# Анализирует нагрузку CPU и выводит вердикт в едином стиле Status.
 check_cpu() {
-	local cores load warn crit
+	local cores load_pct cpu_name
 	echo
 	echo "[ CPU ]"
 	quiet_hint
 
+	# 1. Снимаем первый замер
+	local stat1=$(grep '^cpu ' /proc/stat)
+	local user1=$(echo $stat1 | awk '{print $2}')
+	local nice1=$(echo $stat1 | awk '{print $3}')
+	local syst1=$(echo $stat1 | awk '{print $4}')
+	local idle1=$(echo $stat1 | awk '{print $5}')
+	local iow1=$(echo $stat1 | awk '{print $6}')
+	local irq1=$(echo $stat1 | awk '{print $7}')
+	local sir1=$(echo $stat1 | awk '{print $8}')
+
+	sleep 0.5
+
+	# 2. Снимаем второй замер
+	local stat2=$(grep '^cpu ' /proc/stat)
+	local user2=$(echo $stat2 | awk '{print $2}')
+	local nice2=$(echo $stat2 | awk '{print $3}')
+	local syst2=$(echo $stat2 | awk '{print $4}')
+	local idle2=$(echo $stat2 | awk '{print $5}')
+	local iow2=$(echo $stat2 | awk '{print $6}')
+	local irq2=$(echo $stat2 | awk '{print $7}')
+	local sir2=$(echo $stat2 | awk '{print $8}')
+
+	# 3. Считаем дельту (Shell Arithmetic)
+	local PrevIdle=$((idle1 + iow1))
+	local Idle=$((idle2 + iow2))
+	local PrevNonIdle=$((user1 + nice1 + syst1 + irq1 + sir1))
+	local NonIdle=$((user2 + nice2 + syst2 + irq2 + sir2))
+	local PrevTotal=$((PrevIdle + PrevNonIdle))
+	local Total=$((Idle + NonIdle))
+
+	local total_d=$((Total - PrevTotal))
+	local idle_d=$((Idle - PrevIdle))
+
+	if [ "$total_d" -gt 0 ]; then
+		load_pct=$(( (total_d - idle_d) * 100 / total_d ))
+	else
+		load_pct=0
+	fi
+
+	# 4. Информация о железе
 	cpu_name=$(getprop ro.soc.model)
 	[ -z "$cpu_name" ] && cpu_name=$(getprop ro.board.platform)
 	cores=$(grep -c processor /proc/cpuinfo)
-	load=$(awk '{print $1}' /proc/loadavg)
 
-	log "Model: $cpu_name"
-	log "Board: $(get_board_name)"
-	log "Load: $load | Cores: $cores"
-	log "CPU Governor: $(get_cpu_governor)"
+	# 5. Цвета для процентов нагрузки
+	local load_color=$GREEN
+	[ "$load_pct" -gt 60 ] && load_color=$YELLOW
+	[ "$load_pct" -gt 85 ] && load_color=$RED
+
+	log "Model:  $cpu_name"
+	log "Board:  $(get_board_name)"
+	log "Usage:  ${load_color}${load_pct}%${NC} | Cores: $cores active"
+	log "Governor: $(get_cpu_governor)"
+
 	get_cpu_freqs_detailed
-	
-	# Сравнение текущей макс. частоты с заводской макс. частотой
+
+	# 6. Проверка троттлинга
 	local cur_max_f factory_max_f base="/sys/devices/system/cpu/cpu0/cpufreq"
 	cur_max_f=$(cat "$base/scaling_max_freq" 2>/dev/null)
 	factory_max_f=$(cat "$base/cpuinfo_max_freq" 2>/dev/null)
 
 	if [ -n "$cur_max_f" ] && [ -n "$factory_max_f" ]; then
 		if [ "$cur_max_f" -lt "$factory_max_f" ]; then
-			log "CPU Throttling: ${RED}ACTIVE${NC} (Limited to $((cur_max_f/1000)) MHz)"
+			log "Throttling: ${RED}ACTIVE${NC} ($((cur_max_f/1000)) MHz limit)"
 		else
-			log "CPU Throttling: ${GREEN}Inactive${NC}"
+			log "Throttling: ${GREEN}Inactive${NC}"
 		fi
 	fi
 
-	# Сравниваем дробные значения с помощью awk (bash не поддерживает float)
-	warn=$(awk -v l="$load" -v c="$cores" -v m="$CPU_WARN_MULT" 'BEGIN{print (l > c*m)}')
-	crit=$(awk -v l="$load" -v c="$cores" -v m="$CPU_CRIT_MULT" 'BEGIN{print (l > c*m)}')
+	# 7. Унифицированный статус
+	local s_color=$GREEN
+	local s_label="OK"
+	local s_msg="CPU load normal"
 
-	if [ "$crit" -eq 1 ]; then
-		log "${RED}CRITICAL: CPU Load $load${NC}"
+	if [ "$load_pct" -gt 90 ]; then
+		s_color=$RED
+		s_label="CRITICAL"
+		s_msg="CPU Overload!"
 		SYSTEM_STATUS=$EXIT_CRITICAL
-	elif [ "$warn" -eq 1 ]; then
-		log "${YELLOW}WARNING: CPU Load $load${NC}"
+	elif [ "$load_pct" -gt 70 ]; then
+		s_color=$YELLOW
+		s_label="WARNING"
+		s_msg="High CPU load"
 		[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
-	else
-		log "${GREEN}OK: CPU Load normal${NC}"
 	fi
+
+	log "Status: ${s_color}${s_label} (${s_msg})${NC}"
 }
 
+
 # check_cpu_temp
-# Поиск и выбор максимальной валидной температуры среди датчиков thermal_zone*.
-# Если нет подходящих датчиков — пытаемся взять температуру батареи как прокси.
+# Опрашивает тепловые датчики каждого ядра. При отсутствии данных по ядрам 
+# использует температуру батареи в качестве ориентира SoC.
 check_cpu_temp() {
-	local max=0 z type raw t b
-	local zones=0 denied=0 valid=0
+	local max=0 z type raw t i
+	local cores_ok=0
 
 	echo
 	echo "[ CPU TEMP ]"
 	quiet_hint
 
-	# Расширенный список ключевых слов для поиска процессорных зон
-	# tsens, cpu, soc, msm_therm, core - покрывает 99% Android устройств
-	for z in /sys/class/thermal/thermal_zone*; do
-		[ -f "$z/type" ] || continue
+	log "Core Temperatures:"
 
-		type=$(cat "$z/type" 2>/dev/null) || { denied=1; continue; }
-		type=$(echo "$type" | tr '[:upper:]' '[:lower:]')
+	# Собираем карту путей thermal_zone один раз для ускорения работы
+	local tz_map
+	tz_map=$(grep -r "" /sys/class/thermal/thermal_zone*/type 2>/dev/null)
 
-		# Фильтр типов зон
-		case "$type" in
-			*tsens*|*cpu*|*soc*|*core*|*msm_therm*) ;;
-			*) continue ;;
+	for i in {0..7}; do
+		local sensor_name=""
+		case $i in
+			0) sensor_name="cpu-0-0-usr" ;;
+			1) sensor_name="cpu-0-1-usr" ;;
+			2) sensor_name="cpu-0-2-usr" ;;
+			3) sensor_name="cpu-0-3-usr" ;;
+			4) sensor_name="cpu-1-4-usr" ;;
+			5) sensor_name="cpu-1-5-usr" ;;
+			6) sensor_name="cpu-1-6-usr" ;;
+			7) sensor_name="cpu-1-7-usr" ;;
 		esac
 
-		zones=$((zones + 1))
-		# Авто-определение формата: 45000 (ms) или 45 (градусы)
-		raw=$(cat "$z/temp" 2>/dev/null) || { denied=1; continue; }
-		[ -z "$raw" ] || [ "$raw" -le 0 ] && continue
+		local core_t="N/A"
+		# Находим путь к файлу температуры для конкретного датчика
+		local t_path=$(echo "$tz_map" | grep "$sensor_name" | cut -d: -f1 | sed 's/type/temp/')
 
-		if [ "$raw" -gt 1000 ]; then
-			t=$((raw / 1000))
-		else
-			t=$raw
+		if [ -n "$t_path" ] && [ -f "$t_path" ]; then
+			raw=$(cat "$t_path" 2>/dev/null)
+			if [ -n "$raw" ] && [ "$raw" -gt 0 ]; then
+				# Конвертируем из микроградусов в градусы
+				t=$((raw > 1000 ? raw / 1000 : raw))
+				core_t="${t}°C"
+				[ "$t" -gt "$max" ] && max="$t"
+				cores_ok=$((cores_ok + 1))
+			fi
 		fi
-		# Валидация: 15°C (минимум) до 115°C (порог троттлинга)
-		if [ "$t" -ge 15 ] && [ "$t" -le 115 ]; then
-			valid=1
-			[ "$t" -gt "$max" ] && max="$t"
+
+		# Логика цвета
+		local c_color=$NC
+		local t_val=${core_t%°C}
+		if [[ "$t_val" =~ ^[0-9]+$ ]]; then
+			[ "$t_val" -gt 55 ] && c_color=$YELLOW
+			[ "$t_val" -gt 75 ] && c_color=$RED
 		fi
+
+		# Формируем строку заранее, чтобы printf не конфликтовал с функцией log
+		local core_display
+		core_display=$(printf "${c_color}%4s${NC}" "$core_t")
+		log "              Core $i: $core_display"
 	done
 
-	# Добавляем цветовой индикатор (желтый если > 60, красный если > 80)
-	if [ "$max" -gt 0 ]; then
-		local color=$NC
-		[ "$max" -gt 60 ] && color=$YELLOW
-		[ "$max" -gt 80 ] && color=$RED
-		log "CPU Max Temp: ${color}${max}°C${NC}"
-		return
-	fi
+	# Итоговый расчет SoC
+	local final_t=0
+	local label="SoC Max Temp"
 
-	# Пояснительная секция, если определение температуры CPU по какой-то причине недоступно
-	if [ "$zones" -eq 0 ]; then
-		log "CPU Temp: ${RED}unavailable${NC} (no thermal zones)"
-	elif [ "$denied" -eq 1 ]; then
-		log "CPU Temp: ${RED}unavailable${NC} (permission denied)"
-	elif [ "$valid" -eq 0 ]; then
-		log "CPU Temp: ${RED}unavailable${NC} (invalid sensor data)"
+	if [ "$cores_ok" -gt 0 ]; then
+		final_t=$max
 	else
-		log "CPU Temp: ${RED}unavailable${NC}"
+		# План Б: Температура батареи
+		raw=$(cat /sys/class/power_supply/battery/temp 2>/dev/null)
+		if [ -n "$raw" ]; then
+			final_t=$((raw / 10))
+			label="SoC Temp (battery proxy)"
+		fi
 	fi
 
-	# План Б: Если датчики CPU молчат, берем батарею
-	b=$(cat /sys/class/power_supply/battery/temp 2>/dev/null)
-	if [ -n "$b" ]; then
-		# У батарей делитель обычно 10 (например 365 -> 36.5C)
-		log "SoC Temp (battery proxy): $((b/10))°C"
+	# Светофор для итоговой температуры
+	local status_color=$GREEN
+	[ "$final_t" -gt 60 ] && status_color=$YELLOW
+	[ "$final_t" -gt 80 ] && status_color=$RED
+
+	if [ "$final_t" -gt 0 ]; then
+		log "$label: ${status_color}${final_t}°C ${NC}"
+	else
+		log "$label: ${RED}Unavailable${NC}"
 	fi
 }
 
@@ -531,147 +656,192 @@ check_gpu() {
 	echo "[ GPU MONITOR ]"
 	quiet_hint
 
-	local BC_INSTALLED gpu_model gpu_freq gpu_load gpu_gov
+	local BC_INSTALLED gpu_model gpu_freq gpu_load gpu_gov gpu_temp
 	BC_INSTALLED=$(command -v bc 2>/dev/null)
 
 	gpu_model="Unknown"
 	gpu_freq="N/A"
 	gpu_load="N/A"
 	gpu_gov="N/A"
+	gpu_temp="N/A"
 
-	# Adreno (Qualcomm)
+		# 1. Поиск температуры (Адаптивный)
+		for f in /sys/class/thermal/thermal_zone*/type; do
+		local type=$(cat "$f" 2>/dev/null)
+		if [[ "$type" == "gpuss-0-usr" || "$type" == "gpu-usr" || "$type" == "gpu" ]]; then
+			local t_path="${f%type}temp"
+			t_raw=$(cat "$t_path" 2>/dev/null)
+			if [ -n "$t_raw" ] && [ "$t_raw" -gt 0 ]; then
+				t_val=$((t_raw > 1000 ? t_raw / 1000 : t_raw))
+				gpu_temp="${t_val}°C"
+				break
+			fi
+		fi
+	done
+
+	# 2. Определение модели и метрик (Adreno)
 	if [ -d /sys/class/kgsl/kgsl-3d0 ]; then
 		gpu_model="Adreno (Qualcomm)"
 		local path="/sys/class/kgsl/kgsl-3d0"
 
-		local raw_freq
-		raw_freq=$(cat "$path/gpuclk" 2>/dev/null)
+		# Частота: если gpuclk дает 0, пробуем cur_freq (бывает в некоторых ядрах)
+		local raw_freq=$(cat "$path/gpuclk" 2>/dev/null)
+		if [ -z "$raw_freq" ] || [ "$raw_freq" -eq 0 ]; then
+			raw_freq=$(cat "$path/devfreq/cur_freq" 2>/dev/null)
+		fi
 		[ -n "$raw_freq" ] && gpu_freq="$((raw_freq / 1000000)) MHz"
 
-		# gpubusy обычно содержит busy и total — вычисляем процент
 		gpu_load=$(awk '{if($2>0) printf "%.1f%%", ($1/$2)*100; else print "0%"}' "$path/gpubusy" 2>/dev/null)
 		gpu_gov=$(cat "$path/devfreq/governor" 2>/dev/null)
 
-	# Mali (MediaTek / Exynos / Google Tensor)
+	# 3. Определение модели и метрик (Mali)
 	elif ls /sys/devices/platform/*mali* >/dev/null 2>&1 || [ -d /sys/module/mali_kbase ]; then
-		gpu_model="Mali (MediaTek / Exynos / Tensor)"
-
+		gpu_model="Mali (MediaTek/Exynos/Tensor)"
 		local mali_path
 		mali_path=$(ls -d /sys/devices/platform/*mali* 2>/dev/null | head -1)
 		[ -z "$mali_path" ] && mali_path="/sys/class/misc/mali0/device"
 
-		for f in \
-			"$mali_path/cur_freq" \
-			"$mali_path/clock" \
-			"/sys/kernel/debug/mali0/curr_freq"
-		do
+		# Частота Mali
+		for f in "$mali_path/cur_freq" "$mali_path/clock" "/sys/kernel/debug/mali0/curr_freq"; do
 			if [ -f "$f" ]; then
-				local raw_f
-				raw_f=$(cat "$f" 2>/dev/null)
-				[ -n "$raw_f" ] && [ "$raw_f" -gt 0 ] && gpu_freq="$((raw_f / 1000000)) MHz"
-				break
+				local raw_f=$(cat "$f" 2>/dev/null)
+				[ -n "$raw_f" ] && [ "$raw_f" -gt 0 ] && gpu_freq="$((raw_f / 1000000)) MHz"; break
 			fi
 		done
-
-		for f in \
-			"$mali_path/utilization" \
-			"/sys/module/mali_kbase/parameters/mali_gpu_utilization" \
-			"/sys/kernel/debug/mali0/utilization"
-		do
+		# Нагрузка Mali
+		for f in "$mali_path/utilization" "/sys/module/mali_kbase/parameters/mali_gpu_utilization"; do
 			if [ -f "$f" ]; then
-				local raw_l
-				raw_l=$(cat "$f" 2>/dev/null)
-				[ -n "$raw_l" ] && gpu_load="${raw_l}%"
-				break
+				local raw_l=$(cat "$f" 2>/dev/null)
+				[ -n "$raw_l" ] && gpu_load="${raw_l}%"; break
 			fi
 		done
-
 		gpu_gov=$(cat "$mali_path/devfreq/governor" 2>/dev/null)
 	fi
 
-	# Если не определили модель — считаем GPU недоступным
 	[ "$gpu_model" = "Unknown" ] && { log "GPU: unavailable"; return; }
 
-	log "Model:    $gpu_model"
-	log "Freq:     $gpu_freq"
-	log "Governor: $gpu_gov"
+	# 4. Цветовая индикация температуры
+	local t_color=$NC
+	if [[ "$gpu_temp" =~ ^[0-9]+ ]]; then
+		local t_num=${gpu_temp%°C}
+		[ "$t_num" -gt 55 ] && t_color=$YELLOW
+		[ "$t_num" -gt 75 ] && t_color=$RED
+	fi
 
-	local load_val gpu_warn gpu_crit
-	load_val=$(echo "$gpu_load" | tr -d '%')
-	gpu_warn=0
-	gpu_crit=0
+	# 5. Вывод основных данных
+	log "Model:       $gpu_model"
+	log "Frequency:   $gpu_freq"
+	log "Governor:    $gpu_gov"
+	log "Temperature: ${t_color}${gpu_temp}${NC}"
 
-	# Проверяем, является ли load_val числом (включая дробные)
+	# 6. Анализ нагрузки и логирование статуса
+	local load_val=$(echo "$gpu_load" | tr -d '%')
+	local gpu_warn=0 gpu_crit=0
+
 	if [[ "$load_val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
 		if [ -n "$BC_INSTALLED" ]; then
-			# Используем bc для сравнения дробных чисел
-			gpu_warn=$(echo "$load_val > $GPU_WARN" | bc)
-			gpu_crit=$(echo "$load_val > $GPU_CRIT" | bc)
+			gpu_warn=$(echo "$load_val > ${GPU_WARN:-70}" | bc)
+			gpu_crit=$(echo "$load_val > ${GPU_CRIT:-90}" | bc)
 		else
-			# fallback: сравниваем целую часть
-			[ "${load_val%.*}" -gt "$GPU_WARN" ] && gpu_warn=1
-			[ "${load_val%.*}" -gt "$GPU_CRIT" ] && gpu_crit=1
+			[ "${load_val%.*}" -gt "${GPU_WARN:-70}" ] && gpu_warn=1
+			[ "${load_val%.*}" -gt "${GPU_CRIT:-90}" ] && gpu_crit=1
 		fi
 	fi
 
 	if [ "$gpu_crit" -eq 1 ]; then
-		log "${RED}CRITICAL: GPU Load $gpu_load${NC}"
+		log "Load:       ${RED}${gpu_load} (CRITICAL)${NC}"
 		SYSTEM_STATUS=$EXIT_CRITICAL
 	elif [ "$gpu_warn" -eq 1 ]; then
-		log "${YELLOW}WARNING: GPU Load $gpu_load${NC}"
+		log "Load:       ${YELLOW}${gpu_load} (HIGH)${NC}"
 		[ "$SYSTEM_STATUS" -lt $EXIT_WARNING ] && SYSTEM_STATUS=$EXIT_WARNING
 	else
-		log "Load:     $gpu_load"
+		log "Load:        $gpu_load"
 	fi
 
-	# Добавляем в блок [ GPU MONITOR ]
+	# 7. Refresh Rate
 	local fps_data
-
-	# Получаем текущий FPS через SurfaceFlinger
-	# Мы берем задержку между кадрами и пересчитываем в FPS
 	fps_data=$(dumpsys SurfaceFlinger --latency | head -1 | awk '{if($1>0) printf "%.0f", 1000000000/$1}')
+	[ -z "$fps_data" ] && fps_data="N/A"
 
-	if [ "$fps_data" -lt 40 ]; then
-		log "FPS:      ${RED}${fps_data}${NC} (Lagging)"
-	elif [ "$fps_data" -lt 90 ]; then
-		log "FPS:      ${YELLOW}${fps_data}${NC}"
-	else
-		log "FPS:      ${GREEN}${fps_data}${NC}"
-	fi
+	local f_color=$GREEN
+	[ "$fps_data" != "N/A" ] && {
+		[ "$fps_data" -lt 40 ] && f_color=$RED
+		[ "$fps_data" -lt 90 ] && [ "$fps_data" -ge 40 ] && f_color=$YELLOW
+	}
+	log "Refresh Rate: ${f_color}${fps_data}${NC} HZ"
 }
 
 # check_battery
-# Читает свойства батареи в /sys/class/power_supply/battery и выводит:
-#  - статус (Charging/Discharging)
-#  - health (Good/Unknown)
-#  - cycles (если доступны)
-#  - температуру в градусах Цельсия
-#  - напряжение в mV
-# Также вычисляет процент износа, если доступны charge_full и charge_full_design.
+# Мониторинг АКБ: уровень, здоровье, мощность и детальный тип зарядки.
 check_battery() {
 	echo
 	echo "[ BATTERY & HEALTH ]"
 	quiet_hint
 
 	local b="/sys/class/power_supply/battery"
-	local cap status temp volt health cycles health_pct current_now power_w
+	local w="/sys/class/power_supply/wireless"
+	local cap status temp volt health cycles health_pct current_now power_w charge_type wireless_temp reverse_status
 
-	[ ! -d "$b" ] && log "Battery data: unavailable" && return
+	[ ! -d "$b" ] && { log "Battery data: unavailable"; return; }
 
-	# Основные параметры
+	# 1. Основные параметры
 	cap=$(cat "$b/capacity" 2>/dev/null)
 	status=$(cat "$b/status" 2>/dev/null)
 	temp=$(( $(cat "$b/temp" 2>/dev/null) / 10 ))
 	volt=$(( $(cat "$b/voltage_now" 2>/dev/null) / 1000 ))
 
-	# Расчет мгновенной мощности
-	current_now=$(cat "$b/current_now" 2>/dev/null) # обычно в микроамперах
+		# 2. Проверка реверсивной зарядки
+	reverse_status="Off"
+	for r_node in "$w/reverse_chg_mode" "$w/wireless_out" "/sys/class/google_battery/reverse_chg_mode"; do
+		if [ -f "$r_node" ] && [ "$(cat "$r_node" 2>/dev/null)" = "1" ]; then
+			reverse_status="${MAGENTA}Active (Battery Share)${NC}"
+			charge_type="Wireless Out (Donor)"
+			break
+		fi
+	done
+
+	# 3. Определение типа зарядки
+	if [ "$reverse_status" = "Off" ]; then
+		if [ "$status" = "Charging" ] || [ "$status" = "Full" ]; then
+			if [ -d "$w" ] && [ "$(cat "$w/online" 2>/dev/null)" = "1" ]; then
+				charge_type="Wireless"
+			elif [ -d "/sys/class/power_supply/usb" ]; then
+				local usb_type=$(cat /sys/class/power_supply/usb/type 2>/dev/null)
+				local usb_voltage=$(( $(cat /sys/class/power_supply/usb/voltage_now 2>/dev/null) / 1000 ))
+
+				if [ "$usb_voltage" -gt 6000 ]; then
+					charge_type="Fast Charging (PD/QC)"
+				elif [[ "$usb_type" == *"PD"* ]]; then
+					charge_type="Fast Charging (USB-PD)"
+				elif [ "$usb_voltage" -gt 0 ]; then
+					charge_type="Standard (USB)"
+				else
+					charge_type="Slow (USB/PC)"
+				fi
+			else
+				charge_type="Plugged (Unknown)"
+			fi
+		else
+			# Вместо дублирования Discharging
+			charge_type="Battery (Internal)"
+		fi
+	fi
+
+	# 4. Датчик беспроводной катушки (мониторим и при входе, и при выходе энергии)
+	local w_raw=$(grep -l "wireless_therm" /sys/class/thermal/thermal_zone*/type 2>/dev/null | sed 's/type/temp/' | xargs cat 2>/dev/null)
+	if [ -n "$w_raw" ]; then
+		wireless_temp=$(( w_raw / 1000 ))
+		# Добавляем инфо о катушке, если она теплая или активна беспроводка
+		if [[ "$charge_type" =~ "Wireless" ]]; then
+			charge_type="$charge_type (Coil: ${wireless_temp}°C)"
+		fi
+	fi
+
+	# 5. Расчет мгновенной мощности
+	current_now=$(cat "$b/current_now" 2>/dev/null)
 	if [ -n "$current_now" ] && [ "$volt" -gt 0 ]; then
-		# Ток в мА (с сохранением знака)
 		local i_ma=$((current_now / 1000))
-		# Мощность в Ваттах через awk (v в мВ, i в мА)
 		power_w=$(awk -v v=$volt -v i=$i_ma 'BEGIN { printf "%.2f", (v * i) / 1000000 }')
-		# Для отображения в логе убираем минус, так как статус (Charging/Discharging) и так понятен
 		display_power="${power_w#-}W"
 		display_current="${i_ma#-}mA"
 	else
@@ -679,28 +849,33 @@ check_battery() {
 		display_current="N/A"
 	fi
 
-	# Здоровье и циклы
+	# 6. Здоровье и циклы
 	health=$(cat "$b/health" 2>/dev/null)
 	cycles=$(cat "$b/cycle_count" 2>/dev/null)
 	[ -z "$cycles" ] && cycles="N/A"
 
 	local full=$(cat "$b/charge_full" 2>/dev/null)
 	local design=$(cat "$b/charge_full_design" 2>/dev/null)
-
 	if [ -n "$full" ] && [ -n "$design" ] && [ "$design" -gt 0 ]; then
 		health_pct=$(( full * 100 / design ))
-		# Ограничиваем 100%, если калибровка сбита
 		[ "$health_pct" -gt 100 ] && health_pct=100
 		health="$health ($health_pct%)"
 	fi
 
-	log "Status:   $status ($cap%)"
-	log "Health:   $health"
-	log "Cycles:   $cycles"
-	log "Temp:     ${temp}°C"
-	log "Current:  $display_current"
-	log "Power:    $display_power"
-	log "Voltage:  ${volt}mV"
+	# 7. Вывод
+	local s_color=$NC
+	[ "$status" = "Charging" ] && s_color=$GREEN
+	[ "$status" = "Discharging" ] && [ "$cap" -lt 20 ] && s_color=$RED
+
+	log "Status:      ${s_color}${status}${NC} ($cap%)"
+	log "Type:        $charge_type"
+	[ "$reverse_status" != "Off" ] && log "Reverse:     $reverse_status"
+	log "Health:      $health"
+	log "Cycles:      $cycles"
+	log "Temperature: ${temp}°C"
+	log "Current:     $display_current"
+	log "Power:       $display_power"
+	log "Voltage:     ${volt}mV"
 
 	# Предупреждения
 	if [ "$temp" -gt 45 ]; then
@@ -881,63 +1056,6 @@ measure_latency() {
 	echo "$avg $jitter"
 }
 
-# check_iperf3_speed
-# Тестирование пропускной способности сети (iperf3).
-# - Игнорируется в BRIEF_MODE и если не передан флаг ENABLE_NET_TEST.
-# - Обходит список серверов, используя быстрый TCP-чек порта 5201.
-check_iperf3_speed() {
-	# 1. Жесткое условие: не тормозим систему в кратком режиме
-	[ "$BRIEF_MODE" = "1" ] && return
-
-	# 2. Опциональность: запускаем только если пользователь этого хочет
-	# Либо добавь проверку счетчика циклов, чтобы не спамить тестами
-	if [ "$ENABLE_NET_TEST" != "1" ]; then
-		# Можно просто вывести статус готовности, если iperf3 есть
-		command -v iperf3 >/dev/null 2>&1 && log "iPerf3:     Ready (use --net-speed to test)"
-		return
-	fi
-
-	if ! command -v iperf3 >/dev/null 2>&1; then
-		log "iPerf3:     Not installed"
-		return
-	fi
-
-	echo
-	echo "[ NETWORK SPEED ] (iperf3)"
-	log "Status:     Testing speed (please wait...)"
-
-	local servers=("iperf.he.net" "ping.online.net" "bouygues.iperf.fr" "speedtest.uztelecom.uz" "speedtest.serverius.net")
-	local timeout_sec=10 
-	local server ok=0
-
-	for server in "${servers[@]}"; do
-		# Проверка порта (2 секунды таймаут — это максимум, что мы можем позволить)
-		if ! timeout 2 sh -c "echo >/dev/tcp/$server/5201" 2>/dev/null; then
-			continue
-		fi
-
-		# Тест Download
-		local down
-		down=$(timeout "$timeout_sec" iperf3 -c "$server" -R 2>/dev/null | awk '/receiver/{print $(NF-2),$(NF-1)}')
-
-		if [ -n "$down" ] && [ "$down" != "0 " ]; then
-			ok=1
-			log "Server:     $server"
-			log "Download:   $down"
-
-			# Тест Upload (только если Download удался)
-			local up
-			up=$(timeout "$timeout_sec" iperf3 -c "$server" 2>/dev/null | awk '/receiver/{print $(NF-2),$(NF-1)}')
-
-			# Если upload не удался (как было в твоем логе), пишем "Failed/Blocked"
-			[ -n "$up" ] && [ "$up" != "0 " ] && log "Upload:     $up" || log "Upload:     Blocked/Failed"
-			break
-		fi
-	done
-
-	[ "$ok" -eq 0 ] && log "iPerf3:     ${RED}All servers unreachable${NC}"
-}
-
 # check_network
 # Попытка подключения к нескольким проверочным хостам.
 # - Перечисляем hosts; если хоть один reachable — считаем интернет доступным.
@@ -1024,6 +1142,63 @@ check_network() {
 	fi
 }
 
+# check_iperf3_speed
+# Тестирование пропускной способности сети (iperf3).
+# - Игнорируется в BRIEF_MODE и если не передан флаг ENABLE_NET_TEST.
+# - Обходит список серверов, используя быстрый TCP-чек порта 5201.
+check_iperf3_speed() {
+	# 1. Жесткое условие: не тормозим систему в кратком режиме
+	[ "$BRIEF_MODE" = "1" ] && return
+
+	# 2. Опциональность: запускаем только если пользователь этого хочет
+	# Либо добавь проверку счетчика циклов, чтобы не спамить тестами
+	if [ "$ENABLE_NET_TEST" != "1" ]; then
+		# Можно просто вывести статус готовности, если iperf3 есть
+		command -v iperf3 >/dev/null 2>&1 && log "iPerf3:     Ready (use --net-speed or -s to test)"
+		return
+	fi
+
+	if ! command -v iperf3 >/dev/null 2>&1; then
+		log "iPerf3:     Not installed"
+		return
+	fi
+
+	echo
+	echo "[ NETWORK SPEED ] (iperf3)"
+	log "Status:     Testing speed (please wait...)"
+
+	local servers=("iperf.he.net" "ping.online.net" "bouygues.iperf.fr" "speedtest.uztelecom.uz" "speedtest.serverius.net")
+	local timeout_sec=10 
+	local server ok=0
+
+	for server in "${servers[@]}"; do
+		# Проверка порта (2 секунды таймаут — это максимум, что мы можем позволить)
+		if ! timeout 2 sh -c "echo >/dev/tcp/$server/5201" 2>/dev/null; then
+			continue
+		fi
+
+		# Тест Download
+		local down
+		down=$(timeout "$timeout_sec" iperf3 -c "$server" -R 2>/dev/null | awk '/receiver/{print $(NF-2),$(NF-1)}')
+
+		if [ -n "$down" ] && [ "$down" != "0 " ]; then
+			ok=1
+			log "Server:     $server"
+			log "Download:   $down"
+
+			# Тест Upload (только если Download удался)
+			local up
+			up=$(timeout "$timeout_sec" iperf3 -c "$server" 2>/dev/null | awk '/receiver/{print $(NF-2),$(NF-1)}')
+
+			# Если upload не удался (как было в твоем логе), пишем "Failed/Blocked"
+			[ -n "$up" ] && [ "$up" != "0 " ] && log "Upload:     $up" || log "Upload:     Blocked/Failed"
+			break
+		fi
+	done
+
+	[ "$ok" -eq 0 ] && log "iPerf3:     ${RED}All servers unreachable${NC}"
+}
+
 # check_logcat
 # Снимает дамп ошибок (Error и выше) из буферов main, system, crash:
 # - сохраняет последние 500 строк в ERR_LOG
@@ -1060,22 +1235,19 @@ check_logcat() {
 }
 
 # print_top
-# Выводит список топ-5 процессов в стиле Card UI.
-# - Автоматически декодирует имена пакетов Android.
-# - Динамически подстраивается под BRIEF_MODE.
+# Выводит список топ-5 процессов. Память выводится в MB/GB для лучшей читаемости.
 print_top() {
-	local p c cpu m real_name
+	local p c cpu rss real_name mem_formatted
 	local separator="----------------------------------------"
 
-	# Берем топ-5 процессов по потреблению CPU
+	# Берем топ-5 процессов. rss — это память в KB.
 	local top_data
-	top_data=$(ps -Ao pid,comm,%cpu,%mem --sort=-%cpu 2>/dev/null | head -n 6 | tail -n +2)
+	top_data=$(ps -Ao pid,comm,%cpu,rss --sort=-%cpu 2>/dev/null | head -n 6 | tail -n +2)
 	[ -z "$top_data" ] && return
 
-	# Логика BRIEF_MODE
+	# Логика BRIEF_MODE (по CPU)
 	if [ "$BRIEF_MODE" = "1" ]; then
-		local top_cpu
-		top_cpu=$(echo "$top_data" | awk '{print int($3); exit}')
+		local top_cpu=$(echo "$top_data" | awk '{print int($3); exit}')
 		[ "$top_cpu" -lt 20 ] && return
 		log "${YELLOW}Warning: High CPU usage detected (${top_cpu}%)${NC}"
 	fi
@@ -1084,27 +1256,42 @@ print_top() {
 	echo "[ TOP PROCESSES ]"
 	[ "$BRIEF_MODE" = "1" ] && echo "(!) High load detected:"
 	quiet_hint
-	
+
 	echo "$separator"
 
-	echo "$top_data" | while read -r p c cpu m; do
-		# Продвинутое определение имени (оставляем твою логику, она крутая)
+	echo "$top_data" | while read -r p c cpu rss; do
+		# Имя процесса (твоя логика декодирования cmdline)
 		if [[ "$c" == "app_process"* ]] || [[ "$c" == "base" ]] || [[ "$c" == "sh" ]]; then
 			if [ -f "/proc/$p/cmdline" ]; then
 				real_name=$(tr '\0' '\n' < "/proc/$p/cmdline" | head -n 1)
 				real_name=${real_name##*/}
+				# Убираем лишние точки в именах пакетов для компактности
 				c=${real_name##*.}
 			fi
 		fi
 		[ -z "$c" ] && c="unknown"
 
-		# Вывод в стиле карточки
-		out_printf "Process:   %s\n" "$c"
-		out_printf "Details:   PID: %-8s | CPU: %-6s | MEM: %s\n" "$p" "$cpu%" "$m%"
-		
-		# Логируем в файл одной строкой
-		log "TOP: PID=$p | CMD=$c | CPU=$cpu% | MEM=$m%"
+		# Конвертация RSS (KB) в MB или GB
+		# 1048576 KB = 1024 MB = 1 GB
+		if [ "$rss" -ge 1048576 ]; then
+			mem_formatted=$(awk -v r="$rss" 'BEGIN {printf "%.2f GB", r/1024/1024}')
+		else
+			mem_formatted=$(awk -v r="$rss" 'BEGIN {printf "%d MB", r/1024}')
+		fi
 
+		# Пример логики для индикации (внутри твоего цикла)
+		local mem_color=$NC
+		if [ "$rss" -ge 1048576 ]; then # Больше 1 GB
+			mem_color=$RED
+		elif [ "$rss" -ge 524288 ]; then # Больше 512 MB
+			mem_color=$YELLOW
+		fi
+
+		# Вывод
+		out_printf "Process:   %s\n" "$c"
+		out_printf "Details:   PID: %-8s | CPU: %-6s | MEM: ${mem_color}%s${NC}\n" "$p" "$cpu%" "$mem_formatted"
+
+		log "TOP: PID=$p | CMD=$c | CPU=$cpu% | MEM=$mem_formatted"
 		echo "$separator"
 	done
 }
@@ -1169,7 +1356,7 @@ print_io() {
 			out_printf "Activity:  READ: %s MB | WRITE: %s MB\n" "$r_mb" "$w_mb"
 			
 			# Дублируем подробности в лог
-			log "I/O: Dev=$dev | Mount=$mnt | R=${r_mb}MB | W=${w_mb}MB"
+			log "I/O: Device=$dev | Mount=$mnt | R=${r_mb}MB | W=${w_mb}MB"
 			
 			echo "----------------------------------------"
 		done <<< "$io_raw"
@@ -1221,9 +1408,7 @@ find_mountpoint() {
 }
 
 # check_partitions
-# Анализирует разделы системы в формате списка (Card UI).
-# - Показывает тип ФС, точку монтирования, объем и источник (блочное устройство).
-# - Единый стиль с блоками I/O и TOP PROCESSES.
+# Сканирует основные разделы системы, определяет тип файловой системы, режим доступа (Read-Only/Read-Write) и отображает статистику занятого места.
 check_partitions() {
 	echo
 	echo "[ SYSTEM PARTITIONS ]"
@@ -1235,8 +1420,8 @@ check_partitions() {
 	echo "$separator"
 
 	for part in "${parts[@]}"; do
-		local mp info size used free fstype backend
-		
+		local mp info size used free fstype backend opts access
+
 		mp=$(find_mountpoint "$part")
 		[ -z "$mp" ] && continue
 
@@ -1245,55 +1430,162 @@ check_partitions() {
 		[ -z "$info" ] && continue
 		read -r size used free <<< "$info"
 
-		# Определяем тип ФС
-		fstype=$(awk -v m="$mp" '$2==m {print $3}' /proc/mounts | head -n1)
+		# Определяем тип ФС и опции монтирования
+		# Извлекаем 3-ю (тип) и 4-ю (опции) колонки из /proc/mounts
+		read -r fstype opts <<< "$(awk -v m="$mp" '$2==m {print $3, $4}' /proc/mounts | head -n1)"
 		[ -z "$fstype" ] && fstype="unknown"
+
+		# Определяем режим доступа: ищем 'ro' или 'rw' в начале строки опций или после запятой
+		if [[ ",$opts," == *",ro,"* ]]; then
+			access="-ro"
+		elif [[ ",$opts," == *",rw,"* ]]; then
+			access="-rw"
+		else
+			access="-??"
+		fi
 
 		# Определяем источник (backend)
 		backend="$(get_backend_from_mountinfo "$mp")"
-		[ -z "$backend" ] && backend="unknown"
+		if [ -z "$backend" ] || [ "$backend" = "unknown" ]; then
+			[ "$fstype" = "tmpfs" ] && backend="RAM (tmpfs)" || backend="virtual"
+		fi
 
-		# Вывод в стиле "карточки"
-		out_printf "Partition: %-12s [%s]\n" "$part" "$fstype"
+		# Вывод в стиле "карточки" с новым форматом заголовка
+		out_printf "Partition: %s [%s] [%s]\n" "$part" "$fstype" "$access"
 		out_printf "Mount:     %s\n" "$mp"
 		out_printf "Device:    %s\n" "$backend"
 		out_printf "Storage:   Total: %s | Used: %s | Free: %s\n" "$size" "$used" "$free"
 
 		# Логируем всё одной строкой для истории
-		log "[$part] Type: $fstype | Mount: $mp | Source: $backend | Size: $size | Used: $used | Free: $free"
+		log "[$part] Type: $fstype ($access) | Mount: $mp | Source: $backend | Size: $size | Used: $used | Free: $free"
 
 		echo "$separator"
 	done
 }
 
 # check_pixel_security
-# Специфична для устройств Google Pixel.
-# Пытается определить наличие Titan/StrongBox и состояние Verified Boot.
+# Глубокий анализ безопасности и состояния чипов Google Tensor (6-10 серии).
+# Для старых моделей Pixel (1-5) выводит сообщение об отсутствии чипа Tensor.
 check_pixel_security() {
-	local vendor
+	local soc_name vendor product_model
+	soc_name=$(getprop ro.soc.model)
 	vendor=$(getprop ro.product.manufacturer | tr '[:upper:]' '[:lower:]')
+	product_model=$(getprop ro.product.model)
 
-	# Если устройство не от Google — пропускаем функцию без шума
-	[[ "$vendor" != *"google"* ]] && return
-
-	echo
-	echo "[ GOOGLE TITAN SECURITY ]"
-	quiet_hint
-
-	local titan_status hardware_level
-
-	hardware_level=$(getprop ro.hardware.keystore_impl 2>/dev/null)
-	[ -z "$hardware_level" ] && hardware_level="unknown"
-
-	if logcat -d | grep -qi "StrongBox" ; then
-		titan_status="${GREEN}Active (StrongBox detected)${NC}"
-	else
-		titan_status="${YELLOW}Standby / Not detected${NC}"
+	# 1. Проверка вендора. Если не Google — выходим молча.
+	if [[ "$vendor" != *"google"* ]]; then
+		return
 	fi
 
-	log "Titan Chip:      $titan_status"
-	log "Keystore Impl:   $hardware_level"
-	log "Verified Boot:   $(getprop ro.boot.verifiedbootstate 2>/dev/null)"
+	echo
+	echo "[ GOOGLE PIXEL STATS ]"
+	quiet_hint
+
+	# 2. Проверка на наличие Tensor (gs, zuma, laguna)
+	if [[ ! "$soc_name" =~ ^(gs|zuma|laguna) ]]; then
+		log "Model:          $product_model"
+		log "Status:         ${YELLOW}Feature Unavailable${NC}"
+		log "Reason:         Google Tensor SoC not detected"
+		return
+	fi
+
+	# 3. Определение поколения Tensor
+	local tensor_gen="Tensor (Generic)"
+	case "$soc_name" in
+		"gs101")   tensor_gen="Tensor G1 (Pixel 6)" ;;
+		"gs201")   tensor_gen="Tensor G2 (Pixel 7)" ;;
+		"gs301")   tensor_gen="Tensor G3 (Pixel 8)" ;;
+		"zuma"*)   tensor_gen="Tensor G4 (Pixel 9)" ;;
+		"laguna"*) tensor_gen="Tensor G5 (Pixel 10)" ;;
+	esac
+	log "Platform:       $tensor_gen ($soc_name)"
+
+	# 4. Анализ TPU (NPU) — ищем универсальный путь для всех поколений
+	local tpu_path=""
+	# Проверяем типовые пути для разных поколений
+	for path in "/sys/class/accel/accel0" "/sys/devices/platform/10000000.tpu" "/sys/devices/platform/edgetpu"; do
+		if [ -d "$path" ]; then
+			tpu_path="$path"
+			break
+		fi
+	done
+
+	if [ -n "$tpu_path" ]; then
+		log "TPU Engine:     ${GREEN}Detected${NC} (Google AI Core)"
+	else
+		log "TPU Engine:     ${YELLOW}Hidden/Protected${NC}"
+	fi
+
+	# 5. Titan M2 / StrongBox
+	local strongbox
+	if [ -d "/sys/class/misc/strongbox" ] || [ -d "/dev/strongbox" ]; then
+		strongbox="${GREEN}Hardware (Titan M2)${NC}"
+	else
+		strongbox="${YELLOW}Software/Emulated${NC}"
+	fi
+	log "Security Chip:  $strongbox"
+
+	# 6. Состояние Verified Boot и AVB
+	local avb_state=$(getprop ro.boot.vbmeta.device_state)
+	local vboot=$(getprop ro.boot.verifiedbootstate)
+	log "AVB State:      ${avb_state:-unknown} ($vboot)"
+
+	# 7. AOC (Always On Computer)
+	if [ -d "/sys/devices/platform/aoc" ]; then
+		local aoc_status=$(cat /sys/devices/platform/aoc/status 2>/dev/null || echo "Active")
+		log "AOC Subsystem:  $aoc_status"
+	fi
+
+	# 8. Модем
+	local modem_ver=$(getprop gsm.version.baseband | cut -d',' -f1)
+	[ -n "$modem_ver" ] && log "Modem Baseband: $modem_ver"
+
+	# 9. Загрузчик
+	local bootloader_state=$(getprop ro.boot.flash.locked)
+	if [ "$bootloader_state" = "1" ]; then
+		log "Bootloader:     ${GREEN}Locked${NC}"
+	else
+		log "Bootloader:     ${RED}Unlocked (Risk)${NC}"
+	fi
+}
+
+# get_system_locale
+# Возвращает системную локаль — сначала persist.sys.locale, затем ro.product.locale
+get_system_locale() {
+	getprop persist.sys.locale \ || getprop ro.product.locale
+}
+
+# get_build_description
+# Возвращает строку ROM части прошивки (ro.build.display.id)
+get_build_description() {
+	getprop ro.build.display.id
+}
+
+# get_firmware_description
+# Возвращает строку firmware части прошивки (ro.build.description)
+get_firmware_description() {
+	getprop ro.build.description
+}
+
+# get_board_name
+# Возвращает кодовое имя платы (ro.product.board)
+get_board_name() {
+	getprop ro.product.board
+}
+
+# get_cpu_governor
+# Возвращает текущий governor для cpu0 (scaling_governor)
+get_cpu_governor() {
+	local gov
+	gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
+	[ -n "$gov" ] && echo "$gov"
+}
+
+# get_screen_resolution
+# Использует утилиту wm (window manager) для получения размеров экрана
+# Формат результата: "WIDTHxHEIGHT" (например "1080x2400")
+get_screen_resolution() {
+	wm size 2>/dev/null | awk -F': ' 'NR==1 {print $2}'
 }
 
 # detect_root_method
@@ -1379,43 +1671,126 @@ get_zygisk_status() {
 	fi
 }
 
-# get_system_locale
-# Возвращает системную локаль — сначала persist.sys.locale, затем ro.product.locale
-get_system_locale() {
-	getprop persist.sys.locale \ || getprop ro.product.locale
+# check_wakelocks
+# Анализирует активные вейклоки (Partial Wake Locks) через dumpsys power.
+# Извлекает Tag (имя) и Owner (пакет/UID), определяет статус удержания.
+# Ограничивает вывод до 5 наиболее актуальных записей для чистоты лога.
+check_wakelocks() {
+	echo
+	echo "[ WAKELOCKS ] (PowerManager Analysis)"
+	quiet_hint
+
+	local raw_data
+	raw_data=$(dumpsys power | sed -n '/Wake Locks: size=/,/^[[:space:]]*$/p' | grep "PARTIAL_WAKE_LOCK")
+
+	if [ -n "$raw_data" ]; then
+		echo "----------------------------------------------------"
+		echo "$raw_data" | head -n 5 | while read -r line; do
+			# Извлекаем тег (теперь ищем любые кавычки)
+			local tag=$(echo "$line" | grep -oE "['\"][^'\"]+['\"]" | head -n 1 | tr -d "'\"")
+
+			# Извлекаем владельца (UID или имя пакета)
+			local owner=$(echo "$line" | grep -oE '\((uid=)?[0-9a-zA-Z._-]+\)' | tr -d '() uid=')
+			[ -z "$owner" ] && owner=$(echo "$line" | grep -oE '[0-9]{4,}' | head -n 1)
+
+			[ -z "$tag" ] && tag="System/Kernel"
+			[ -z "$owner" ] && owner="Unknown"
+
+			local clean_tag=$(echo "$tag" | cut -c1-30)
+
+			# Определяем статус для лога (с цветом) и для экрана (текстом)
+			local is_active="Active"
+			local log_status="${GREEN}Active${NC}"
+			if echo "$line" | grep -qE "disabled|released"; then
+				is_active="Inactive"
+				log_status="${YELLOW}Inactive${NC}"
+			fi
+
+			# Чистый вывод в колонки без управляющих символов
+			printf "Tag:    %-30s\n" "$clean_tag"
+			printf "Owner:  %-30s\n" "$owner"
+			printf "Status: %s\n" "$is_active"
+
+			# А вот здесь, в основной строке лога, цвета будут работать корректно
+			log "Wakelock: $tag ($owner) -> $log_status"
+			echo "----------------------------------------------------"
+		done
+	else
+		log "Status: ${GREEN}OK${NC} (No active partial wake locks)"
+	fi
 }
 
-# get_build_description
-# Возвращает строку ROM части прошивки (ro.build.display.id)
-get_build_description() {
-	getprop ro.build.display.id
+# check_integrity_status
+# Пытается определить уровень доверия Google Play Integrity.
+check_integrity_status() {
+	local integrity="None"
+	local color=$RED
+	local g_integrity s_integrity basic vboot
+
+	# 1. Проверка через системные пропсы
+	g_integrity=$(getprop sys.usb.config.meta 2>/dev/null)
+	s_integrity=$(getprop ro.com.google.clientidbase.ms 2>/dev/null)
+
+	# 2. Базовые флаги
+	basic=$(getprop ro.boot.flash.locked)
+	vboot=$(getprop ro.boot.verifiedbootstate)
+
+	# Проверка на базовую целостность
+	local bl_check
+	# Очищаем вывод от ANSI-цветов с помощью sed напрямую
+	bl_check=$(get_bootloader_status_hard 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g')
+
+	if [[ "$vboot" == "green" ]] && [[ "$basic" == "1" ]]; then
+		integrity="MEETS_BASIC_INTEGRITY"
+		color=$YELLOW
+	fi
+
+	# 3. Логика для Strong/Device
+	if [[ "$bl_check" == *"Locked (Official)"* ]]; then
+		integrity="MEETS_STRONG_INTEGRITY"
+		color=$GREEN
+	elif [[ "$bl_check" == *"Fake Locked"* ]]; then
+		integrity="MEETS_DEVICE_INTEGRITY (Spoofed)"
+		color=$YELLOW
+	fi
+
+	echo -e "${color}${integrity}${NC}"
 }
 
-# get_firmware_description
-# Возвращает строку firmware части прошивки (ro.build.description)
-get_firmware_description() {
-	getprop ro.build.description
-}
+# get_bootloader_status
+# Жёсткая проверка: ищем признаки разблокировки, которые пытаются скрыть.
+get_bootloader_status() {
+	local lock_prop verified_prop secure_boot lk_state
 
-# get_board_name
-# Возвращает кодовое имя платы (ro.product.board)
-get_board_name() {
-	getprop ro.product.board
-}
+	# 1. Стандартные пропсы
+	lock_prop=$(getprop ro.boot.flash.locked)
+	verified_prop=$(getprop ro.boot.verifiedbootstate)
 
-# get_cpu_governor
-# Возвращает текущий governor для cpu0 (scaling_governor)
-get_cpu_governor() {
-	local gov
-	gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
-	[ -n "$gov" ] && echo "$gov"
-}
+	# 2. Поиск в cmdline (там часто остается реальное состояние)
+	# Ищем упоминания "orange" (разблокирован) или флаги безопасности
+	local cmdline=$(cat /proc/cmdline)
 
-# get_screen_resolution
-# Использует утилиту wm (window manager) для получения размеров экрана
-# Формат результата: "WIDTHxHEIGHT" (например "1080x2400")
-get_screen_resolution() {
-	wm size 2>/dev/null | awk -F': ' 'NR==1 {print $2}'
+	# 3. Эвристика для Xiaomi (иногда реальный статус в ro.boot.status)
+	lk_state=$(getprop ro.boot.status) # Бывает 'locked' или 'unlocked'
+
+	local final_status="Unknown"
+	local color=$NC
+
+	# Логика определения "правды"
+	if [[ "$cmdline" == *"orange"* ]] || [[ "$cmdline" == *"verifiedbootstate=orange"* ]] || [[ "$lk_state" == "unlocked" ]]; then
+		final_status="Unlocked (Fake Locked Detected)"
+		color=$RED
+	elif [ "$lock_prop" = "0" ]; then
+		final_status="Unlocked"
+		color=$RED
+	elif [ "$lock_prop" = "1" ] && [ "$verified_prop" = "green" ]; then
+		# Если пропсы говорят "Locked", проверяем, не подсунул ли их Magisk
+		# Обычно на кастомных ядрах с разблокированным лоадером 'orange' подменяется на 'green'
+		final_status="Locked (Official/Spoofed)"
+		color=$GREEN
+	fi
+
+	echo -e "${color}${final_status}${NC}"
 }
 
 # print_magisk_modules
@@ -1462,54 +1837,6 @@ print_magisk_modules() {
 	[ "$found" -eq 0 ] && echo "$(date +%H:%M:%S) - No Magisk modules installed"
 }
 
-# get_deep_sleep_stats
-# Рассчитывает время глубокого сна (Deep Sleep) процессора.
-get_deep_sleep_stats() {
-	local uptime_ms=0 sleep_ms=0 deep_sleep_pct=0
-	local total_idle_us=0 i=0 s_val=0
-	local last_state_idx=0 cpu_count=0
-
-	# 1. Находим индекс самого глубокого состояния сна (макс. число в названии папки)
-	# Это универсально для всех ядер: от 3.18 до 6.x
-	last_state_idx=$(ls -1 /sys/devices/system/cpu/cpu0/cpuidle/ 2>/dev/null | grep "state" | sed 's/state//' | sort -rn | head -n 1)
-
-	# Если ничего не нашли, выходим
-	if [ -z "$last_state_idx" ]; then
-		log "Deep Sleep: unavailable (No cpuidle states)"
-		return
-	fi
-
-	# 2. Получаем аптайм системы
-	uptime_ms=$(awk '{print int($1 * 1000)}' /proc/uptime)
-	
-	# 3. Получаем количество ядер
-	cpu_count=$(ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null | wc -l)
-	[ "$cpu_count" -eq 0 ] && cpu_count=1
-
-	# 4. Суммируем время этого "самого глубокого" состояния по всем ядрам
-	for i in $(seq 0 $((cpu_count - 1))); do
-		local target_path="/sys/devices/system/cpu/cpu$i/cpuidle/state${last_state_idx}/time"
-		if [ -f "$target_path" ]; then
-			s_val=$(cat "$target_path" 2>/dev/null)
-			total_idle_us=$((total_idle_us + ${s_val:-0}))
-		fi
-	done
-
-	# 5. Расчеты
-	# Делим на количество ядер (обычно 8) и переводим из мкс в мс
-	sleep_ms=$((total_idle_us / cpu_count / 1000))
-
-	if [ "$sleep_ms" -gt 0 ] && [ "$uptime_ms" -gt 0 ]; then
-		deep_sleep_pct=$(( sleep_ms * 100 / uptime_ms ))
-		[ "$deep_sleep_pct" -gt 100 ] && deep_sleep_pct=100
-
-		local sleep_min=$((sleep_ms / 1000 / 60))
-		log "Deep Sleep: $deep_sleep_pct% (${sleep_min} min total)"
-	else
-		log "Deep Sleep: 0% (Device always active)"
-	fi
-}
-
 # print_system
 # Выводит базовую информацию о системе:
 #  - uptime
@@ -1533,6 +1860,7 @@ print_system() {
 	fi
 
 	log "SELinux: $(getenforce 2>/dev/null)"
+	log "Play Integrity: $(check_integrity_status)"
 	log "ABI: $(getprop ro.product.cpu.abi)"
 }
 
@@ -1543,12 +1871,11 @@ print_system_extended() {
 	echo "[ SYSTEM INFO ] (EXTENDED)"
 	quiet_hint
 
-	# Показ времени активного использования и статуса deep_sleep
-	log "Uptime: $(uptime -p)"
-	get_deep_sleep_stats
-
-	# Вывод языка, ROM и firmware частей прошивки
+	# Вывод языка системы и времени активного использования
 	log "Locale: $(get_system_locale)"
+	log "Uptime: $(uptime -p)"
+
+	# Вывод ROM и firmware частей прошивки
 	log "Build: $(get_build_description)"
 	log "Firmware: $(get_firmware_description)"
 
@@ -1567,9 +1894,106 @@ print_system_extended() {
 		log "Root: ${RED}NO${NC}"
 	fi
 
-	# Проверка безопасности: статус SELinux и архитектуры процессора
+	# Проверка безопасности: статус SELinux, Play Integrity и архитектуры процессора
 	log "SELinux: $(getenforce 2>/dev/null)"
+	log "Play Integrity: $(check_integrity_status)"
 	log "ABI: $(getprop ro.product.cpu.abi)"
+}
+
+# check_io_schedulers
+# Проверяет настройки планировщика для основных блочных устройств (UFS/eMMC).
+#  - scheduler: текущий алгоритм (mq-deadline, kyber, none)
+#  - read_ahead: размер упреждающего чтения
+check_io_schedulers() {
+	echo
+	echo "[ I/O ] (Schedulers)"
+	quiet_hint
+
+	local dev_list=("sda" "sdb" "mmcblk0")
+	local separator="----------------------------------------"
+
+	echo "$separator"
+	for dev in "${dev_list[@]}"; do
+		[ ! -d "/sys/block/$dev" ] && continue
+
+		local sched read_ahead
+		# Извлекаем активный планировщик из скобок [none]
+		sched=$(cat "/sys/block/$dev/queue/scheduler" 2>/dev/null | awk -F'[' '{print $2}' | cut -d']' -f1)
+		[ -z "$sched" ] && sched="N/A"
+		
+		read_ahead=$(cat "/sys/block/$dev/queue/read_ahead_kb" 2>/dev/null)
+
+		out_printf "Device:    %s\n" "$dev"
+		out_printf "Scheduler: %s\n" "$sched"
+		out_printf "ReadAhead: %s KB\n" "${read_ahead:-0}"
+		
+		log "I/O Scheduler: Device=$dev | Schedule=$sched | RA=${read_ahead}KB"
+		echo "$separator"
+	done
+}
+
+# print_kernel_extended
+# Выводит детализированную информацию о ядре: компилятор, сеть, энтропию и системные таймеры.
+print_kernel_extended() {
+	echo
+	echo "[ KERNEL INFO ] (EXTENDED)"
+	quiet_hint
+
+	# 1. Версия и компилятор
+	local full_ver=$(cat /proc/version)
+	local compiler=$(echo "$full_ver" | grep -oE "(clang|gcc) version [0-9.]+")
+	log "Full Version:    $full_ver"
+	[ -n "$compiler" ] && log "Compiler:        $compiler"
+
+	# 2. Сетевой стек (TCP & VPN)
+	local tcp_algo=$(sysctl -n net.ipv4.tcp_congestion_control)
+	local tcp_avail=$(sysctl -n net.ipv4.tcp_available_congestion_control)
+	log "TCP Congestion:  $tcp_algo (Available: $tcp_avail)"
+
+	if [ -d "/sys/module/wireguard" ]; then
+		local wg_ver=$(cat /sys/module/wireguard/version)
+		log "WireGuard:       v$wg_ver (Kernel Module)"
+	fi
+
+	# 3. Системные ресурсы и таймеры (HZ и Энтропия)
+	local hz="Unknown"
+
+	if [ -f "/proc/config.gz" ]; then
+		# Используем zcat или gzip -dc, которые точно есть в toybox/busybox
+		hz=$(zcat /proc/config.gz 2>/dev/null | grep "CONFIG_HZ=" | head -1 | cut -d= -f2)
+		# Если zcat не сработал, пробуем альтернативу
+		[ -z "$hz" ] && hz=$(gzip -dc /proc/config.gz 2>/dev/null | grep "CONFIG_HZ=" | head -1 | cut -d= -f2)
+	fi
+
+	# Если через конфиг не вышло, пробуем через время прерываний (эвристика)
+	if [ -z "$hz" ] || [ "$hz" = "Unknown" ]; then
+		# Для ARM64 в 99% случаев на Android это 100, 250 или 300
+		# Оставляем "Unknown", чтобы не гадать, или используем значение из USER_HZ
+		hz=$(getconf CLK_TCK 2>/dev/null || echo "100")
+	fi
+
+	local entropy=$(cat /proc/sys/kernel/random/entropy_avail)
+	local entropy_status="Low"
+	[ "$entropy" -gt 256 ] && entropy_status="Healthy"
+	[ "$entropy" -gt 1024 ] && entropy_status="Excellent"
+
+	log "Entropy Avail:   $entropy bits ($entropy_status)"
+	log "Tick Rate (HZ):  $hz"
+
+	# 4. Boot Args (сокращенно)
+	local cmd=$(cat /proc/cmdline)
+	log "Boot Args:       ${cmd:0:100}..."
+
+	# 5. Специфика и Виртуализация
+	if [ -e /dev/kvm ]; then
+		log "Virtualization: KVM Enabled"
+	fi
+
+	if [[ "$(uname -r)" == *"android"* ]]; then
+		log "Kernel Type:     GKI (Generic Kernel Image)"
+	else
+		log "Kernel Type:     Legacy / Custom Vendor"
+	fi
 }
 
 # run_monitor
@@ -1601,9 +2025,9 @@ run_monitor() {
 		touch "$LOG" 2>/dev/null
 		# Записываем технический заголовок только в файл
 		{
-			echo "___________________________________________________"
+			echo "_____________________________________"
 			echo "LOG SESSION START: $(date '+%Y-%m-%d %H:%M:%S')"
-			echo "___________________________________________________"
+			echo "_____________________________________"
 		} >> "$LOG"
 	fi
 
@@ -1616,17 +2040,20 @@ run_monitor() {
 	check_thermal_status
 	check_gpu
 	check_battery
+	check_wakelocks
 	check_network
 	check_iperf3_speed
 	check_logcat
 	print_top
 	print_io
+	check_io_schedulers
 	check_partitions
 	check_pixel_security
 
 	# Блок расширенной информации
 	if [ "$EXTENDED" -eq 1 ]; then
 		print_magisk_modules
+		print_kernel_extended
 		print_system_extended
 	else
 		print_system
@@ -1659,7 +2086,7 @@ while [ $# -gt 0 ]; do
 		-b|--brief) BRIEF_MODE=1 ;;
 		-e|--extended) EXTENDED=1 ;;
 		-f|--no-file) NO_FILE_LOG=1;;
-		--net-speed) ENABLE_NET_TEST=1;;
+		-s|--net-speed) ENABLE_NET_TEST=1;;
 		-c|--clear-log)
 			if [ -f "$LOG" ]; then
 				: > "$LOG"
