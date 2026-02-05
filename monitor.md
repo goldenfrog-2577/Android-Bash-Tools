@@ -1,67 +1,72 @@
-# Android Root System Monitor
+# 📱 Android Root System Monitor (ARSM)
 
-CLI-утилита для мониторинга системного состояния Android-устройств
-с root-доступом (Magisk / KernelSU).
+**ARSM** — это мощная CLI-утилита на базе Bash, предназначенная для глубокого низкоуровневого мониторинга Android-устройств. Проект эволюционировал из простого скрипта в комплексный инструмент диагностики, который понимает специфику различных SoC и архитектур Android 11-15. Скрипт ориентирован на энтузиастов, разработчиков ядер и опытных пользователей root-прав.
 
-## Requirements
+---
 
-- Android 11+
-- Root-доступ (Magisk 26+)
-- BusyBox или Toybox
-- Доступ к /proc и /sys
+## 🛠 Ключевые возможности
 
-## Installation
+* **Адаптивность к железу:** Автоматическое определение процессоров Qualcomm (Snapdragon) и Google Tensor (Pixel 6-10).
+* **Интеллектуальный Loop:** Режим мониторинга с компенсацией времени выполнения — интервалы всегда точные.
+* **Глубокая безопасность:** Проверка статусов Zygisk, Play Integrity, AVB и реального состояния Bootloader (детект "Fake Locked").
+* **Анализ питания:** Расчет мощности в Ваттах, определение протоколов быстрой зарядки (PD/QC) и мониторинг реверсивной зарядки.
+* **Диагностика ошибок:** Автоматический захват и фильтрация критических ошибок из `logcat` (буферы main, system, crash).
 
-- git clone …
-- chmod +x monitor.sh
+---
 
-## Usage
+## 🚀 Быстрый старт
 
-./monitor.sh [options]
+### Требования
+* **Root-доступ:** Magisk 24+ или KernelSU (обязательно).
+* **Среда:** Termux, MT Manager или ADB Shell.
+* **Зависимости:** Стандартный набор Toybox/Busybox (awk, sed, grep, df).
+* **ОС:** Android 11 и выше (API 30+).
 
-## Examples
-- ./monitor.sh
-- ./monitor.sh --quiet
-- ./monitor.sh --no-logcat
+### Установка и запуск
+1. Скопируйте файл `monitor.sh` на устройство.
+2. Дайте права на исполнение:
+   ```bash
+   chmod +x monitor.sh
+```
+3. Запустите от имени суперпользователя:
+   ```bash
+   su -c ./monitor.sh
+```
 
-## Exit Codes
+## ⚙️ Флаги запуска (CLI Options)
 
-| Code | Label      | Description                   |
-|------|------------|-------------------------------|
-|      |            |                               |
-| 0    | OK         | All checks passed             |
-| 1    | WARNING    | Non-critical issue detected   |
-| 2    | CRITICAL   | Critical system condition     |
-| 3    | INTERNAL   | Script internal error         |
+* `-h, --help` — Показать справку и доступные пороги (thresholds).
+* `-l, --loop <sec>` — Запустить бесконечный цикл обновления каждые N секунд.
+* `-e, --extended` — Расширенный отчет: модули Magisk, детали ядра, энтропия, TCP стек.
+* `-b, --brief` — Краткий режим: вывод только при наличии WARNING или CRITICAL.
+* `-q, --quiet` — Только запись в лог-файл без вывода в терминал.
+* `-s, --net-speed` — Тест скорости сети через iPerf3 (требует установленный iperf3).
+* `-n, --no-logcat` — Пропустить тяжелый анализ системного лога для ускорения.
 
-## Output Structure
+## 📊 Структура вывода
+* **STORAGE:** Проверка раздела /data, износ памяти (UFS Life Time) и точки монтирования.
+* **MEMORY:** Состояние RAM и использование ZRAM.
+* **CPU/GPU:** Частоты по ядрам, статус троттлинга, загрузка видеоядра и Refresh Rate.
+* **BATTERY:** Здоровье АКБ, циклы, температура катушки и мгновенный ток.
+* **NETWORK:** Тип соединения (Wi-Fi/Mobile), IP, оператор, задержка (Latency) и Jitter.
+* **WAKELOCKS:** Анализ partial wake locks, мешающих устройству уснуть.
+* **TOP PROCESSES:** Список самых тяжелых процессов с именами пакетов.
 
-- STORAGE
-- MEMORY
-- CPU
-- GPU
-- BATTERY
-- NETWORK
-- LOGCAT
-- TOP PROCESSES
-- PARTITIONS
-- SYSTEM INFO
+## 📝 Логирование
+Скрипт автоматически управляет логами в директории:
+`/data/media/0/.My Folder/logs/`
 
-## Options
+* `android_monitor.log` — Полная история сессий (с авто-ротацией при >1000 строк).
+* `last_errors.log` — Дамп последних 500 ошибок из logcat для дебага.
 
-- --help          Show help and exit
-- --quiet         Disable colored output
-- --no-logcat     Skip logcat analysis
-- --loop <seconds> Run script after X seconds
+## 🛡 Коды возврата (Exit Codes)
+Скрипт возвращает статусы, которые можно использовать в автоматизации (например, в Tasker):
+* **0 (OK):** Система работает в пределах нормы.
+* **1 (WARNING):** Обнаружены отклонения (высокий нагрев, забит диск).
+* **2 (CRITICAL):** Критическое состояние (перегрев, нехватка памяти).
+* **3 (INTERNAL):** Ошибка запуска (нет прав root или неверные аргументы).
 
-## Known Limitations
-
-- GPU load may be unavailable on some SoC
-- Battery cycles are vendor-dependent
-- Temperature readings depend on kernel support
-
-## Internal Design Notes
-
-- Bash-only by design
-- No external dependencies
-- Optimized for rooted Android environments
+## ⚠️ Известные ограничения
+* **GPU Load:** На некоторых проприетарных ядрах Mali данные о загрузке могут быть скрыты.
+* **Refresh Rate:** Данные берутся из SurfaceFlinger, на устройствах с динамическим LTPO значение может быть усредненным.
+* **Storage Health:** Доступно только на чипах, поддерживающих стандарт UFS 2.1+ или eMMC с открытым life_time узлом.
