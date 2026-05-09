@@ -75,7 +75,6 @@
 ## 📱 Мой сетап
 
 * Device: POCO F3 (alioth)
-* OS: Evolution X 10.5 (Android 15)
-* Kernel: Linux version 4.19.246-N0kernel (build-user@build-host) (Android (12701618, +pgo, +bolt, +lto, +mlgo, based on r536225) clang version 19.0.1 (https://android.googlesource.com/toolchain/llvm-project b3a530ec6537146650e42be89f1089e9a3588460), LLD 19.0.1) #11 SMP PREEMPT Thu Apr 24 10:04:23 UTC 2025
-* Root: Magisk / Zygisk
-<!--end list-->
+* OS: Evolution X 11.6.3 (Android 16 QPR2)
+* Kernel: Linux version 4.19.325-RvKernel-Alioth-v1.7-cip130-st14 (Rve@RvEnterprises) (Android (14475230, +pgo, +bolt, +lto, +mlgo, based on r574158) clang version 21.0.0 (https://android.googlesource.com/toolchain/llvm-project 9f872551d3c681d06fd303b36f16ed5c274735eb), LLD 21.0.0 (/mnt/disks/build-disk/src/googleplex-android/llvm-r574158-release/out/llvm-project/llvm 9f872551d3c681d06fd303b36f16ed5c274735eb)) #1 SMP PREEMPT Tue Apr 7 10:27:20 UTC 2026
+* Root Access: Magisk 30.7
