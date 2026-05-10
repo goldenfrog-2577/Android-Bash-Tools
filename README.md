@@ -84,6 +84,50 @@
 
 ⚠️ Скрипт предназначен исключительно для продвинутых пользователей Android и предполагает понимание работы A/B-разметки, AVB 2.0, Fastboot и recovery-среды.
 
+### 📡 7. [volte_vowifi.sh](./scripts/volte_vowifi.sh) — Pixel IMS / VoLTE / VoWiFi Toolkit
+Экспериментальный инструмент для принудительной активации и перерегистрации IMS-сервисов (VoLTE / VoWiFi) на устройствах Google Pixel.
+
+Скрипт ориентирован на ситуации, когда оператор или прошивка искусственно ограничивают работу IMS-функций, несмотря на аппаратную поддержку устройства.
+
+⚠️ Инструмент предназначен исключительно для продвинутых пользователей и работает по принципу **best-effort**. Успех зависит от:
+* региона,
+* оператора,
+* modem-конфигурации,
+* carrier policy,
+* состояния IMS на стороне сети.
+
+#### Возможности
+* **IMS Re-Registration**:
+  * принудительная перерегистрация IMS,
+  * restart IMS-процессов,
+  * повторные попытки регистрации.
+* **VoLTE / VoWiFi Overrides**:
+  * активация `persist.dbg.*` флагов,
+  * включение roaming override,
+  * принудительное включение Wi-Fi Calling.
+* **Telephony Recovery Actions**:
+  * soft-reload радиомодуля через Airplane Mode,
+  * restart mobile data,
+  * `cmd phone ims`,
+  * `service call phone`.
+* **Automatic Backup System**:
+  * автоматическое сохранение текущих `getprop` и `settings`,
+  * генерация rollback-инструкций.
+* **IMS Diagnostics**:
+  * автоматический `dumpsys ims`,
+  * логирование состояния IMS,
+  * анализ признаков успешной регистрации.
+* **Pixel-Oriented Design**:
+  * оптимизировано под Tensor-устройства и AOSP-based telephony stack.
+
+#### Требования
+* root-доступ
+* `resetprop` (желательно)
+* Google Pixel с поддержкой IMS
+* Android 13+
+
+⚠️ Скрипт не изменяет modem firmware и не обходит carrier whitelist напрямую. Некоторые операторы могут продолжать блокировать IMS даже после применения всех override-параметров.
+
 ---
 
 ## 🚀 Установка и использование
