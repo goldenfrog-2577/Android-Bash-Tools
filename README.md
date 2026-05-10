@@ -52,6 +52,36 @@
  
 Для более подробной документации по данному скрипту, вам стоит [заглянуть сюда](./monitor.md)
 
+### 🧰 6. [otg_kit.sh](./scripts/otg_kit.sh) — OTG Rescue ToolKit
+Продвинутый rescue-комплекс для восстановления Android-устройств через OTG-подключение. Предназначен для работы со смартфонами в режимах ADB, Recovery, Fastboot и FastbootD напрямую с другого Android-устройства.
+
+Поддерживает сценарии восстановления после bootloop, неудачной прошивки, конфликтов Magisk-модулей и повреждений разделов.
+
+* **ADB / Fastboot Hub**: Единый интерфейс для управления устройством в режимах system, recovery, sideload, fastboot и fastbootd.
+* **OTG Recovery Workflow**: Работа с устройствами через USB OTG без использования ПК.
+* **Partition Dumping**: Создание byte-to-byte дампов разделов (`boot`, `vendor_boot`, `init_boot` и др.) с автоматической проверкой размеров и MD5-хэшей.
+* **Safe Flashing**: Встроенная система Anti Flash & Erase (AFE), блокирующая прошивку и стирание критических разделов (`abl`, `tz`, `modem`, `persist`, `devinfo` и др.).
+* **Pixel Rescue Features**:
+  * Поддержка `fastboot reboot rescue`
+  * Работа с `vbmeta`
+  * Fastboot boot для временной загрузки ядер и recovery-образов
+  * Поддержка `vendor_boot` / `init_boot`
+* **A/B Slot Management**: Просмотр и переключение активных слотов (`a/b`) напрямую из Fastboot.
+* **Magisk Emergency Mode**: Быстрое удаление модулей Magisk через recovery при bootloop после установки несовместимого модуля.
+* **Smart Device Detection**:
+  * Автоматическое определение Xiaomi / POCO / Redmi / Pixel / Samsung
+  * Вывод предупреждений о AVB, Anti-Rollback, Download Mode и рисках блокировки загрузчика
+* **VBMeta Tools**: Прошивка `vbmeta.img` с автоматическим отключением `verity` и `verification`.
+* **FastbootD Support**: Перезагрузка в userspace fastboot для работы с динамическими разделами внутри `super.img`.
+* **Advanced Bootloader Control**:
+  * `flashing unlock`
+  * `flashing lock`
+  * `unlock_critical`
+  * Проверка статуса загрузчика
+* **Rescue-Oriented UI**: Динамическое меню в зависимости от состояния устройства и автоматическое обновление статуса подключения.
+
+⚠️ Скрипт предназначен исключительно для продвинутых пользователей Android и предполагает понимание работы A/B-разметки, AVB 2.0, Fastboot и recovery-среды.
+
 ---
 
 ## 🚀 Установка и использование
