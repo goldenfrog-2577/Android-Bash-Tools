@@ -52,23 +52,23 @@
 * **Root & Security**: Честная проверка прав суперпользователя через UID и отображение статуса SELinux.
 * **Smart Top**: Список самых ресурсоемких процессов с идеально ровным форматированием колонок.
  
-Для более подробной документации по данному скрипту, вам стоит [заглянуть сюда](./monitor.md)
+Для более подробной документации по данному скрипту, вам стоит [заглянуть сюда](./monitor.md).
 
 ### 🧰 6. [otg_kit.sh](./scripts/otg_kit.sh) — OTG Rescue ToolKit
-Продвинутый rescue-комплекс для восстановления Android-устройств через OTG-подключение. Предназначен для работы со смартфонами в режимах ADB, Recovery, Fastboot и FastbootD напрямую с другого Android-устройства.
+Продвинутый rescue-комплекс для восстановления Android-устройств через OTG-подключение. Предназначен для работы со смартфонами в режимах ADB, recovery, fastboot и fastbootd напрямую с другого Android-устройства.
 
 Поддерживает сценарии восстановления после bootloop, неудачной прошивки, конфликтов Magisk-модулей или повреждения системных разделов.
 
 * **ADB / Fastboot Hub**: Единый интерфейс для управления устройством в режимах system, recovery, sideload, fastboot и fastbootd.
-* **OTG Recovery Workflow**: Работа с устройствами через USB OTG без использования ПК.
-* **Partition Dumping**: Создание byte-to-byte дампов разделов (`boot`, `vendor_boot`, `init_boot` и др.) с автоматической проверкой размеров и MD5-хэшей.
+* **OTG Recovery Workflow**: Работа с устройствами через отладку по USB без использования ПК.
+* **Partition Dumping**: Создание побайтовой копии разделов (`boot`, `vendor_boot`, `init_boot` и др.) с автоматической проверкой размеров и MD5-хэшей.
 * **Safe Flashing**: Встроенная система Anti Flash & Erase (AFE), блокирующая прошивку и стирание критических разделов (`abl`, `tz`, `modem`, `persist`, `devinfo` и др.).
 * **Pixel Rescue Features**:
   * Поддержка `fastboot reboot rescue`
   * Работа с `vbmeta`
-  * Fastboot boot для временной загрузки ядер и recovery-образов
+  * Работа с `fastboot boot` для временной загрузки кастомных ядер и recovery-образов
   * Поддержка `vendor_boot` / `init_boot`
-* **A/B Slot Management**: Просмотр и переключение активных слотов (`a/b`) напрямую из Fastboot.
+* **A/B Slot Management**: Просмотр и переключение активных слотов (`a/b`) напрямую из fastboot.
 * **Magisk Emergency Mode**: Быстрое удаление модулей Magisk через recovery при bootloop после установки несовместимого модуля.
 * **Smart Device Detection**:
   * Автоматическое определение Xiaomi / POCO / Redmi / Pixel / Samsung
@@ -76,9 +76,9 @@
 * **VBMeta Tools**: Прошивка `vbmeta.img` с автоматическим отключением `verity` и `verification`.
 * **FastbootD Support**: Перезагрузка в userspace fastboot для работы с динамическими разделами внутри `super.img`.
 * **Advanced Bootloader Control**:
-  * `flashing unlock`
-  * `flashing lock`
-  * `unlock_critical`
+  * Разблокировка загрузчика через `fastboot flashing unlock`
+  * Блокировка загрузчика через `fastboot flashing lock`
+  * Разблокировка критических разделов через `fastboot unlock_critical`
   * Проверка статуса загрузчика
 * **Rescue-Oriented UI**: Динамическое меню в зависимости от состояния устройства и автоматическое обновление статуса подключения.
 
@@ -92,22 +92,22 @@
 ⚠️ Инструмент предназначен исключительно для продвинутых пользователей и работает по принципу **best-effort**. Успех зависит от:
 * региона,
 * оператора,
-* modem-конфигурации,
-* carrier policy,
+* конфигурации модема,
+* политики оператора связи,
 * состояния IMS на стороне сети.
 
 #### Возможности
 * **IMS Re-Registration**:
   * принудительная перерегистрация IMS,
-  * restart IMS-процессов,
+  * перезагрузка IMS-процессов,
   * повторные попытки регистрации.
 * **VoLTE / VoWiFi Overrides**:
   * активация `persist.dbg.*` флагов,
   * включение roaming override,
-  * принудительное включение Wi-Fi Calling.
+  * принудительное включение "Звонков по Wi-Fi".
 * **Telephony Recovery Actions**:
-  * soft-reload радиомодуля через Airplane Mode,
-  * restart mobile data,
+  * перезапуск радиомодуля через "Режим полёта",
+  * перезагрузка мобильной сети,
   * `cmd phone ims`,
   * `service call phone`.
 * **Automatic Backup System**:
