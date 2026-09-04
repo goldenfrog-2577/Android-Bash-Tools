@@ -1,20 +1,20 @@
 # 🐸 Android Bash Tools by GoldenFrog
 
-Набор специализированных скриптов для продвинутых пользователей Android. Оптимизировано и протестировано на **POCO F3 (alioth)** на базе **Evolution X** (Android 16 QPR2) и на **Pixel 6 (oriole)** на базе **Android 16 QPR3** (номер сборки: CP1A.260405.005), но в целом совместимо с большинством устройств при наличии Termux, любого другого эмулятора терминала и наличия root-прав.
+Набор специализированных скриптов для продвинутых пользователей Android. Оптимизировано и протестировано на **POCO F3 (alioth)** на базе **Evolution X 11.10** (Android 16 QPR2) и на **Pixel 6 (oriole)** на базе **Android 16 QPR3** (номер сборки: CP1A.260405.005), но в целом совместимо с большинством устройств при наличии Termux, любого другого эмулятора терминала и наличия root-прав.
 
 ## ⚠️ Дисклеймер
 
 Использование скриптов осуществляется на свой страх и риск.
 Автор не несёт ответственности за возможные последствия.
 
-Некоторые инструменты репозитория предназначены для low-level работы с разделами Android-устройств. Перед использованием рекомендуется понимать принципы работы Fastboot, AVB 2.0, dynamic partitions и A/B slot system.
+Некоторые инструменты репозитория предназначены для низкоуровневой работы с разделами Android-устройств. Перед использованием рекомендуется понимать принципы работы fastboot, AVB 2.0, динамические разделы и систему слотов A/B.
 
 ## ⚙️ Требования
 
 * Android 11+
-* Root-доступ (Magisk / KernelSU)
+* Root-доступ (Magisk / KernelSU или его современные форки)
 * BusyBox или Toybox
-* Termux / adb shell / root-terminal
+* Shizuku / Termux или любой другой эмулятор терминала
 
 ## 🛠 Состав инструментов
 
@@ -42,7 +42,7 @@
 * **Native Speed**: Использует скомпилированный бинарник `unzip`, обходя медленные Java-методы стандартных проводников.
 * **Visual Progress**: Интерактивная шкала прогресса в терминале.
 * **Safe Search**: Автоматический поиск и нумерованный выбор архивов в указанной директории.
-* **Root Friendly**: Идеально подходит для работы в защищенных разделах `/data/`.
+* **Root Friendly**: Идеально подходит для работы в защищенных разделах `/data/*`.
 
 ### 🔍 5. [monitor.sh](./scripts/monitor.sh) — Бортовой компьютер системы
 Комплексный диагностический отчет, объединяющий состояние «железа» и системные логи в одном окне. Идеально подходит для быстрой проверки здоровья устройства.
@@ -57,7 +57,7 @@
 ### 🧰 6. [otg_kit.sh](./scripts/otg_kit.sh) — OTG Rescue ToolKit
 Продвинутый rescue-комплекс для восстановления Android-устройств через OTG-подключение. Предназначен для работы со смартфонами в режимах ADB, Recovery, Fastboot и FastbootD напрямую с другого Android-устройства.
 
-Поддерживает сценарии восстановления после bootloop, неудачной прошивки, конфликтов Magisk-модулей и повреждений разделов.
+Поддерживает сценарии восстановления после bootloop, неудачной прошивки, конфликтов Magisk-модулей или повреждения системных разделов.
 
 * **ADB / Fastboot Hub**: Единый интерфейс для управления устройством в режимах system, recovery, sideload, fastboot и fastbootd.
 * **OTG Recovery Workflow**: Работа с устройствами через USB OTG без использования ПК.
@@ -82,7 +82,7 @@
   * Проверка статуса загрузчика
 * **Rescue-Oriented UI**: Динамическое меню в зависимости от состояния устройства и автоматическое обновление статуса подключения.
 
-⚠️ Скрипт предназначен исключительно для продвинутых пользователей Android и предполагает понимание работы A/B-разметки, AVB 2.0, Fastboot и recovery-среды.
+⚠️ Скрипт предназначен исключительно для продвинутых пользователей Android и предполагает понимание работы A/B-разметки, AVB 2.0, fastboot и recovery-среды.
 
 ### 📡 7. [volte_vowifi.sh](./scripts/volte_vowifi.sh) — Pixel IMS / VoLTE / VoWiFi Toolkit
 Экспериментальный инструмент для принудительной активации и перерегистрации IMS-сервисов (VoLTE / VoWiFi) на устройствах Google Pixel.
@@ -124,21 +124,21 @@
 * root-доступ
 * `resetprop` (желательно)
 * Google Pixel с поддержкой IMS
-* Android 13+
+* Android 13 и выше
 
-⚠️ Скрипт не изменяет modem firmware и не обходит carrier whitelist напрямую. Некоторые операторы могут продолжать блокировать IMS даже после применения всех override-параметров.
+⚠️ Скрипт не изменяет аппаратное обеспечение модема и не обходит ограничения от оператора связи напрямую. Некоторые операторы могут продолжать блокировать IMS даже после применения всех указанных параметров в скрипте.
 
 ---
 
 ## 🚀 Установка и использование
 
 1. Клонируйте репозиторий (`git clone https://github.com/goldenfrog-2577/Android-Bash-Tools.git`) или скачайте нужный скрипт.
-2. Поместите скрипты в `/data/local/scripts/` (рекомендуется).
+2. Поместите скрипты в `/data/local/scripts/*` (рекомендуется).
 3. Установите права на выполнение:
    ```bash
    chmod +x *.sh
    ```
-4. Для работы **cpu.sh** и **apks.sh** требуются права **Root**.
+4. Для работы большинства скриптов в репозитории требуются **root**-права.
 
 ---
 
@@ -151,6 +151,6 @@
 ## 📱 Мой сетап
 
 * Device: POCO F3 (alioth)
-* OS: Evolution X 11.6.3 (Android 16 QPR2)
-* Kernel: Linux version 4.19.325-RvKernel-Alioth-v1.7-cip130-st14 (Rve@RvEnterprises) (Android (14475230, +pgo, +bolt, +lto, +mlgo, based on r574158) clang version 21.0.0 (https://android.googlesource.com/toolchain/llvm-project 9f872551d3c681d06fd303b36f16ed5c274735eb), LLD 21.0.0 (/mnt/disks/build-disk/src/googleplex-android/llvm-r574158-release/out/llvm-project/llvm 9f872551d3c681d06fd303b36f16ed5c274735eb)) #1 SMP PREEMPT Tue Apr 7 10:27:20 UTC 2026
+* OS: Evolution X 11.10 (Android 16 QPR2)
+* Kernel: Linux version 4.19.325-cip135-st19-perf-g5bcb9aa83bf2 (build-user@build-host) (Android (14054515, +pgo, +bolt, +lto, +mlgo, based on r563880c) clang version 21.0.0 (https://android.googlesource.com/toolchain/llvm-project 5e96669f06077099aa41290cdb4c5e6fa0f59349), LLD 21.0.0 (/mnt/disks/build-disk/src/googleplex-android/llvm-r563880-release/out/llvm-project/llvm 5e96669f06077099aa41290cdb4c5e6fa0f59349)) #1 SMP PREEMPT Tue Aug 18 18:22:05 EEST 2026
 * Root Access: Magisk 30.7
