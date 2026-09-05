@@ -11,7 +11,7 @@
 
 ## ⚙️ Требования
 
-* Android 11+
+* Android 11 и выше (API 30+)
 * Root-доступ (Magisk / KernelSU или его современные форки)
 * BusyBox или Toybox
 * Shizuku / Termux или любой другой эмулятор терминала
