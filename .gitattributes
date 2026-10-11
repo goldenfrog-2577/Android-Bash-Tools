@@ -1,0 +1,7 @@
+# Батники Windows должны храниться с CRLF: с LF cmd.exe теряет метки (call/goto)
+*.bat -text
+*.cmd -text
+*.cfg -text
+
+# Скрипты Android — всегда LF
+*.sh text eol=lf
