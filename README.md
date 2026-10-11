@@ -5,7 +5,7 @@
 Все скрипты проверены на двух реальных устройствах:
 
 * **Google Pixel 8 Pro** (husky, Tensor G3), Android 17 QPR1
-* **POCO F3** (alioth, Snapdragon 870), Evolution X 11.10 на Android 16 QPR@
+* **POCO F3** (alioth, Snapdragon 870), Evolution X 11.10 на Android 16 QPR2
 
 На других устройствах скрипты работают в «общем» режиме: датчики и пути ищутся по стандартным именам, а то, чего на устройстве нет, просто не выводится.
 
