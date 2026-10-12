@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3 — монитор состояния rooted Android
+# monitor.sh v3.2 — монитор состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -29,7 +29,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.0"
+readonly VERSION="3.2"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -120,13 +120,14 @@ char_len() {
 	REPLY=${#t}
 }
 
-# kv "Подпись" "значение" — ровная колонка с кириллицей
+# kv "Подпись" "значение" — ровная колонка с кириллицей.
+# [3.1] Перед двоеточием всегда есть пробел, даже у подписи во всю ширину колонки.
 kv() {
 	strip_ansi "$1"
 	char_len "$REPLY"
 	local pad=$((KV_WIDTH - REPLY)) sp=""
 	[ $pad -gt 0 ] && printf -v sp '%*s' "$pad" ""
-	emit "  $1$sp: $2"
+	emit "  $1$sp : $2"
 }
 
 note() { emit "  ${DIM}$*${NC}"; }
@@ -437,6 +438,48 @@ cpu_snapshot() {   # → REPLY="total idle" по строке cpu из /proc/sta
 	REPLY="$((u + n + s + i + w + q + sq + ${st:-0})) $((i + w))"
 }
 
+# [3.1] Тип ядер по /proc/cpuinfo (CPU implementer + CPU part) — работает на любом
+# ARM SoC без таблицы чипов. Неизвестный код → пусто, и вывод будет обобщённым.
+declare -A CORE_TYPE
+core_name() {   # core_name 0x41 0xd46 → REPLY="A510"
+	REPLY=""
+	case "${1,,}:${2,,}" in
+		0x41:0xd03) REPLY="A53" ;;  0x41:0xd04) REPLY="A35" ;;  0x41:0xd05) REPLY="A55" ;;
+		0x41:0xd07) REPLY="A57" ;;  0x41:0xd08) REPLY="A72" ;;  0x41:0xd09) REPLY="A73" ;;
+		0x41:0xd0a) REPLY="A75" ;;  0x41:0xd0b) REPLY="A76" ;;  0x41:0xd0d) REPLY="A77" ;;
+		0x41:0xd41) REPLY="A78" ;;  0x41:0xd44) REPLY="X1" ;;   0x41:0xd46) REPLY="A510" ;;
+		0x41:0xd47) REPLY="A710" ;; 0x41:0xd48) REPLY="X2" ;;   0x41:0xd4d) REPLY="A715" ;;
+		0x41:0xd4e) REPLY="X3" ;;   0x41:0xd80) REPLY="A520" ;; 0x41:0xd81) REPLY="A720" ;;
+		0x41:0xd82) REPLY="X4" ;;   0x41:0xd85) REPLY="X925" ;; 0x41:0xd87) REPLY="A725" ;;
+		# Qualcomm Kryo со своими кодами (SD835–SD855)
+		0x51:0x800) REPLY="Kryo Gold" ;;   0x51:0x801) REPLY="Kryo Silver" ;;
+		0x51:0x802) REPLY="Kryo 3xx Gold" ;; 0x51:0x803) REPLY="Kryo 3xx Silver" ;;
+		0x51:0x804) REPLY="Kryo 4xx Gold" ;; 0x51:0x805) REPLY="Kryo 4xx Silver" ;;
+	esac
+	[ -n "$REPLY" ]
+}
+load_core_types() {
+	CORE_TYPE=()
+	local line key val cpu="" impl=""
+	while IFS= read -r line; do
+		key="${line%%:*}"; key="${key//$'\t'/}"; key="${key%"${key##*[! ]}"}"
+		val="${line#*: }"
+		case "$key" in
+			processor)         cpu="$val"; impl="" ;;
+			"CPU implementer") impl="$val" ;;
+			"CPU part")        [ -n "$cpu" ] && core_name "$impl" "$val" && CORE_TYPE[$cpu]="$REPLY" ;;
+		esac
+	done < "$R/proc/cpuinfo" 2>/dev/null
+}
+
+# «4 ядра», «1 ядро», «8 ядер»
+cores_word() {
+	local n=$1 m10=$(($1 % 10)) m100=$(($1 % 100))
+	if [ "$m10" -eq 1 ] && [ "$m100" -ne 11 ]; then REPLY="$n ядро"
+	elif [ "$m10" -ge 2 ] && [ "$m10" -le 4 ] && { [ "$m100" -lt 12 ] || [ "$m100" -gt 14 ]; }; then REPLY="$n ядра"
+	else REPLY="$n ядер"; fi
+}
+
 check_cpu() {
 	section "ПРОЦЕССОР"
 	local t1 i1 t2 i2 load=0
@@ -445,34 +488,51 @@ check_cpu() {
 	cpu_snapshot; read -r t2 i2 <<< "$REPLY"
 	[ $((t2 - t1)) -gt 0 ] && load=$(( ( (t2 - t1) - (i2 - i1) ) * 100 / (t2 - t1) ))
 
-	local soc board cores la1
+	local soc board cores la1 la5 la15
 	prop ro.soc.model; soc="$REPLY"
 	[ -z "$soc" ] && { prop ro.board.platform; soc="$REPLY"; }
 	prop ro.product.board; board="$REPLY"
 	cores=$(grep -c '^processor' "$R/proc/cpuinfo" 2>/dev/null)
-	read -r la1 _ < "$R/proc/loadavg" 2>/dev/null
+	read -r la1 la5 la15 _ < "$R/proc/loadavg" 2>/dev/null
 
 	level_by "$load" "$CPU_WARN" "$CPU_CRIT"; local lvl=$REPLY
 	kv "Модель" "${soc:-?}${board:+ · плата $board}"
 	color_by_level "$lvl"
-	kv "Загрузка" "${REPLY}${load}%${NC} · ядер онлайн: ${cores:-?} · load avg ${la1:-?}"
+	kv "Загрузка" "${REPLY}${load}%${NC} · ядер онлайн: ${cores:-?}"
+	# [3.2] load average — по-русски и отдельной строкой: за 1, 5 и 15 минут
+	[ -n "${la1:-}" ] && kv "Ср. нагрузка" "$la1 / ${la5:-?} / ${la15:-?} ${DIM}(за 1, 5, 15 мин)${NC}"
 
-	# Частоты по кластерам: текущая / предел (▼ — предел ниже паспортного)
-	local p cpus cur max hw gov line
+	# [3.1] Частоты по кластерам: «Кластер N : 4× A510 · текущая / предел МГц».
+	# ▼ — предел ниже паспортного. Регулятор — одной строкой, а не в каждой.
+	load_core_types
+	local p cpus first n cur max hw gov govs="" line ctype idx=0
+	local -a _cl
 	for p in "$R"/sys/devices/system/cpu/cpufreq/policy*; do
 		[ -d "$p" ] || continue
-		rd "$p/related_cpus" && cpus="${REPLY// /,}"
+		rd "$p/related_cpus"; cpus="$REPLY"
 		rd "$p/scaling_cur_freq"; cur="$REPLY"
 		rd "$p/scaling_max_freq"; max="$REPLY"
 		rd "$p/cpuinfo_max_freq"; hw="$REPLY"
 		rd "$p/scaling_governor"; gov="$REPLY"
 		is_int "$cur" && is_int "$max" || continue
-		line="$((cur / 1000)) / $((max / 1000)) МГц"
+		idx=$((idx + 1))
+		read -r -a _cl <<< "$cpus"; n=${#_cl[@]}; first="${_cl[0]:-}"
+		ctype="${CORE_TYPE[$first]:-}"
+		if [ -n "$ctype" ] && [ "$n" -gt 0 ]; then
+			line="${n}× $ctype · "
+		elif [ "$n" -gt 0 ]; then
+			cores_word "$n"; line="$REPLY · "
+		else
+			line=""
+		fi
+		line="$line$((cur / 1000)) / $((max / 1000)) МГц"
 		if is_int "$hw" && [ "$max" -lt "$hw" ]; then
 			line="$line ${YELLOW}▼${NC} ${DIM}(паспорт $((hw / 1000)))${NC}"
 		fi
-		kv "CPU ${cpus}" "$line ${DIM}· $gov${NC}"
+		kv "Кластер $idx" "$line"
+		[ -n "$gov" ] && [[ " $govs " != *" $gov "* ]] && govs="${govs:+$govs }$gov"
 	done
+	[ -n "$govs" ] && kv "Регулятор" "${govs// / \/ }"
 
 	# load average относительно числа ядер (пороги CPU_*_MULT)
 	if is_int "${cores:-x}" && [ -n "${la1:-}" ]; then
@@ -507,6 +567,7 @@ check_thermal() {
 	local shown=0 name t max=-999
 
 	# CPU: Tensor — зоны LITTLE/MID/BIG; Qualcomm — cpu-<кластер>-<n>-usr; иначе HAL
+	local -A TLABEL=([LITTLE]="Малые ядра" [MID]="Средние ядра" [BIG]="Большие ядра")
 	for name in LITTLE MID BIG; do
 		if [ -n "${TZ[$name]:-}" ]; then
 			mdeg "${TZ[$name]}"; t="$REPLY"
@@ -515,7 +576,7 @@ check_thermal() {
 		else
 			continue
 		fi
-		color_temp "$t"; kv "CPU $name" "$REPLY"; shown=1
+		color_temp "$t"; kv "${TLABEL[$name]}" "$REPLY"; shown=1
 		[ "${t%.*}" -gt "$max" ] && max="${t%.*}"
 	done
 	if [ "$shown" -eq 0 ]; then
@@ -523,21 +584,21 @@ check_thermal() {
 		for c in 0 1 2 3; do
 			zone_max "cpu-$c-*-usr" || zone_max "cpu-$c-*" || continue
 			mdeg "$REPLY"; t="$REPLY"
-			color_temp "$t"; kv "CPU кластер $c" "$REPLY"; shown=1
+			color_temp "$t"; kv "Кластер $((c + 1))" "$REPLY"; shown=1
 			[ "${t%.*}" -gt "$max" ] && max="${t%.*}"
 		done
 	fi
 	if [ "$shown" -eq 0 ] && zone_max '*cpu*'; then
-		mdeg "$REPLY"; t="$REPLY"; color_temp "$t"; kv "CPU" "$REPLY"; shown=1
+		mdeg "$REPLY"; t="$REPLY"; color_temp "$t"; kv "Процессор" "$REPLY"; shown=1
 	fi
-	[ "$shown" -eq 0 ] && kv "CPU" "нет данных"
+	[ "$shown" -eq 0 ] && kv "Процессор" "нет данных"
 
 	# GPU / TPU / корпус / батарея
-	if [ -n "${TZ[G3D]:-}" ]; then mdeg "${TZ[G3D]}"; color_temp "$REPLY"; kv "GPU" "$REPLY"
-	elif zone_max 'gpuss-*-usr' || zone_max 'gpu*'; then mdeg "$REPLY"; color_temp "$REPLY"; kv "GPU" "$REPLY"
-	elif rd "$R/sys/class/kgsl/kgsl-3d0/temp" && is_int "$REPLY"; then mdeg "$REPLY"; color_temp "$REPLY"; kv "GPU" "$REPLY"
+	if [ -n "${TZ[G3D]:-}" ]; then mdeg "${TZ[G3D]}"; color_temp "$REPLY"; kv "Графика" "$REPLY"
+	elif zone_max 'gpuss-*-usr' || zone_max 'gpu*'; then mdeg "$REPLY"; color_temp "$REPLY"; kv "Графика" "$REPLY"
+	elif rd "$R/sys/class/kgsl/kgsl-3d0/temp" && is_int "$REPLY"; then mdeg "$REPLY"; color_temp "$REPLY"; kv "Графика" "$REPLY"
 	fi
-	[ -n "${TZ[TPU]:-}" ] && { mdeg "${TZ[TPU]}"; color_temp "$REPLY"; kv "TPU" "$REPLY"; }
+	[ -n "${TZ[TPU]:-}" ] && { mdeg "${TZ[TPU]}"; color_temp "$REPLY"; kv "Нейроблок TPU" "$REPLY"; }
 
 	local skin=""
 	for name in "${!HAL_TYPE[@]}"; do
@@ -554,12 +615,12 @@ check_thermal() {
 
 	# Статус Thermal HAL (0–6)
 	if [ "$HAL_READY" = "false" ]; then
-		kv "Thermal HAL" "${DIM}не готов на этой прошивке — статус недоступен${NC}"
+		kv "Термостатус" "${DIM}Thermal HAL не готов на этой прошивке${NC}"
 	elif is_int "${HAL_STATUS:-x}"; then
 		local s="$HAL_STATUS" lbl="${THERMAL_STATUS_NAMES[$HAL_STATUS]:-$HAL_STATUS}"
-		if   [ "$s" -ge 4 ]; then kv "Thermal HAL" "${RED}$lbl ($s)${NC}"; raise_status 2
-		elif [ "$s" -ge 2 ]; then kv "Thermal HAL" "${YELLOW}$lbl ($s)${NC}"; raise_status 1
-		else kv "Thermal HAL" "${GREEN}$lbl ($s)${NC}"; fi
+		if   [ "$s" -ge 4 ]; then kv "Термостатус" "${RED}$lbl ($s)${NC}"; raise_status 2
+		elif [ "$s" -ge 2 ]; then kv "Термостатус" "${YELLOW}$lbl ($s)${NC}"; raise_status 1
+		else kv "Термостатус" "${GREEN}$lbl ($s)${NC}"; fi
 	fi
 
 	# Троттлинг: охлаждающие устройства CPU/GPU/TPU с cur_state > 0
@@ -654,7 +715,44 @@ check_gpu() {
 	res=$(wm size 2>/dev/null | awk -F': ' '/Override/ {o=$2} /Physical/ {p=$2} END {print (o ? o " (физ. " p ")" : p)}')
 	period=$(dumpsys SurfaceFlinger --latency 2>/dev/null | head -n 1)
 	is_int "${period:-x}" && [ "$period" -gt 0 ] && hz=$(( (1000000000 + period / 2) / period ))
-	kv "Экран" "${res:-?}${hz:+ · $hz Гц}"
+	detect_ltpo
+	kv "Экран" "${res:-?}${hz:+ · $hz Гц}${REPLY:+ · $REPLY}"
+	[ -n "$PANEL_MODEL" ] && kv "Панель" "$PANEL_MODEL"
+}
+
+# [3.1] LTPO / адаптивная частота экрана → REPLY («LTPO 1–120 Гц» или пусто).
+# 1) Драйвер панели Pixel (gs-panel): panel_idle есть только у панелей, которые
+#    умеют снижать частоту в простое; нижняя граница — min_vrefresh.
+# 2) Запасной путь — dumpsys display: частоты ниже 60 Гц в mSupportedRefreshRates.
+#    Это признак адаптивной частоты, но не обязательно LTPO, поэтому подпись мягче.
+PANEL_MODEL=""
+detect_ltpo() {
+	REPLY=""; PANEL_MODEL=""
+	local pp minv="" rates lo hi
+	for pp in "$R"/sys/devices/platform/exynos-drm/primary-panel "$R"/sys/devices/platform/*/primary-panel; do
+		[ -d "$pp" ] || continue
+		rd "$pp/panel_model" && PANEL_MODEL="$REPLY"
+		[ -z "$PANEL_MODEL" ] && rd "$pp/panel_name" && PANEL_MODEL="$REPLY"
+		REPLY=""
+		if [ -e "$pp/panel_idle" ]; then
+			rd "$pp/min_vrefresh" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && minv="$REPLY"
+			REPLY="LTPO"
+		fi
+		break
+	done
+	# Диапазон частот из DisplayManager (один раз, первая строка списка)
+	rates=$(dumpsys display 2>/dev/null | sed -n 's/.*mSupportedRefreshRates=\[\([^]]*\)\].*/\1/p' | head -n 1)
+	read -r lo hi <<< "$(printf '%s' "$rates" | awk -F', *' '{ lo = 1e9; hi = 0
+		for (i = 1; i <= NF; i++) { v = $i + 0; if (v <= 0) continue; if (v < lo) lo = v; if (v > hi) hi = v }
+		if (hi > 0) printf "%.0f %.0f", lo, hi }')"
+	if [ "$REPLY" = "LTPO" ]; then
+		# Нижняя граница LTPO (до 1 Гц) системе не видна — берём её только у драйвера
+		if [ -n "$minv" ] && is_int "${hi:-x}"; then REPLY="LTPO $minv–$hi Гц"
+		elif is_int "${hi:-x}"; then REPLY="LTPO до $hi Гц"; fi
+	elif is_int "${lo:-x}" && is_int "${hi:-x}" && [ "$lo" -lt 60 ]; then
+		REPLY="адаптивная $lo–$hi Гц"
+	fi
+	return 0
 }
 
 # ── Батарея ──────────────────────────────────────────────────────────────────
@@ -774,27 +872,76 @@ check_wakelocks() {
 
 # ── Сеть ─────────────────────────────────────────────────────────────────────
 
-# Данные о сети из dumpsys connectivity: тип, интерфейс, DNS, Wi-Fi
-NET_TRANSPORT=""; NET_IFACE=""; NET_DNS=""; NET_WIFI=""
+# Данные о сети из dumpsys connectivity: тип, интерфейс, DNS, Wi-Fi.
+# [3.1] Раньше бралась первая проверенная не-VPN сеть. На Pixel мобильные данные
+# остаются подключены и проверены даже при Wi-Fi, и в списке они часто первые —
+# отсюда ложное «VPN поверх мобильной сети». Теперь разбираем все сети сразу:
+#   1) транспорт VPN-сети: Android дописывает к ней транспорты нижележащей сети
+#      («Transports: WIFI|VPN»);
+#   2) иначе — её Underlying networks по номеру сети;
+#   3) иначе — как выбирает сам Android: проверенный Wi-Fi важнее мобильной сети.
+NET_TRANSPORT=""; NET_IFACE=""; NET_DNS=""; NET_WIFI=""; NET_VPN_UNDER=""; NET_HAS_VPN=0
 load_connectivity() {
-	NET_TRANSPORT=""; NET_IFACE=""; NET_DNS=""; NET_WIFI=""
-	local out
-	out=$(dumpsys connectivity 2>/dev/null | awk '
-		/NetworkAgentInfo\{/ && /Transports: / && !/Transports: VPN/ && /IS_VALIDATED|VALIDATED/ {
-			tr = $0; sub(/.*Transports: /, "", tr); sub(/ .*/, "", tr)
-			ifc = $0; sub(/.*InterfaceName: /, "", ifc); sub(/ .*/, "", ifc)
-			dns = $0; if (sub(/.*DnsAddresses: \[ */, "", dns)) { sub(/ *\].*/, "", dns); gsub(/\//, "", dns) } else dns = ""
+	NET_TRANSPORT=""; NET_IFACE=""; NET_DNS=""; NET_WIFI=""; NET_VPN_UNDER=""; NET_HAS_VPN=0
+	local recs
+	recs=$(dumpsys connectivity 2>/dev/null | awk '
+		/NetworkAgentInfo\{/ && /Transports: / {
+			id = ""; if (match($0, /network\{[0-9]+\}/)) id = substr($0, RSTART + 8, RLENGTH - 9)
+			tr = $0; sub(/.*Transports: /, "", tr); sub(/ .*/, "", tr); gsub(/\|/, "+", tr)
+			ifc = ""; if (match($0, /InterfaceName: [^ ]+/)) ifc = substr($0, RSTART + 15, RLENGTH - 15)
+			dns = $0; if (sub(/.*DnsAddresses: \[ */, "", dns)) { sub(/ *\].*/, "", dns); gsub(/\//, "", dns); gsub(/,/, "", dns) } else dns = ""
 			ssid = ""; if (match($0, /SSID: "[^"]*"/)) ssid = substr($0, RSTART + 7, RLENGTH - 8)
 			rssi = ""; if (match($0, /RSSI: -?[0-9]+/)) rssi = substr($0, RSTART + 6, RLENGTH - 6)
 			fr = ""; if (match($0, /Frequency: [0-9]+/)) fr = substr($0, RSTART + 11, RLENGTH - 11)
 			ls = ""; if (match($0, /Link speed: [0-9]+/)) ls = substr($0, RSTART + 12, RLENGTH - 12)
-			print tr "|" ifc "|" dns "|" ssid "|" rssi "|" fr "|" ls; exit
+			val = ($0 ~ /VALIDATED/) ? 1 : 0
+			und = ""; if (match($0, /[Uu]nderlying[ A-Za-z]*: *\[[0-9, ]*\]/)) {
+				und = substr($0, RSTART, RLENGTH); sub(/.*\[/, "", und); sub(/\].*/, "", und); gsub(/[ ,]+/, " ", und) }
+			gsub(/\|/, "", ssid)
+			print id "|" tr "|" ifc "|" dns "|" ssid "|" rssi "|" fr "|" ls "|" val "|" und
 		}')
-	[ -z "$out" ] && return
-	local ssid rssi fr ls
-	IFS='|' read -r NET_TRANSPORT NET_IFACE NET_DNS ssid rssi fr ls <<< "$out"
-	if [ -n "$ssid" ]; then
-		NET_WIFI="«$ssid»${fr:+ · $fr МГц}${rssi:+ · $rssi дБм}${ls:+ · $ls Мбит/с}"
+	[ -z "$recs" ] && return
+	local id tr ifc dns ssid rssi fr ls val und
+	local -A TR_BY_ID
+	local vpn_tr="" vpn_dns="" vpn_und="" wifi="" cell="" first=""
+	while IFS='|' read -r id tr ifc dns ssid rssi fr ls val und; do
+		[ -n "$id" ] && TR_BY_ID[$id]="$tr"
+		case "+$tr+" in
+			*+VPN+*)
+				[ "$NET_HAS_VPN" -eq 1 ] && continue
+				NET_HAS_VPN=1; vpn_tr="$tr"; vpn_dns="$dns"; vpn_und="$und" ;;
+			*+WIFI+*)
+				[ "$val" = "1" ] && [ -z "$wifi" ] && wifi="$tr|$ifc|$dns|$ssid|$rssi|$fr|$ls" ;;
+			*+CELLULAR+*)
+				[ "$val" = "1" ] && [ -z "$cell" ] && cell="$tr|$ifc|$dns|||||" ;;
+			*)
+				[ "$val" = "1" ] && [ -z "$first" ] && first="$tr|$ifc|$dns|||||" ;;
+		esac
+	done <<< "$recs"
+
+	# Основная физическая сеть — так же, как выбирает Android: Wi-Fi, затем мобильная
+	local main="${wifi:-${cell:-$first}}"
+	if [ -n "$main" ]; then
+		IFS='|' read -r NET_TRANSPORT NET_IFACE NET_DNS ssid rssi fr ls <<< "$main"
+		if [ -n "$ssid" ]; then
+			NET_WIFI="«$ssid»${fr:+ · $fr МГц}${rssi:+ · $rssi дБм}${ls:+ · $ls Мбит/с}"
+		fi
+	fi
+
+	if [ "$NET_HAS_VPN" -eq 1 ]; then
+		local t u
+		# 1) транспорты самой VPN-сети без «VPN»
+		for t in ${vpn_tr//+/ }; do [ "$t" != "VPN" ] && { NET_VPN_UNDER="$t"; break; }; done
+		# 2) Underlying networks
+		if [ -z "$NET_VPN_UNDER" ]; then
+			for u in $vpn_und; do
+				for t in ${TR_BY_ID[$u]//+/ }; do [ "$t" != "VPN" ] && { NET_VPN_UNDER="$t"; break 2; }; done
+			done
+		fi
+		# 3) приоритет Android
+		[ -z "$NET_VPN_UNDER" ] && NET_VPN_UNDER="${NET_TRANSPORT%%+*}"
+		# Через VPN DNS обычно свои — показываем их
+		[ -n "$vpn_dns" ] && NET_DNS="$vpn_dns"
 	fi
 }
 
@@ -840,10 +987,14 @@ check_network() {
 		kv "Подключение" "${RED}нет маршрута в интернет${NC}"
 	else
 		local via=""
-		if [ "$kind" = "VPN" ] && [ -n "$NET_TRANSPORT" ]; then
-			case "$NET_TRANSPORT" in
-				WIFI*) via=" поверх Wi-Fi" ;; CELLULAR*) via=" поверх мобильной сети" ;; *) via=" поверх $NET_TRANSPORT" ;;
+		if [ "$kind" = "VPN" ] && [ -n "$NET_VPN_UNDER" ]; then
+			case "$NET_VPN_UNDER" in
+				WIFI) via=" поверх Wi-Fi" ;; CELLULAR) via=" поверх мобильной сети" ;;
+				ETHERNET) via=" поверх Ethernet" ;; *) via=" поверх $NET_VPN_UNDER" ;;
 			esac
+		elif [ "$kind" != "VPN" ] && [ "$NET_HAS_VPN" -eq 1 ]; then
+			# VPN поднят, но root-трафик идёт мимо него (VPN только для приложений)
+			via=" ${DIM}· VPN активен для приложений${NC}"
 		fi
 		kv "Подключение" "${GREEN}$kind${NC}$via ${DIM}($dev)${NC}"
 	fi
@@ -876,14 +1027,15 @@ check_network() {
 	if [ "$ok" -eq 0 ]; then
 		verdict 1 "интернета нет"
 	fi
+	# [3.2] Подсказка про iperf3 — строкой этой же секции, серым
+	if [ "$ENABLE_NET_TEST" -ne 1 ] && command -v iperf3 >/dev/null 2>&1; then
+		kv "${DIM}Тест скорости${NC}" "${DIM}доступен (iperf3): запусти с --net-speed${NC}"
+	fi
 }
 
 check_iperf3_speed() {
 	[ "$BRIEF_MODE" -eq 1 ] && return
-	if [ "$ENABLE_NET_TEST" -ne 1 ]; then
-		command -v iperf3 >/dev/null 2>&1 && note "iperf3 установлен — тест скорости: --net-speed"
-		return
-	fi
+	[ "$ENABLE_NET_TEST" -ne 1 ] && return   # [3.2] подсказка теперь в секции «СЕТЬ»
 	section "СКОРОСТЬ СЕТИ" "(iperf3)"
 	if ! command -v iperf3 >/dev/null 2>&1; then
 		kv "iperf3" "не установлен"
@@ -961,6 +1113,7 @@ print_top() {
 	[ -z "$data" ] && data=$(ps -Ao pid,comm,%cpu,rss -k -%cpu 2>/dev/null | awk 'NR > 1 && NR <= 6')
 	[ -z "$data" ] && return
 	section "ТОП ПРОЦЕССОВ" "(по CPU)"
+	# [3.2] Строка «PID 1234 : имя · CPU % · ОЗУ МБ» — в общей колонке, как остальные
 	local pid comm cpu rss name mem mc
 	while read -r pid comm cpu rss; do
 		name="$comm"
@@ -971,10 +1124,12 @@ print_top() {
 					name="${name##*/}"; [ -z "$name" ] && name="$comm"
 				fi ;;
 		esac
-		mem=$(hsize_kb "${rss:-0}")
-		mc=""
-		is_int "${rss:-x}" && { [ "$rss" -ge 1048576 ] && mc="$RED" || { [ "$rss" -ge 524288 ] && mc="$YELLOW"; }; }
-		kv "${cpu}%" "${name:0:40} ${DIM}· PID $pid ·${NC} ${mc}$mem${mc:+$NC}"
+		mem="?"; mc=""
+		if is_int "${rss:-x}"; then
+			mem=$(( (rss + 512) / 1024 ))
+			[ "$rss" -ge 1048576 ] && mc="$RED" || { [ "$rss" -ge 524288 ] && mc="$YELLOW"; }
+		fi
+		kv "PID $pid" "${name:0:40} ${DIM}·${NC} ${cpu}% ${DIM}·${NC} ${mc}${mem} МБ${mc:+$NC}"
 	done <<< "$data"
 }
 
@@ -1076,23 +1231,23 @@ check_pixel_security() {
 	kv "Платформа" "$gen ${DIM}($plat)${NC}"
 
 	if [ -d "$R/sys/class/edgetpu" ] || compgen -G "$R/dev/edgetpu*" >/dev/null; then
-		kv "TPU" "${GREEN}есть${NC} ${DIM}(edgetpu)${NC}"
+		kv "Нейроблок TPU" "${GREEN}есть${NC} ${DIM}(edgetpu)${NC}"
 	else
-		kv "TPU" "не найден"
+		kv "Нейроблок TPU" "не найден"
 	fi
 
 	prop ro.strongbox.model; local sb="$REPLY"
 	if [ -e "$R/dev/gsc0" ] || [ -e "$R/dev/citadel0" ] || [ -n "$sb" ]; then
-		kv "Титан" "${GREEN}${sb:-Titan M}${NC} ${DIM}(StrongBox)${NC}"
+		kv "Чип защиты" "${GREEN}${sb:-Titan M}${NC} ${DIM}(StrongBox)${NC}"
 	else
-		kv "Титан" "${YELLOW}не найден${NC}"
+		kv "Чип защиты" "${YELLOW}не найден${NC}"
 	fi
 	if [ -e "$R/dev/aoc" ] || [ -d "$R/sys/devices/platform/aoc" ]; then
 		kv "AOC" "есть ${DIM}(Always-On Compute)${NC}"
 	fi
 	prop gsm.version.baseband
 	[ -n "$REPLY" ] && kv "Модем" "${REPLY%%,*}"
-	kv "Verified Boot" "$VB_LABEL"
+	kv "Статус AVB" "$VB_LABEL"
 }
 
 # ── Система ──────────────────────────────────────────────────────────────────
@@ -1138,7 +1293,7 @@ uptime_str() {
 
 print_system() {
 	section "СИСТЕМА"
-	uptime_str; kv "Аптайм" "$REPLY"
+	uptime_str; kv "Время работы" "$REPLY"
 	detect_root
 	kv "Root" "${GREEN}есть${NC} · $ROOT_INFO"
 	[ -n "$ZYGISK_INFO" ] && kv "Zygisk" "$ZYGISK_INFO"
@@ -1148,7 +1303,7 @@ print_system() {
 		Permissive) kv "SELinux" "${YELLOW}Permissive${NC}" ;;
 		*)          kv "SELinux" "${se:-?}" ;;
 	esac
-	kv "Verified Boot" "$VB_LABEL"
+	kv "Статус AVB" "$VB_LABEL"
 	note "ядро: ${VB_REAL:-${VB_DEVSTATE:-—}} · свойства: ${VB_PROP:-—}/flash.locked=${VB_LOCKPROP:-—}"
 	note "Вердикт Play Integrity выносят серверы Google — локально его не проверить."
 	prop ro.product.cpu.abi; kv "ABI" "$REPLY"
@@ -1164,35 +1319,112 @@ print_system() {
 	kv "Драйверы" "Vulkan: ${vk:-по умолчанию} · EGL: ${egl:-по умолчанию}"
 }
 
-print_magisk_modules() {
-	local dir="$R/data/adb/modules" m name ver st found=0
-	[ -d "$dir" ] || return
-	section "МОДУЛИ MAGISK"
-	for m in "$dir"/*/; do
-		m="${m%/}"
-		[ "${m##*/}" = "lost+found" ] && continue
-		found=1
-		name=""; ver=""
-		if [ -r "$m/module.prop" ]; then
-			name=$(sed -n 's/^name=//p' "$m/module.prop" | head -n 1)
-			ver=$(sed -n 's/^version=//p' "$m/module.prop" | head -n 1)
-		fi
-		st="${GREEN}вкл${NC}"
-		[ -e "$m/disable" ] && st="${YELLOW}выкл${NC}"
-		[ -e "$m/remove" ] && st="${RED}удалится${NC}"
-		kv "[$st]" "${name:-${m##*/}}${ver:+ ${DIM}$ver${NC}}"
-	done
-	[ "$found" -eq 0 ] && kv "Модули" "не установлены"
+# [3.1] Модули: заголовок по типу root, статус у каждого модуля, версия через
+# разделитель, описание строкой ниже. Флаги — штатные файлы Magisk/KernelSU/APatch:
+#   disable → выкл., remove → удалится, update или modules_update/<id> → обновлён.
+# Новые модули, которые появятся только после перезагрузки, тоже показываем.
+mod_prop() {   # mod_prop ФАЙЛ КЛЮЧ → REPLY (без управляющих символов)
+	REPLY=""
+	[ -r "$1" ] || return 1
+	REPLY=$(sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1)
+	REPLY="${REPLY//[[:cntrl:]]/}"
+	[ -n "$REPLY" ]
 }
 
+print_magisk_modules() {
+	[ -z "$ROOT_INFO" ] && detect_root
+	local title="ROOT"
+	case "$ROOT_INFO" in
+		Magisk*)   title="MAGISK" ;;
+		KernelSU*) title="KERNELSU" ;;
+		APatch*)   title="APATCH" ;;
+	esac
+	local dir="$R/data/adb/modules" upd="$R/data/adb/modules_update"
+	[ -d "$dir" ] || [ -d "$upd" ] || [ "$title" != "ROOT" ] || return 0
+	section "МОДУЛИ $title"
+
+	local -a ids=()
+	local m id
+	for m in "$dir"/*/ "$upd"/*/; do
+		id="${m%/}"; id="${id##*/}"
+		[ "$id" = "lost+found" ] && continue
+		[[ " ${ids[*]} " == *" $id "* ]] || ids+=("$id")
+	done
+	if [ ${#ids[@]} -eq 0 ]; then
+		emit "  ${RED}Модули не установлены${NC}"
+		return 0
+	fi
+
+	local name ver vc desc st stc tag pend=0 sp
+	for id in "${ids[@]}"; do
+		m="$dir/$id"
+		if [ -d "$m" ]; then
+			st="вкл."; stc="$GREEN"
+			[ -e "$m/disable" ] && { st="выкл."; stc="$YELLOW"; }
+			if [ -e "$m/update" ] || [ -d "$upd/$id" ]; then st="обновлён"; stc="$CYAN"; pend=1; fi
+			[ -e "$m/remove" ] && { st="удалится"; stc="$RED"; pend=1; }
+		else
+			m="$upd/$id"; st="новый"; stc="$CYAN"; pend=1
+		fi
+		# Свойства берём из обновлённой копии, если она есть
+		local propf="$m/module.prop"
+		[ -r "$upd/$id/module.prop" ] && propf="$upd/$id/module.prop"
+		mod_prop "$propf" name;        name="${REPLY:-$id}"
+		mod_prop "$propf" version;     ver="$REPLY"
+		mod_prop "$propf" versionCode; vc="$REPLY"
+		mod_prop "$propf" description; desc="$REPLY"
+		# Колонка статуса шириной 8 символов
+		char_len "$st"; printf -v sp '%*s' $((8 - REPLY)) ""
+		tag="${stc}${st}${NC}${sp}"
+		emit "  ${tag} ${BOLD}${name}${NC}${ver:+ ${DIM}·${NC} $ver}${vc:+ ${DIM}($vc)${NC}}"
+		if [ -n "$desc" ]; then
+			[ ${#desc} -gt 160 ] && desc="${desc:0:157}..."
+			emit "           ${DIM}${desc}${NC}"
+		fi
+	done
+	[ "$pend" -eq 1 ] && note "обновлён / удалится / новый — изменения применятся после перезагрузки"
+}
+
+# [3.1] Ядро: полный разбор /proc/version — версия, сборщик, компилятор и линкер,
+# флаги сборки и дата, архитектура, размер страницы, модули ядра.
 print_kernel_extended() {
 	section "ЯДРО"
 	local ver rel major minor
 	rd "$R/proc/version"; ver="$REPLY"
 	rel=$(uname -r 2>/dev/null)
-	kv "Версия" "$rel"
-	local cc; cc=$(printf '%s' "$ver" | grep -oE '(clang|gcc) version [0-9.]+' | head -n 1)
-	[ -n "$cc" ] && kv "Компилятор" "$cc"
+	kv "Версия" "${rel:-?}"
+	local arch; arch=$(uname -m 2>/dev/null); [ -n "$arch" ] && kv "Архитектура" "$arch"
+
+	# «Linux version REL (user@host) (toolchain) #N SMP PREEMPT Day Mon DD HH:MM:SS TZ YYYY»
+	local builder="" tool="" build="" date=""
+	local re_full='^Linux version [^ ]+ [(]([^)]*)[)] [(](.*)[)] (#.*)$'
+	local re_short='^Linux version [^ ]+ [(]([^)]*)[)] (#.*)$'
+	if [[ "$ver" =~ $re_full ]]; then
+		builder="${BASH_REMATCH[1]}"; tool="${BASH_REMATCH[2]}"; build="${BASH_REMATCH[3]}"
+	elif [[ "$ver" =~ $re_short ]]; then
+		builder="${BASH_REMATCH[1]}"; build="${BASH_REMATCH[2]}"
+	fi
+	[ -n "$builder" ] && kv "Сборщик" "$builder"
+
+	local cc ld based
+	cc=$(printf '%s' "${tool:-$ver}" | grep -oE '(clang|gcc) version [0-9][0-9.]*' | head -n 1)
+	ld=$(printf '%s' "${tool:-$ver}" | grep -oE '(LLD|GNU ld[^,)]*) [0-9][0-9.]*' | head -n 1)
+	based=$(printf '%s' "$tool" | grep -oE 'based on r[0-9a-z]+' | head -n 1)
+	if [ -n "$cc" ]; then
+		cc="${cc/ version/}"
+		kv "Компилятор" "$cc${ld:+ · $ld}${based:+ ${DIM}(Android, ${based#based on })${NC}}"
+	fi
+
+	if [ -n "$build" ]; then
+		# Дата — хвост вида «Mon Oct 13 10:00:00 UTC 2026»
+		local re_date='^(.*[^ ]) +([A-Z][a-z]{2} [A-Z][a-z]{2} +[0-9]+ [0-9:]+ [A-Za-z0-9+-]+ [0-9]{4})$'
+		if [[ "$build" =~ $re_date ]]; then
+			build="${BASH_REMATCH[1]}"; date="${BASH_REMATCH[2]}"
+		fi
+		kv "Сборка" "$build"
+		[ -n "$date" ] && kv "Дата сборки" "$date"
+	fi
+
 	IFS=. read -r major minor _ <<< "$rel"
 	if is_int "${major:-x}" && is_int "${minor%%[!0-9]*}"; then
 		minor="${minor%%[!0-9]*}"
@@ -1201,6 +1433,13 @@ print_kernel_extended() {
 		else
 			kv "Тип" "не GKI ${DIM}(legacy, ядро < 5.10)${NC}"
 		fi
+	fi
+
+	local pg; pg=$(getconf PAGESIZE 2>/dev/null)
+	is_int "${pg:-x}" && kv "Страница" "$((pg / 1024)) КБ"
+	if [ -r "$R/proc/modules" ]; then
+		local nmod; nmod=$(grep -c '' "$R/proc/modules" 2>/dev/null)
+		kv "Модули ядра" "${nmod:-0} загружено"
 	fi
 
 	local tcp avail
@@ -1342,7 +1581,7 @@ show_help() {
   -l, --loop <сек>      повторять каждые N секунд (Ctrl+C — выход)
   -b, --brief           только предупреждения и критичные события
   -d, --dry-run         только заголовок и системная информация
-  -e, --extended        расширенно: модули Magisk, ядро, сборка, драйверы
+  -e, --extended        расширенно: модули root, ядро, сборка, драйверы
   -s, --net-speed       тест скорости сети (нужен iperf3)
   -c, --clear-log       очистить лог-файл и выйти
 
@@ -1487,3 +1726,16 @@ fi
 #  Удалено: «Play Integrity» (локально не определяется), bootstrap.sh-опечатка.
 
 
+#
+# Изменения v3.1 (косметика, отдельные блоки):
+#  Отступ перед двоеточием во всех строках, «Статус AVB»; кластеры CPU с типом
+#  ядер из /proc/cpuinfo и общим регулятором; русские подписи температур;
+#  LTPO по драйверу панели Pixel (panel_idle / min_vrefresh), запасной путь —
+#  dumpsys display; VPN поверх Wi-Fi определяется по транспортам VPN-сети,
+#  а не по первой сети в списке; топ процессов «PID : имя · CPU · ОЗУ МБ»;
+#  «Защитный чип»; модули — заголовок по типу root, статусы, описания;
+#  ядро — сборщик, компилятор/линкер, флаги и дата сборки, страница, модули.
+#
+# Изменения v3.2: «Ср. нагрузка» (load average за 1/5/15 мин) отдельной строкой,
+#  подсказка iperf3 — серой строкой в секции «СЕТЬ», топ процессов в общей
+#  колонке с подписью «PID N», «Чип защиты», «Время работы» вместо «Аптайм».
