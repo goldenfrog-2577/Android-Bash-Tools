@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.5 — мониторинг состояния rooted Android
+# monitor.sh v3.6 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -11,6 +11,19 @@
 # Коды выхода: 0 — ОК, 1 — есть предупреждения, 2 — критично, 3 — ошибка скрипта.
 # Флаги и коды выхода совместимы с v2 — cron/задачи переделывать не нужно.
 
+# ── [3.6] Уходим из рабочей папки ─────────────────────────────────────────
+# Если запустить скрипт через su из папки, которую root не видит (каталог
+# приложения в другом пространстве монтирования), bash на КАЖДОЙ подстановке
+# $(...) пишет «job-working-directory: error retrieving current directory:
+# getcwd: …». Скрипту текущая папка не нужна — все пути абсолютные, поэтому
+# переходим в «/». Сначала превращаем $0 в абсолютный путь для перезапуска в bash.
+case "$0" in
+	/*) _self="$0" ;;
+	*)  _self="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)/${0##*/}" ;;
+esac
+[ -f "$_self" ] && cd / 2>/dev/null
+[ -f "$_self" ] || _self="$0"
+
 # ── bash обязателен: если запустили через sh — перезапускаемся в bash ──────────
 if [ -z "${BASH_VERSION:-}" ]; then
 	for _b in "$(command -v bash 2>/dev/null)" \
@@ -18,7 +31,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 		/data/data/bin.mt.plus/files/term/bin/bash \
 		/data/data/com.termux/files/usr/bin/bash \
 		/system/xbin/bash /system/bin/bash /usr/bin/bash /bin/bash; do
-		[ -n "$_b" ] && [ -x "$_b" ] && exec "$_b" "$0" "$@"
+		[ -n "$_b" ] && [ -x "$_b" ] && exec "$_b" "$_self" "$@"
 	done
 	echo "[!] Нужен bash (MT Manager / Termux)." >&2
 	exit 3
@@ -29,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.5"
+readonly VERSION="3.6"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -192,10 +205,17 @@ exit_code_label() {
 #  ЧТЕНИЕ ДАННЫХ (без подоболочек — кэши живут весь проход)
 # ═════════════════════════════════════════════════════════════════════════════
 
+# [3.6] can_read ФАЙЛ — можно ли прочитать, проверкой настоящим открытием файла.
+# «[ -r файл ]» спрашивает ядро через faccessat, и на части ядер с KernelSU
+# (Redmi Note 13 Pro 5G, ядро Zen-Itsu) он отвечает «нет» на файлы, которые
+# прекрасно читаются. Из-за этого пропадали частоты CPU, износ UFS, ZRAM,
+# давление и честный статус AVB. Открытие файла таких сюрпризов не даёт.
+can_read() { { : < "$1"; } 2>/dev/null; }
+
 # rd ФАЙЛ → REPLY (первая строка, без пробелов по краям; пусто, если нет файла)
 rd() {
 	REPLY=""
-	[ -r "$1" ] || return 1
+	can_read "$1" || return 1
 	IFS= read -r REPLY 2>/dev/null < "$1" || [ -n "$REPLY" ] || return 1
 	REPLY="${REPLY#"${REPLY%%[! ]*}"}"; REPLY="${REPLY%"${REPLY##*[! ]}"}"
 	return 0
@@ -268,13 +288,13 @@ load_verified_boot() {
 	VB_REAL=""; VB_DEVSTATE=""; VB_SPOOF=0
 	local src
 	for src in "$R/proc/bootconfig" "$R/proc/cmdline"; do
-		[ -r "$src" ] || continue
+		can_read "$src" || continue
 		local data; data=$(tr ' ' '\n' < "$src" 2>/dev/null)
 		[ -z "$VB_REAL" ] && VB_REAL=$(printf '%s\n' "$data" | sed -n 's/^androidboot\.verifiedbootstate=\{0,1\}"\{0,1\}\([a-z]*\).*/\1/p' | head -n 1)
 		[ -z "$VB_DEVSTATE" ] && VB_DEVSTATE=$(printf '%s\n' "$data" | sed -n 's/^androidboot\.vbmeta\.device_state=\{0,1\}"\{0,1\}\([a-z]*\).*/\1/p' | head -n 1)
 	done
 	# bootconfig пишет «key = "value"» — после tr ключ и значение в разных строках
-	if [ -r "$R/proc/bootconfig" ]; then
+	if can_read "$R/proc/bootconfig"; then
 		[ -z "$VB_REAL" ] && VB_REAL=$(sed -n 's/^androidboot\.verifiedbootstate *= *"\([a-z]*\)".*/\1/p' "$R/proc/bootconfig" | head -n 1)
 		[ -z "$VB_DEVSTATE" ] && VB_DEVSTATE=$(sed -n 's/^androidboot\.vbmeta\.device_state *= *"\([a-z]*\)".*/\1/p' "$R/proc/bootconfig" | head -n 1)
 	fi
@@ -485,7 +505,7 @@ check_memory() {
 
 	# Давление (PSI): строки «some avg10=… avg60=…» и «full …»
 	local psi_some="" psi_full="" plvl=0
-	if [ -r "$R/proc/pressure/memory" ]; then
+	if can_read "$R/proc/pressure/memory"; then
 		psi_some=$(awk '$1 == "some" { for (i = 2; i <= NF; i++) if ($i ~ /^avg60=/) { sub(/avg60=/, "", $i); print $i } }' "$R/proc/pressure/memory")
 		psi_full=$(awk '$1 == "full" { for (i = 2; i <= NF; i++) if ($i ~ /^avg60=/) { sub(/avg60=/, "", $i); print $i } }' "$R/proc/pressure/memory")
 	fi
@@ -761,7 +781,7 @@ check_gpu() {
 		rd "$k/gpuclk"; is_int "$REPLY" && [ "$REPLY" -gt 0 ] || rd "$k/devfreq/cur_freq"
 		is_int "$REPLY" && [ "$REPLY" -gt 0 ] && freq="$((REPLY / 1000000)) МГц"
 		if rd "$k/gpu_busy_percentage"; then load="${REPLY%%[ %]*}"
-		elif [ -r "$k/gpubusy" ]; then
+		elif can_read "$k/gpubusy"; then
 			load=$(awk '{ if ($2 > 0) printf "%d", $1 * 100 / $2; else print 0 }' "$k/gpubusy")
 		fi
 		rd "$k/devfreq/governor" && gov="$REPLY"
@@ -769,7 +789,7 @@ check_gpu() {
 		local c
 		for c in "$R/sys/devices/platform/1f000000.mali" "$R"/sys/devices/platform/*.mali \
 			"$R/sys/class/misc/mali0/device"; do
-			[ -r "$c/cur_freq" ] || [ -r "$c/gpuinfo" ] && { mali="$c"; break; }
+			can_read "$c/cur_freq" || can_read "$c/gpuinfo" && { mali="$c"; break; }
 		done
 		if [ -n "$mali" ]; then
 			# gpuinfo kbase: «Mali-G715 7 cores r0p1 0xA862»
@@ -988,7 +1008,7 @@ load_connectivity() {
 			id = ""; if (match($0, /network\{[0-9]+\}/)) id = substr($0, RSTART + 8, RLENGTH - 9)
 			tr = $0; sub(/.*Transports: /, "", tr); sub(/ .*/, "", tr); gsub(/\|/, "+", tr)
 			ifc = ""; if (match($0, /InterfaceName: [^ ]+/)) ifc = substr($0, RSTART + 15, RLENGTH - 15)
-			dns = $0; if (sub(/.*DnsAddresses: \[ */, "", dns)) { sub(/ *\].*/, "", dns); gsub(/\//, "", dns); gsub(/,/, "", dns) } else dns = ""
+			dns = $0; if (sub(/.*DnsAddresses: \[ */, "", dns)) { sub(/ *\].*/, "", dns); gsub(/\//, "", dns); gsub(/ *, */, ", ", dns) } else dns = ""
 			ssid = ""; if (match($0, /SSID: "[^"]*"/)) ssid = substr($0, RSTART + 7, RLENGTH - 8)
 			rssi = ""; if (match($0, /RSSI: -?[0-9]+/)) rssi = substr($0, RSTART + 6, RLENGTH - 6)
 			fr = ""; if (match($0, /Frequency: [0-9]+/)) fr = substr($0, RSTART + 11, RLENGTH - 11)
@@ -1218,7 +1238,7 @@ print_top() {
 		name="$comm"
 		case "$comm" in
 			app_process*|main|base|sh)
-				if [ -r "$R/proc/$pid/cmdline" ]; then
+				if can_read "$R/proc/$pid/cmdline"; then
 					IFS= read -r -d '' name < "$R/proc/$pid/cmdline"
 					name="${name##*/}"; [ -z "$name" ] && name="$comm"
 				fi ;;
@@ -1236,7 +1256,7 @@ print_top() {
 
 print_io() {
 	section "ВВОД-ВЫВОД" "(с момента загрузки)"
-	[ -r "$R/proc/diskstats" ] || { kv "diskstats" "нет данных"; return; }
+	can_read "$R/proc/diskstats" || { kv "diskstats" "нет данных"; return; }
 	# Карта «устройство → точка монтирования» из mountinfo, без временных файлов
 	local out
 	out=$(awk '
@@ -1265,7 +1285,7 @@ check_io_schedulers() {
 	declare -A grp
 	local d n s ra key
 	for d in "$R"/sys/block/sd[a-z] "$R"/sys/block/mmcblk[0-9]; do
-		[ -r "$d/queue/scheduler" ] || continue
+		can_read "$d/queue/scheduler" || continue
 		n="${d##*/}"
 		rd "$d/queue/scheduler"; s="$REPLY"
 		[[ "$s" =~ \[([^]]+)\] ]] && s="${BASH_REMATCH[1]}"
@@ -1424,7 +1444,7 @@ print_system() {
 # Новые модули, которые появятся только после перезагрузки, тоже показываем.
 mod_prop() {   # mod_prop ФАЙЛ КЛЮЧ → REPLY (без управляющих символов)
 	REPLY=""
-	[ -r "$1" ] || return 1
+	can_read "$1" || return 1
 	REPLY=$(sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1)
 	REPLY="${REPLY//[[:cntrl:]]/}"
 	[ -n "$REPLY" ]
@@ -1463,7 +1483,7 @@ print_modules() {
 		fi
 		# Свойства берём из обновлённой копии, если она есть
 		local propf="$m/module.prop"
-		[ -r "$upd/$id/module.prop" ] && propf="$upd/$id/module.prop"
+		can_read "$upd/$id/module.prop" && propf="$upd/$id/module.prop"
 		mod_prop "$propf" name;        name="${REPLY:-$id}"
 		mod_prop "$propf" version;     ver="$REPLY"
 		mod_prop "$propf" versionCode; vc="$REPLY"
@@ -1532,7 +1552,7 @@ print_kernel_extended() {
 
 	local pg; pg=$(getconf PAGESIZE 2>/dev/null)
 	is_int "${pg:-x}" && kv "Страница" "$((pg / 1024)) КБ"
-	if [ -r "$R/proc/modules" ]; then
+	if can_read "$R/proc/modules"; then
 		local nmod; nmod=$(grep -c '' "$R/proc/modules" 2>/dev/null)
 		kv "Модули ядра" "${nmod:-0} загружено"
 	fi
@@ -1544,7 +1564,7 @@ print_kernel_extended() {
 	if rd "$R/sys/module/wireguard/version"; then kv "WireGuard" "v$REPLY"; fi
 
 	local hz=""
-	[ -r "$R/proc/config.gz" ] && hz=$( (zcat "$R/proc/config.gz" || gzip -dc "$R/proc/config.gz") 2>/dev/null | sed -n 's/^CONFIG_HZ=//p' | head -n 1)
+	can_read "$R/proc/config.gz" && hz=$( (zcat "$R/proc/config.gz" || gzip -dc "$R/proc/config.gz") 2>/dev/null | sed -n 's/^CONFIG_HZ=//p' | head -n 1)
 	if [ -n "$hz" ]; then kv "Частота тика" "$hz Гц"; else kv "Частота тика" "неизвестно (нет /proc/config.gz)"; fi
 
 	# [3.5] Новый генератор случайных чисел (BLAKE2s, 5.18) в 2022 году перенесли
@@ -1973,3 +1993,11 @@ fi
 #  большие ядра Qualcomm с собственными кодами (0x51) показываются настоящими
 #  ядрами ARM (у SM8250 — A55); «Энтропия» — фиксированные 256 распознаются по
 #  poolsize, а не по версии ядра (новый RNG перенесён и в 4.19, и в 5.4).
+#
+# Изменения v3.6 — по первому запуску на чужом устройстве (Redmi Note 13 Pro 5G):
+#  скрипт переходит в «/» до запуска — без этого при старте из недоступной
+#  root'у папки bash засыпал вывод ошибками getcwd.
+#  Проверка «можно ли прочитать» — открытием файла (can_read), а не [ -r ]:
+#  на ядрах, где faccessat врёт (KernelSU, Zen-Itsu), пропадали CPU, UFS,
+#  ZRAM, PSI и статус AVB. DNS: несколько серверов выводятся через запятую
+#  (с 3.1 они склеивались в «10.11.12.1310.11.12.14»).
