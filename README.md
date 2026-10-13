@@ -92,6 +92,8 @@ sh unpacker.sh --help                               # все опции
 * **Безопасность**: Verified Boot с обнаружением подмены свойств, Magisk и Zygisk, SELinux; на Pixel — Titan M2, TPU, AOC.
 * **Ошибки logcat**: самые шумные теги и реальные падения приложений.
 
+Кроме двух основных устройств, проверен на Redmi Note 13 Pro 5G (Snapdragon 7s Gen 2, KernelSU).
+
 Подробная документация — [здесь](./monitor.md).
 
 ### 🧰 6. [otg_kit.sh](./scripts/linux/otg_kit.sh) — OTG Rescue Toolkit
