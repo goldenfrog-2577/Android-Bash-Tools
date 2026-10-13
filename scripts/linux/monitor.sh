@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.2 — монитор состояния rooted Android
+# monitor.sh v3.5 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -29,7 +29,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.2"
+readonly VERSION="3.5"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -53,6 +53,7 @@ NO_FILE_LOG=0
 BRIEF_MODE=0
 EXTENDED=0
 DRY_RUN=0
+DRY_SECTIONS=""   # [3.3] -d cpu,gpu — какие секции вывести в пробном запуске
 QUIET=0
 LOOP_INTERVAL=0
 ENABLE_NET_TEST=0
@@ -93,8 +94,10 @@ readonly KV_WIDTH=13      # ширина подписи в символах
 
 strip_ansi() { REPLY="${1//$'\033'\[*([0-9;])m/}"; }
 
+EMIT_COUNT=0   # [3.3] сколько строк выведено — по нему dry-run понимает, есть ли у секции данные
 emit() {
 	local line="$1" ts
+	EMIT_COUNT=$((EMIT_COUNT + 1))
 	if [ "$QUIET" -eq 0 ]; then
 		if [ "$BRIEF_MODE" -eq 1 ] && [ "$CUR_SECTION" = "ИТОГ" ]; then
 			case "$line" in *Итог:*) printf '%s\n' "$line" ;; esac
@@ -311,7 +314,7 @@ print_header() {
 	local ts; printf -v ts '%(%Y-%m-%d %H:%M:%S)T' -1
 	CUR_SECTION="ЗАГОЛОВОК"
 	emit "${BOLD}════════════════════════════════════════${NC}"
-	emit "${BOLD} МОНИТОР СИСТЕМЫ ANDROID${NC}  v$VERSION"
+	emit "${BOLD} МОНИТОРИНГ СИСТЕМЫ ANDROID${NC}  v$VERSION"
 	emit "${BOLD}════════════════════════════════════════${NC}"
 	kv "Устройство" "${model:-?} (${codename:-?})"
 	kv "Android" "${rel:-?}${sdk:+ (SDK $sdk)}${build:+ · $build}"
@@ -413,21 +416,111 @@ check_storage() {
 
 # ── Память ───────────────────────────────────────────────────────────────────
 
+# [3.4] Память: не только «занято %». Процент на Android мало что значит —
+# система нарочно держит RAM занятой кэшем. Реальную картину дают:
+#   PSI (/proc/pressure/memory) — доля времени, когда задачи ждали память;
+#   выгрузки lmkd — сколько приложений система убила из-за нехватки;
+#   zram mm_stat — сколько данных в подкачке и как хорошо они сжались.
+# Статус = худшее из «занято %» (пороги --ram-warn/--ram-crit) и давления за минуту:
+#   some ≥ 5%  — ВНИМАНИЕ (задачи заметно ждут память → подлагивания);
+#   full ≥ 20% — КРИТИЧНО (всё стоит, ожидая память).
+PSI_MEM_WARN=5     # some avg60, %
+PSI_MEM_CRIT=20    # full avg60, %
+
 check_memory() {
 	section "ПАМЯТЬ" "(RAM)"
-	local total=0 avail=0 swt=0 swf=0 k v _
+	local total=0 avail=0 cached=0 swt=0 swf=0 k v _
 	while read -r k v _; do
 		case "$k" in
-			MemTotal:) total=$v ;; MemAvailable:) avail=$v ;;
+			MemTotal:) total=$v ;; MemAvailable:) avail=$v ;; Cached:) cached=$v ;;
 			SwapTotal:) swt=$v ;; SwapFree:) swf=$v ;;
 		esac
 	done < "$R/proc/meminfo"
 	if [ "$total" -le 0 ]; then verdict 3 "нет /proc/meminfo"; return; fi
-	local used=$((total - avail)) pct=$(( (total - avail) * 100 / total ))
-	kv "Всего" "$(hsize_kb "$total") · доступно $(hsize_kb "$avail")"
-	[ "$swt" -gt 0 ] && kv "ZRAM/swap" "занято $(hsize_kb $((swt - swf))) из $(hsize_kb "$swt")"
-	level_by "$pct" "$RAM_WARN" "$RAM_CRIT"
-	verdict "$REPLY" "занято $pct%"
+	local pct=$(( (total - avail) * 100 / total )) apct=$(( avail * 100 / total ))
+
+	# Тип памяти: Pixel пишет «12GiB,Samsung,LPDDR5,0109»
+	local ddr="" dtype dvend
+	prop ro.boot.hardware.ddr
+	if [ -n "$REPLY" ]; then
+		IFS=',' read -r _ dvend dtype _ <<< "$REPLY"
+		ddr="${dtype}${dvend:+, $dvend}"
+	fi
+	kv "Всего" "$(hsize_kb "$total")${ddr:+ · $ddr}"
+	kv "Доступно" "$(hsize_kb "$avail") ($apct%) · кэш $(hsize_kb "$cached")"
+
+	# zram: все активные устройства из /proc/swaps (их может быть несколько —
+	# например, прошивочный zram0 + добавленный zram1); mm_stat = orig compr mem_used …
+	local zdevs zn zd orig compr used algo="" algos="" back="" bdw=0 o_sum=0 u_sum=0 nz=0 r
+	zdevs=$(awk 'NR > 1 && $1 ~ /zram/ { sub(/.*\//, "", $1); print $1 }' "$R/proc/swaps" 2>/dev/null)
+	for zn in $zdevs; do
+		zd="$R/sys/block/$zn"
+		rd "$zd/mm_stat" || continue
+		read -r orig compr used _ <<< "$REPLY"
+		is_int "${orig:-x}" && is_int "${used:-x}" || continue
+		o_sum=$((o_sum + orig)); u_sum=$((u_sum + used)); nz=$((nz + 1))
+		if rd "$zd/comp_algorithm" && [[ "$REPLY" =~ \[([^]]+)\] ]]; then
+			algo="${BASH_REMATCH[1]}"
+			[[ " $algos " == *" $algo "* ]] || algos="${algos:+$algos }$algo"
+		fi
+		if rd "$zd/backing_dev" && [ -n "$REPLY" ] && [ "$REPLY" != "none" ]; then
+			back="$REPLY"
+			rd "$zd/bd_stat" && { read -r r _ <<< "$REPLY"; is_int "${r:-x}" && bdw=$((bdw + r)); }   # страниц на диске
+		fi
+	done
+	if [ "$nz" -gt 0 ] && [ "$u_sum" -gt 0 ]; then
+		local ratio devs=""
+		ratio=$(awk -v o="$o_sum" -v u="$u_sum" 'BEGIN { printf "%.1f", o / u }')
+		[ "$nz" -gt 1 ] && devs=" ${DIM}($nz устройства)${NC}"
+		kv "ZRAM" "$(hsize_kb $((o_sum / 1024))) → $(hsize_kb $((u_sum / 1024))) ${DIM}(сжатие ×$ratio)${NC}${algos:+ · ${algos// //}}$devs"
+	fi
+	if [ "$swt" -gt 0 ]; then
+		local wb=""
+		if [ -n "$back" ]; then
+			wb=" · сброс на диск: вкл."
+			[ "$bdw" -gt 0 ] && wb="$wb ${DIM}(там $(hsize_kb $((bdw * 4))))${NC}"
+		fi
+		kv "Подкачка" "занято $(hsize_kb $((swt - swf))) из $(hsize_kb "$swt")$wb"
+	fi
+
+	# Давление (PSI): строки «some avg10=… avg60=…» и «full …»
+	local psi_some="" psi_full="" plvl=0
+	if [ -r "$R/proc/pressure/memory" ]; then
+		psi_some=$(awk '$1 == "some" { for (i = 2; i <= NF; i++) if ($i ~ /^avg60=/) { sub(/avg60=/, "", $i); print $i } }' "$R/proc/pressure/memory")
+		psi_full=$(awk '$1 == "full" { for (i = 2; i <= NF; i++) if ($i ~ /^avg60=/) { sub(/avg60=/, "", $i); print $i } }' "$R/proc/pressure/memory")
+	fi
+	if [ -n "$psi_some" ]; then
+		plvl=$(awk -v s="$psi_some" -v f="${psi_full:-0}" -v w="$PSI_MEM_WARN" -v c="$PSI_MEM_CRIT" \
+			'BEGIN { print (f >= c) ? 2 : (s >= w) ? 1 : 0 }')
+		local cs="" cf=""
+		[ "$plvl" -ge 1 ] && cs="$YELLOW"
+		[ "$plvl" -ge 2 ] && cf="$RED"
+		kv "Давление" "${cs}${psi_some}%${cs:+$NC} · полное ${cf}${psi_full:-?}%${cf:+$NC} ${DIM}(за минуту)${NC}"
+	fi
+
+	# Выгрузки lmkd с момента загрузки и в среднем за час
+	local kills up_s
+	kills=$(dumpsys activity lmk 2>/dev/null | awk -F': *' '/Total number of kills/ { print $2; exit }')
+	if is_int "${kills:-x}"; then
+		read -r up_s _ < "$R/proc/uptime" 2>/dev/null
+		local rate=""
+		up_s="${up_s%%.*}"
+		is_int "${up_s:-x}" && [ "$up_s" -ge 3600 ] && rate=" ${DIM}(~$(( kills * 3600 / up_s )) в час)${NC}"
+		kv "Выгрузки" "$kills приложений с загрузки$rate"
+	fi
+
+	# Настройки vm — в расширенном режиме: видно, что применил 99_init.kernel
+	if [ "$EXTENDED" -eq 1 ]; then
+		local sw mf vcp
+		rd "$R/proc/sys/vm/swappiness"; sw="$REPLY"
+		rd "$R/proc/sys/vm/min_free_kbytes"; mf="$REPLY"
+		rd "$R/proc/sys/vm/vfs_cache_pressure"; vcp="$REPLY"
+		kv "Настройки VM" "swappiness ${sw:-?} · min_free $(( ${mf:-0} / 1024 )) МБ · cache_pressure ${vcp:-?}"
+	fi
+
+	level_by "$pct" "$RAM_WARN" "$RAM_CRIT"; local lvl=$REPLY
+	[ "$plvl" -gt "$lvl" ] && lvl=$plvl
+	verdict "$lvl" "занято $pct%${psi_some:+ · давление $psi_some%}"
 }
 
 # ── Процессор ────────────────────────────────────────────────────────────────
@@ -451,10 +544,15 @@ core_name() {   # core_name 0x41 0xd46 → REPLY="A510"
 		0x41:0xd47) REPLY="A710" ;; 0x41:0xd48) REPLY="X2" ;;   0x41:0xd4d) REPLY="A715" ;;
 		0x41:0xd4e) REPLY="X3" ;;   0x41:0xd80) REPLY="A520" ;; 0x41:0xd81) REPLY="A720" ;;
 		0x41:0xd82) REPLY="X4" ;;   0x41:0xd85) REPLY="X925" ;; 0x41:0xd87) REPLY="A725" ;;
-		# Qualcomm Kryo со своими кодами (SD835–SD855)
-		0x51:0x800) REPLY="Kryo Gold" ;;   0x51:0x801) REPLY="Kryo Silver" ;;
-		0x51:0x802) REPLY="Kryo 3xx Gold" ;; 0x51:0x803) REPLY="Kryo 3xx Silver" ;;
-		0x51:0x804) REPLY="Kryo 4xx Gold" ;; 0x51:0x805) REPLY="Kryo 4xx Silver" ;;
+		# [3.5] Qualcomm отдаёт для части ядер свои коды (implementer 0x51), хотя
+		# внутри — обычные ядра ARM. Пишем настоящее ядро, как и для остальных:
+		# 0x800/0x801 — Kryo 2xx (SD835): A73 / A53; 0x802/0x803 — Kryo 3xx (SD845):
+		# A75 / A55; 0x804/0x805 — Kryo 4xx (SD855/860): A76 / A55. У SD865/870 большие
+		# ядра отдают обычный код ARM (A77), а малые — те же 0x51:0x805.
+		# Например, у SM8250 малые ядра отдают 0x51:0x805 — это Cortex-A55.
+		0x51:0x800) REPLY="A73" ;; 0x51:0x801) REPLY="A53" ;;
+		0x51:0x802) REPLY="A75" ;; 0x51:0x803) REPLY="A55" ;;
+		0x51:0x804) REPLY="A76" ;; 0x51:0x805) REPLY="A55" ;;
 	esac
 	[ -n "$REPLY" ]
 }
@@ -560,7 +658,8 @@ zone_max() {
 	[ -n "$best" ]
 }
 
-THERMAL_STATUS_NAMES=(НОРМА ЛЁГКИЙ УМЕРЕННЫЙ СИЛЬНЫЙ КРИТИЧЕСКИЙ АВАРИЙНЫЙ ОТКЛЮЧЕНИЕ)
+# [3.3] Строка «Перегрев»: «нет (0)», «лёгкий (1)» … — читается как обычная фраза
+THERMAL_STATUS_NAMES=(нет лёгкий умеренный сильный критический аварийный отключение)
 
 check_thermal() {
 	section "ТЕМПЕРАТУРА И ТРОТТЛИНГ"
@@ -615,12 +714,12 @@ check_thermal() {
 
 	# Статус Thermal HAL (0–6)
 	if [ "$HAL_READY" = "false" ]; then
-		kv "Термостатус" "${DIM}Thermal HAL не готов на этой прошивке${NC}"
+		kv "Перегрев" "${DIM}неизвестно — Thermal HAL не готов на этой прошивке${NC}"
 	elif is_int "${HAL_STATUS:-x}"; then
 		local s="$HAL_STATUS" lbl="${THERMAL_STATUS_NAMES[$HAL_STATUS]:-$HAL_STATUS}"
-		if   [ "$s" -ge 4 ]; then kv "Термостатус" "${RED}$lbl ($s)${NC}"; raise_status 2
-		elif [ "$s" -ge 2 ]; then kv "Термостатус" "${YELLOW}$lbl ($s)${NC}"; raise_status 1
-		else kv "Термостатус" "${GREEN}$lbl ($s)${NC}"; fi
+		if   [ "$s" -ge 4 ]; then kv "Перегрев" "${RED}$lbl ($s)${NC}"; raise_status 2
+		elif [ "$s" -ge 2 ]; then kv "Перегрев" "${YELLOW}$lbl ($s)${NC}"; raise_status 1
+		else kv "Перегрев" "${GREEN}$lbl ($s)${NC}"; fi
 	fi
 
 	# Троттлинг: охлаждающие устройства CPU/GPU/TPU с cur_state > 0
@@ -1252,14 +1351,14 @@ check_pixel_security() {
 
 # ── Система ──────────────────────────────────────────────────────────────────
 
-ROOT_INFO=""; ZYGISK_INFO=""
+ROOT_INFO=""; ZYGISK_INFO=""; ROOT_KIND="ROOT"   # ROOT_KIND — для заголовка «МОДУЛИ …»
 detect_root() {
-	ROOT_INFO=""; ZYGISK_INFO=""
+	ROOT_INFO=""; ZYGISK_INFO=""; ROOT_KIND="ROOT"
 	if command -v magisk >/dev/null 2>&1 || [ -d "$R/data/adb/magisk" ]; then
 		local v vc
 		v=$(magisk -v 2>/dev/null); v="${v%%:*}"
 		vc=$(magisk -V 2>/dev/null)
-		ROOT_INFO="Magisk ${v:-?}${vc:+ ($vc)}"
+		ROOT_INFO="Magisk ${v:-?}${vc:+ ($vc)}"; ROOT_KIND="MAGISK"
 		# Zygisk: настройка в БД Magisk + реальное присутствие в zygote64
 		local on="" active=0 pid
 		on=$(magisk --sqlite "SELECT value FROM settings WHERE key='zygisk'" 2>/dev/null)
@@ -1272,9 +1371,9 @@ detect_root() {
 		elif [ "$active" -eq 1 ]; then ZYGISK_INFO="${GREEN}активен${NC} ${DIM}(сторонний: ZygiskNext/NeoZygisk)${NC}"
 		else ZYGISK_INFO="выключен"; fi
 	elif [ -d "$R/data/adb/ksu" ] || command -v ksud >/dev/null 2>&1; then
-		ROOT_INFO="KernelSU"
+		ROOT_INFO="KernelSU"; ROOT_KIND="KERNELSU"
 	elif [ -d "$R/data/adb/ap" ] || command -v apd >/dev/null 2>&1; then
-		ROOT_INFO="APatch"
+		ROOT_INFO="APatch"; ROOT_KIND="APATCH"
 	else
 		ROOT_INFO="root (метод не определён)"
 	fi
@@ -1331,17 +1430,13 @@ mod_prop() {   # mod_prop ФАЙЛ КЛЮЧ → REPLY (без управляющ
 	[ -n "$REPLY" ]
 }
 
-print_magisk_modules() {
+# [3.4] Было print_magisk_modules: секция универсальная — теперь print_modules,
+# а заголовок берётся из глобальной ROOT_KIND (её видит и список секций в -d).
+print_modules() {
 	[ -z "$ROOT_INFO" ] && detect_root
-	local title="ROOT"
-	case "$ROOT_INFO" in
-		Magisk*)   title="MAGISK" ;;
-		KernelSU*) title="KERNELSU" ;;
-		APatch*)   title="APATCH" ;;
-	esac
 	local dir="$R/data/adb/modules" upd="$R/data/adb/modules_update"
-	[ -d "$dir" ] || [ -d "$upd" ] || [ "$title" != "ROOT" ] || return 0
-	section "МОДУЛИ $title"
+	[ -d "$dir" ] || [ -d "$upd" ] || [ "$ROOT_KIND" != "ROOT" ] || return 0
+	section "МОДУЛИ $ROOT_KIND"
 
 	local -a ids=()
 	local m id
@@ -1452,11 +1547,17 @@ print_kernel_extended() {
 	[ -r "$R/proc/config.gz" ] && hz=$( (zcat "$R/proc/config.gz" || gzip -dc "$R/proc/config.gz") 2>/dev/null | sed -n 's/^CONFIG_HZ=//p' | head -n 1)
 	if [ -n "$hz" ]; then kv "Частота тика" "$hz Гц"; else kv "Частота тика" "неизвестно (нет /proc/config.gz)"; fi
 
+	# [3.5] Новый генератор случайных чисел (BLAKE2s, 5.18) в 2022 году перенесли
+	# во все стабильные ветки, включая 4.19 и 5.4 — поэтому 256 бывает и на старых
+	# ядрах. Признак нового RNG — poolsize 256: тогда entropy_avail всегда 256
+	# после инициализации, и это не ошибка. На старом RNG poolsize был 4096.
 	if rd "$R/proc/sys/kernel/random/entropy_avail"; then
-		if [ "$REPLY" = "256" ] && { [ "${major:-0}" -gt 5 ] || { [ "${major:-0}" -eq 5 ] && [ "${minor:-0}" -ge 18 ]; }; }; then
-			kv "Энтропия" "256 ${DIM}(ядро ≥ 5.18: фиксированное значение, это норма)${NC}"
+		local ent="$REPLY" pool=""
+		rd "$R/proc/sys/kernel/random/poolsize" && pool="$REPLY"
+		if [ "$pool" = "256" ]; then
+			kv "Энтропия" "$ent ${DIM}(новый RNG: значение фиксированное, это норма)${NC}"
 		else
-			kv "Энтропия" "$REPLY бит"
+			kv "Энтропия" "$ent из ${pool:-?} бит"
 		fi
 	fi
 	[ -e "$R/dev/kvm" ] && kv "KVM" "есть ${DIM}(pKVM / виртуализация)${NC}"
@@ -1513,6 +1614,120 @@ open_log() {
 
 close_log() { [ "$LOG_FD_OPEN" -eq 1 ] && exec 3>&-; LOG_FD_OPEN=0; }
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  [3.3] ПРОБНЫЙ ЗАПУСК: выборочный вывод секций
+# ═════════════════════════════════════════════════════════════════════════════
+# Секцией считается любая функция, которая вызывает section "…". Список собирается
+# сам из кода скрипта (declare -F / declare -f), поэтому новая функция check_* или
+# print_* с section появится здесь без правок — даже если её нет в run_monitor.
+#   -d                 заголовок + список секций
+#   -d cpu,thermal     заголовок + только эти секции (код выхода — их итог)
+#   -d all             заголовок + все секции подряд
+# Имя секции — имя функции без check_/print_ (cpu, thermal, magisk_modules…)
+# или полное имя функции.
+
+declare -a DRY_FUNCS DRY_TITLES DRY_MAIN
+discover_sections() {
+	DRY_FUNCS=(); DRY_TITLES=(); DRY_MAIN=()
+	local f body title main_body line var nl=$'\n'
+	local re_sec="(^|${nl})[[:space:]]*section \"([^\"]*)\""
+	local re_var='[$][{]?([A-Za-z_][A-Za-z_0-9]*)[}]?'
+	local -A TITLE_OF=() SEEN=()
+	main_body=$(declare -f run_monitor)
+
+	# 1) все функции, которые вызывают section "…"
+	while read -r _ _ f; do
+		case "$f" in section|run_dry|run_monitor|discover_sections) continue ;; esac
+		body=$(declare -f "$f")
+		[[ "$body" =~ $re_sec ]] || continue
+		title="${BASH_REMATCH[2]}"
+		# [3.4] $ПЕРЕМЕННАЯ в заголовке: глобальная — подставляем значение, иначе «…»
+		while [[ "$title" =~ $re_var ]]; do
+			var="${BASH_REMATCH[1]}"
+			title="${title/"${BASH_REMATCH[0]}"/${!var:-…}}"
+		done
+		TITLE_OF[$f]="$title"
+	done < <(declare -F)
+
+	# 2) [3.4] порядок как в обычном проходе, затем секции вне прохода по алфавиту
+	while IFS= read -r line; do
+		line="${line#"${line%%[! ]*}"}"; f="${line%%[; ]*}"
+		[ -n "${TITLE_OF[$f]:-}" ] && [ -z "${SEEN[$f]:-}" ] || continue
+		SEEN[$f]=1; DRY_FUNCS+=("$f"); DRY_TITLES+=("${TITLE_OF[$f]}"); DRY_MAIN+=(1)
+	done <<< "$main_body"
+	for f in $(printf '%s\n' "${!TITLE_OF[@]}" | sort); do
+		[ -z "${SEEN[$f]:-}" ] || continue
+		DRY_FUNCS+=("$f"); DRY_TITLES+=("${TITLE_OF[$f]}"); DRY_MAIN+=(0)
+	done
+}
+
+short_name() { REPLY="${1#check_}"; REPLY="${REPLY#print_}"; }
+
+run_dry() {
+	load_zones
+	load_thermal_hal
+	detect_root          # нужен для заголовка «МОДУЛИ MAGISK» в списке
+	discover_sections
+	print_header
+
+	local i n
+	if [ -z "$DRY_SECTIONS" ]; then
+		CUR_SECTION="ПРОБНЫЙ ЗАПУСК"
+		emit ""
+		emit "${CYAN}[ СЕКЦИИ ]${NC} ${DIM}(выбор: -d имя[,имя…] или -d all)${NC}"
+		# Своя ширина колонки: имена секций длиннее обычных подписей
+		local w=0 sp
+		for i in "${!DRY_FUNCS[@]}"; do short_name "${DRY_FUNCS[$i]}"; [ ${#REPLY} -gt $w ] && w=${#REPLY}; done
+		for i in "${!DRY_FUNCS[@]}"; do
+			short_name "${DRY_FUNCS[$i]}"; n="$REPLY"
+			printf -v sp '%*s' $((w - ${#n})) ""
+			if [ "${DRY_MAIN[$i]}" -eq 1 ]; then
+				emit "  ${n}${sp} : ${DRY_TITLES[$i]}"
+			else
+				emit "  ${n}${sp} : ${DRY_TITLES[$i]} ${DIM}· не в основном проходе${NC}"
+			fi
+		done
+		return $EXIT_OK
+	fi
+
+	# Разбор списка: запятые и пробелы, имя без префикса или полное имя функции
+	local want sel=() unknown=""
+	for want in ${DRY_SECTIONS//,/ }; do
+		if [ "$want" = "all" ]; then sel=("${DRY_FUNCS[@]}"); break; fi
+		local found=""
+		for i in "${!DRY_FUNCS[@]}"; do
+			short_name "${DRY_FUNCS[$i]}"
+			if [ "$want" = "$REPLY" ] || [ "$want" = "${DRY_FUNCS[$i]}" ]; then found="${DRY_FUNCS[$i]}"; break; fi
+		done
+		if [ -n "$found" ]; then sel+=("$found"); else unknown="$unknown $want"; fi
+	done
+	if [ -n "$unknown" ]; then
+		printf '%s[!] Нет таких секций:%s%s — список: %s -d\n' "$RED" "$unknown" "$NC" "${0##*/}" >&2
+		return $EXIT_INTERNAL
+	fi
+
+	# Секции, которые в обычном проходе зависят от флагов, при явном выборе включаем
+	local f before
+	for f in "${sel[@]}"; do
+		[ "$f" = "check_iperf3_speed" ] && ENABLE_NET_TEST=1
+		before=$EMIT_COUNT
+		"$f"
+		if [ "$EMIT_COUNT" -eq "$before" ]; then
+			short_name "$f"
+			CUR_SECTION="ПРОБНЫЙ ЗАПУСК"
+			emit ""
+			emit "${DIM}[ $REPLY ] на этом устройстве данных для вывода нет${NC}"
+		fi
+	done
+
+	CUR_SECTION="ИТОГ"
+	emit ""
+	emit "${BOLD}════════════════════════════════════════${NC}"
+	emit " Итог: $(exit_code_label "$SYSTEM_STATUS") ${DIM}(код $SYSTEM_STATUS · только выбранные секции)${NC}"
+	emit "${BOLD}════════════════════════════════════════${NC}"
+	return "$SYSTEM_STATUS"
+}
+
 run_monitor() {
 	check_dependencies || return $?
 	SYSTEM_STATUS=$EXIT_OK
@@ -1521,12 +1736,10 @@ run_monitor() {
 	load_verified_boot
 
 	if [ "$DRY_RUN" -eq 1 ]; then
-		print_header
-		print_system
-		emit ""
-		emit "${DIM}Пробный запуск (--dry-run): проверки пропущены.${NC}"
+		run_dry
+		local rc=$?
 		close_log
-		return $EXIT_OK
+		return $rc
 	fi
 
 	load_zones
@@ -1550,7 +1763,7 @@ run_monitor() {
 	check_pixel_security
 	print_system
 	if [ "$EXTENDED" -eq 1 ]; then
-		print_magisk_modules
+		print_modules
 		print_kernel_extended
 	fi
 
@@ -1568,7 +1781,7 @@ run_monitor() {
 
 show_help() {
 	cat <<EOF
-МОНИТОР СИСТЕМЫ ANDROID v$VERSION — нужен root
+МОНИТОРИНГ СИСТЕМЫ ANDROID v$VERSION — нужен root
 
 Запуск:
   su -c sh ${0##*/} [опции]
@@ -1580,7 +1793,8 @@ show_help() {
   -f, --no-file         не писать лог-файл
   -l, --loop <сек>      повторять каждые N секунд (Ctrl+C — выход)
   -b, --brief           только предупреждения и критичные события
-  -d, --dry-run         только заголовок и системная информация
+  -d, --dry-run [секции] заголовок и список секций; с именами — только они:
+                        -d cpu,thermal   ·   -d all — все секции подряд
   -e, --extended        расширенно: модули root, ядро, сборка, драйверы
   -s, --net-speed       тест скорости сети (нужен iperf3)
   -c, --clear-log       очистить лог-файл и выйти
@@ -1630,7 +1844,7 @@ acquire_lock() {
 	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 		pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-			printf '[!] Монитор уже запущен (PID %s). Если это не так: rm -r %s\n' "$pid" "$LOCK_DIR" >&2
+			printf '[!] Мониторинг уже запущен (PID %s). Если это не так: rm -r %s\n' "$pid" "$LOCK_DIR" >&2
 			return $EXIT_INTERNAL
 		fi
 		rm -rf "$LOCK_DIR"
@@ -1650,7 +1864,11 @@ while [ $# -gt 0 ]; do
 		-q|--quiet) QUIET=1 ;;
 		-n|--no-logcat) NO_LOGCAT=1 ;;
 		-l|--loop) require_option_value "$@"; shift; LOOP_INTERVAL="$1" ;;
-		-d|--dry-run) DRY_RUN=1 ;;
+		-d|--dry-run)
+			DRY_RUN=1
+			# [3.3] необязательный список секций: -d cpu,thermal  (всё, что не начинается с «-»)
+			if [ $# -gt 1 ] && [ -n "$2" ] && [ "${2#-}" = "$2" ]; then shift; DRY_SECTIONS="$1"; fi ;;
+		--dry-run=*) DRY_RUN=1; DRY_SECTIONS="${1#*=}" ;;
 		-b|--brief) BRIEF_MODE=1 ;;
 		-e|--extended) EXTENDED=1 ;;
 		-f|--no-file) NO_FILE_LOG=1 ;;
@@ -1739,3 +1957,19 @@ fi
 # Изменения v3.2: «Ср. нагрузка» (load average за 1/5/15 мин) отдельной строкой,
 #  подсказка iperf3 — серой строкой в секции «СЕТЬ», топ процессов в общей
 #  колонке с подписью «PID N», «Чип защиты», «Время работы» вместо «Аптайм».
+#
+# Изменения v3.3: «Перегрев» вместо «Термостатус» (значения: нет / лёгкий / …);
+#  пробный запуск -d [секции]: секции находятся сами по вызову section в коде,
+#  выбор через запятую или all, код выхода — итог выбранных секций.
+#
+# Изменения v3.4: секция «ПАМЯТЬ» — тип памяти, доступно и кэш, zram со сжатием
+#  и алгоритмом, подкачка и сброс на диск (writeback), давление PSI, выгрузки
+#  lmkd, настройки vm в -e; статус — худшее из «занято %» и давления.
+#  Список секций в -d: порядок как в обычном проходе, заголовки с переменными
+#  раскрываются («МОДУЛИ MAGISK»), секция модулей теперь называется modules.
+#  ZRAM суммируется по всем активным устройствам (zram0 + добавленный zram1).
+#
+# Изменения v3.5: «Мониторинг» в заголовке и справке; «Настройки VM»; малые и
+#  большие ядра Qualcomm с собственными кодами (0x51) показываются настоящими
+#  ядрами ARM (у SM8250 — A55); «Энтропия» — фиксированные 256 распознаются по
+#  poolsize, а не по версии ядра (новый RNG перенесён и в 4.19, и в 5.4).
