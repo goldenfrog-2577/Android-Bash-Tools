@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.6 — мониторинг состояния rooted Android
+# monitor.sh v3.10.1 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.6"
+readonly VERSION="3.10.1"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -52,7 +52,10 @@ LOG="/data/media/0/.GoldenFrog/logs/android_monitor.log"
 ERR_LOG="/data/media/0/.GoldenFrog/logs/last_errors.log"
 LOCK_DIR="/dev/.goldenfrog_monitor.lock"   # /dev — tmpfs, писать туда может только root
 
-# Тестовый хук: корень с поддельными /sys, /proc, /dev (как в cpu.sh)
+# Тестовый хук: корень с поддельными /sys, /proc, /dev (как в cpu.sh).
+# [3.7] Подменяет только ФАЙЛЫ. Команды (getprop, dumpsys, df, ip, uname, ps…)
+# идут из PATH — для теста их подменяют своими скриптами-заглушками в начале PATH:
+#   PATH=/путь/к/заглушкам:$PATH MONITOR_SYSROOT=/путь/к/корню bash monitor.sh -d cpu
 R="${MONITOR_SYSROOT:-}"
 
 EXIT_OK=0
@@ -93,6 +96,19 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
 else
 	RED=""; GREEN=""; YELLOW=""; CYAN=""; MAGENTA=""; DIM=""; BOLD=""; NC=""
 fi
+
+# [3.9] Ширина экрана для переноса длинных строк. Только в терминале: в файл и
+# в конвейер строки идут целиком. MONITOR_COLS=N задаёт ширину вручную
+# (0 — не переносить). Termux на телефоне: 53–60 символов в портрете.
+TERM_COLS=0
+if [ -n "${MONITOR_COLS:-}" ]; then
+	[[ "$MONITOR_COLS" =~ ^[0-9]+$ ]] && TERM_COLS=$MONITOR_COLS
+elif [ -t 1 ]; then
+	read -r _ TERM_COLS < <(stty size < /dev/tty 2>/dev/null)
+	[[ "${TERM_COLS:-}" =~ ^[0-9]+$ ]] || TERM_COLS="${COLUMNS:-0}"
+	[[ "$TERM_COLS" =~ ^[0-9]+$ ]] || TERM_COLS=0
+fi
+[ "$TERM_COLS" -gt 0 ] && [ "$TERM_COLS" -lt 40 ] && TERM_COLS=40   # уже 40 — не ломаем вёрстку
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  ВЫВОД: терминал + лог-файл, режимы --quiet и --brief
@@ -143,10 +159,79 @@ kv() {
 	char_len "$REPLY"
 	local pad=$((KV_WIDTH - REPLY)) sp=""
 	[ $pad -gt 0 ] && printf -v sp '%*s' "$pad" ""
+	# [3.9] Длинное значение переносится под колонку значений
+	if [ "$TERM_COLS" -gt 0 ] && [ "$BRIEF_MODE" -eq 0 ]; then   # в --brief строки идут по одной
+		strip_ansi "$2"; char_len "$REPLY"
+		if [ $((KV_WIDTH + 5 + REPLY)) -gt "$TERM_COLS" ]; then
+			wrap_text "$2" $((TERM_COLS - KV_WIDTH - 5))
+			local first=1 ln ind
+			printf -v ind '%*s' $((KV_WIDTH + 5)) ""
+			while IFS= read -r ln; do
+				if [ "$first" -eq 1 ]; then emit "  $1$sp : $ln"; first=0
+				else emit "$ind$ln"; fi
+			done <<< "$REPLY"
+			return
+		fi
+	fi
 	emit "  $1$sp : $2"
 }
 
-note() { emit "  ${DIM}$*${NC}"; }
+# [3.9] wrap_text "текст" ширина → REPLY: строки через \n. Сначала режем по « · »
+# (разделитель остаётся в конце строки), длинный кусок — по пробелам.
+# Ширина считается без ANSI-кодов; цвет, начатый на одной строке, терминал
+# продолжает на следующей, так что раскраска не ломается.
+wrap_text() {
+	local text="$1" w="$2" out="" line="" llen=0 seg word wlen sep=" · "
+	local -a segs words
+	[ "$w" -lt 10 ] && w=10
+	# Разбиваем на сегменты по « · »
+	local rest="$text"
+	segs=()
+	while [[ "$rest" == *"$sep"* ]]; do segs+=("${rest%%"$sep"*}"); rest="${rest#*"$sep"}"; done
+	segs+=("$rest")
+	local i n=${#segs[@]}
+	for ((i = 0; i < n; i++)); do
+		seg="${segs[$i]}"
+		[ "$i" -lt $((n - 1)) ] && seg="$seg ·"
+		strip_ansi "$seg"; char_len "$REPLY"; wlen=$REPLY
+		if [ "$llen" -gt 0 ] && [ $((llen + 1 + wlen)) -le "$w" ]; then
+			line="$line $seg"; llen=$((llen + 1 + wlen)); continue
+		fi
+		if [ "$wlen" -le "$w" ]; then
+			[ "$llen" -gt 0 ] && out="$out$line"$'\n'
+			line="$seg"; llen=$wlen; continue
+		fi
+		# Сегмент длиннее строки — по словам
+		read -ra words <<< "$seg"
+		for word in "${words[@]}"; do
+			strip_ansi "$word"; char_len "$REPLY"; wlen=$REPLY
+			if [ "$llen" -gt 0 ] && [ $((llen + 1 + wlen)) -le "$w" ]; then
+				line="$line $word"; llen=$((llen + 1 + wlen))
+			else
+				[ "$llen" -gt 0 ] && out="$out$line"$'\n'
+				line="$word"; llen=$wlen
+			fi
+		done
+	done
+	REPLY="$out$line"
+}
+
+note() { wrap_emit 2 "${DIM}$*${NC}"; }
+
+# [3.9] wrap_emit отступ "текст" — свободный текст с переносом по ширине экрана
+wrap_emit() {
+	local ind; printf -v ind '%*s' "$1" ""
+	if [ "$TERM_COLS" -gt 0 ] && [ "$BRIEF_MODE" -eq 0 ]; then
+		strip_ansi "$2"; char_len "$REPLY"
+		if [ $(( $1 + REPLY )) -gt "$TERM_COLS" ]; then
+			local ln
+			wrap_text "$2" $((TERM_COLS - $1))
+			while IFS= read -r ln; do emit "$ind$ln"; done <<< "$REPLY"
+			return
+		fi
+	fi
+	emit "$ind$2"
+}
 
 section() {
 	CUR_SECTION="$1"
@@ -237,24 +322,26 @@ load_props() {
 prop() { REPLY="${PROP[$1]:-}"; }
 
 # Термозоны: тип → температура (м°C). Отбрасываем заведомо мусорные значения.
-declare -A TZ
+# [3.8] Массив был назван TZ и затирал одноимённую переменную окружения часового
+# пояса: время в шапке и даты выводились по UTC, если пояс задан через TZ.
+declare -A TZONE
 load_zones() {
-	TZ=()
+	TZONE=()
 	local z t v
 	for z in "$R"/sys/class/thermal/thermal_zone*; do
 		IFS= read -r t 2>/dev/null < "$z/type" || continue
 		IFS= read -r v 2>/dev/null < "$z/temp" || continue
 		is_int "$v" || continue
 		[ "$v" -gt -30000 ] && [ "$v" -lt 150000 ] || continue
-		if [ -z "${TZ[$t]:-}" ] || [ "$v" -gt "${TZ[$t]}" ]; then TZ[$t]="$v"; fi
+		if [ -z "${TZONE[$t]:-}" ] || [ "$v" -gt "${TZONE[$t]}" ]; then TZONE[$t]="$v"; fi
 	done
 }
 
 # Thermal HAL: dumpsys thermalservice — один раз за проход
-declare -A HAL HAL_TYPE
+declare -A HAL HAL_TYPE HAL_STAT
 HAL_STATUS=""; HAL_READY=""
 load_thermal_hal() {
-	HAL=(); HAL_TYPE=(); HAL_STATUS=""; HAL_READY=""
+	HAL=(); HAL_TYPE=(); HAL_STAT=(); HAL_STATUS=""; HAL_READY=""
 	local line name val typ in_cached=0
 	while IFS= read -r line; do
 		case "$line" in
@@ -268,6 +355,8 @@ load_thermal_hal() {
 			val="${BASH_REMATCH[1]}"; typ="${BASH_REMATCH[2]}"; name="${BASH_REMATCH[3]}"
 			[ -n "${HAL[$name]:-}" ] && continue
 			HAL[$name]="$val"; HAL_TYPE[$name]="$typ"
+			# [3.9] Статус датчика 0–6: выше 0 — датчик перешёл свой порог
+			[[ "$line" =~ mStatus=([0-9]+) ]] && HAL_STAT[$name]="${BASH_REMATCH[1]}"
 		fi
 	done < <(dumpsys thermalservice 2>/dev/null)
 }
@@ -276,6 +365,15 @@ load_thermal_hal() {
 mdeg() { REPLY="$(( $1 / 1000 )).$(( ( ${1#-} % 1000 ) / 100 ))"; }
 # дробные °C из HAL → «47.2»
 fdeg() { printf -v REPLY '%.1f' "$1" 2>/dev/null || REPLY="$1"; }
+
+# [3.8] Длительность в секундах → REPLY: «~35 мин», «~1 ч 25 мин». Без склонений —
+# сокращения читаются одинаково при любом числе.
+fmt_dur() {
+	local s="$1" m h
+	m=$(( (s + 59) / 60 ))
+	if [ "$m" -lt 60 ]; then REPLY="~$m мин"
+	else h=$((m / 60)); m=$((m % 60)); REPLY="~$h ч${m:+ $m мин}"; [ "$m" -eq 0 ] && REPLY="~$h ч"; fi
+}
 
 hsize_kb() {   # КБ → «12.3 ГБ»
 	awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.1f ГБ", k/1048576;
@@ -498,7 +596,11 @@ check_memory() {
 		local wb=""
 		if [ -n "$back" ]; then
 			wb=" · сброс на диск: вкл."
-			[ "$bdw" -gt 0 ] && wb="$wb ${DIM}(там $(hsize_kb $((bdw * 4))))${NC}"
+			# [3.7.2] bd_stat считает в страницах ядра: 4 КБ обычно, но 16 КБ на ядрах
+			# с большой страницей (Pixel 8+ в режиме 16K) — берём реальный размер.
+			local pg_kb=4 pg; pg=$(getconf PAGESIZE 2>/dev/null)
+			is_int "${pg:-x}" && [ "$pg" -ge 4096 ] && pg_kb=$((pg / 1024))
+			[ "$bdw" -gt 0 ] && wb="$wb ${DIM}(там $(hsize_kb $((bdw * pg_kb))))${NC}"
 		fi
 		kv "Подкачка" "занято $(hsize_kb $((swt - swf))) из $(hsize_kb "$swt")$wb"
 	fi
@@ -509,13 +611,14 @@ check_memory() {
 		psi_some=$(awk '$1 == "some" { for (i = 2; i <= NF; i++) if ($i ~ /^avg60=/) { sub(/avg60=/, "", $i); print $i } }' "$R/proc/pressure/memory")
 		psi_full=$(awk '$1 == "full" { for (i = 2; i <= NF; i++) if ($i ~ /^avg60=/) { sub(/avg60=/, "", $i); print $i } }' "$R/proc/pressure/memory")
 	fi
-	if [ -n "$psi_some" ]; then
-		plvl=$(awk -v s="$psi_some" -v f="${psi_full:-0}" -v w="$PSI_MEM_WARN" -v c="$PSI_MEM_CRIT" \
+	# [3.7] Считаем, даже если есть только одна из строк (some или full)
+	if [ -n "$psi_some" ] || [ -n "$psi_full" ]; then
+		plvl=$(awk -v s="${psi_some:-0}" -v f="${psi_full:-0}" -v w="$PSI_MEM_WARN" -v c="$PSI_MEM_CRIT" \
 			'BEGIN { print (f >= c) ? 2 : (s >= w) ? 1 : 0 }')
 		local cs="" cf=""
 		[ "$plvl" -ge 1 ] && cs="$YELLOW"
 		[ "$plvl" -ge 2 ] && cf="$RED"
-		kv "Давление" "${cs}${psi_some}%${cs:+$NC} · полное ${cf}${psi_full:-?}%${cf:+$NC} ${DIM}(за минуту)${NC}"
+		kv "Давление" "${cs}${psi_some:-?}%${cs:+$NC} · полное ${cf}${psi_full:-?}%${cf:+$NC} ${DIM}(за минуту)${NC}"
 	fi
 
 	# Выгрузки lmkd с момента загрузки и в среднем за час
@@ -587,7 +690,7 @@ load_core_types() {
 			"CPU implementer") impl="$val" ;;
 			"CPU part")        [ -n "$cpu" ] && core_name "$impl" "$val" && CORE_TYPE[$cpu]="$REPLY" ;;
 		esac
-	done < "$R/proc/cpuinfo" 2>/dev/null
+	done 2>/dev/null < "$R/proc/cpuinfo"   # [3.7] 2> раньше <, иначе ошибка открытия видна
 }
 
 # «4 ядра», «1 ядро», «8 ядер»
@@ -600,23 +703,33 @@ cores_word() {
 
 check_cpu() {
 	section "ПРОЦЕССОР"
-	local t1 i1 t2 i2 load=0
-	cpu_snapshot; read -r t1 i1 <<< "$REPLY"
-	[ -z "$R" ] && sleep 0.5
-	cpu_snapshot; read -r t2 i2 <<< "$REPLY"
-	[ $((t2 - t1)) -gt 0 ] && load=$(( ( (t2 - t1) - (i2 - i1) ) * 100 / (t2 - t1) ))
+	# [3.7] /proc/stat не прочитался — загрузка «н/д», а не 0%
+	local t1="" i1="" t2="" i2="" load=""
+	if can_read "$R/proc/stat"; then
+		cpu_snapshot; read -r t1 i1 <<< "$REPLY"
+		[ -z "$R" ] && sleep 0.5
+		cpu_snapshot; read -r t2 i2 <<< "$REPLY"
+		if is_int "${t1:-x}" && is_int "${t2:-x}" && [ $((t2 - t1)) -gt 0 ]; then
+			load=$(( ( (t2 - t1) - (i2 - i1) ) * 100 / (t2 - t1) ))
+		fi
+	fi
 
 	local soc board cores la1 la5 la15
 	prop ro.soc.model; soc="$REPLY"
 	[ -z "$soc" ] && { prop ro.board.platform; soc="$REPLY"; }
 	prop ro.product.board; board="$REPLY"
 	cores=$(grep -c '^processor' "$R/proc/cpuinfo" 2>/dev/null)
-	read -r la1 la5 la15 _ < "$R/proc/loadavg" 2>/dev/null
+	read -r la1 la5 la15 _ 2>/dev/null < "$R/proc/loadavg"
 
-	level_by "$load" "$CPU_WARN" "$CPU_CRIT"; local lvl=$REPLY
+	local lvl=0
 	kv "Модель" "${soc:-?}${board:+ · плата $board}"
-	color_by_level "$lvl"
-	kv "Загрузка" "${REPLY}${load}%${NC} · ядер онлайн: ${cores:-?}"
+	if [ -n "$load" ]; then
+		level_by "$load" "$CPU_WARN" "$CPU_CRIT"; lvl=$REPLY
+		color_by_level "$lvl"
+		kv "Загрузка" "${REPLY}${load}%${NC} · ядер онлайн: ${cores:-?}"
+	else
+		kv "Загрузка" "н/д · ядер онлайн: ${cores:-?}"
+	fi
 	# [3.2] load average — по-русски и отдельной строкой: за 1, 5 и 15 минут
 	[ -n "${la1:-}" ] && kv "Ср. нагрузка" "$la1 / ${la5:-?} / ${la15:-?} ${DIM}(за 1, 5, 15 мин)${NC}"
 
@@ -660,7 +773,9 @@ check_cpu() {
 		[ "$la_lvl" -gt "$lvl" ] && lvl=$la_lvl
 	fi
 	case $lvl in
-		2) verdict 2 "перегрузка" ;; 1) verdict 1 "высокая нагрузка" ;; *) verdict 0 "нагрузка в норме" ;;
+		2) verdict 2 "перегрузка" ;; 1) verdict 1 "высокая нагрузка" ;;
+		*) if [ -z "$load" ] && [ -z "${la1:-}" ]; then verdict 1 "данные о загрузке недоступны"
+		   else verdict 0 "нагрузка в норме"; fi ;;
 	esac
 }
 
@@ -669,10 +784,10 @@ check_cpu() {
 # Самая горячая зона по шаблону имени: zone_max 'gpuss-*-usr' → REPLY (м°C)
 zone_max() {
 	local k best=""
-	for k in "${!TZ[@]}"; do
+	for k in "${!TZONE[@]}"; do
 		# shellcheck disable=SC2053
 		[[ "$k" == $1 ]] || continue
-		if [ -z "$best" ] || [ "${TZ[$k]}" -gt "$best" ]; then best="${TZ[$k]}"; fi
+		if [ -z "$best" ] || [ "${TZONE[$k]}" -gt "$best" ]; then best="${TZONE[$k]}"; fi
 	done
 	REPLY="$best"
 	[ -n "$best" ]
@@ -688,8 +803,8 @@ check_thermal() {
 	# CPU: Tensor — зоны LITTLE/MID/BIG; Qualcomm — cpu-<кластер>-<n>-usr; иначе HAL
 	local -A TLABEL=([LITTLE]="Малые ядра" [MID]="Средние ядра" [BIG]="Большие ядра")
 	for name in LITTLE MID BIG; do
-		if [ -n "${TZ[$name]:-}" ]; then
-			mdeg "${TZ[$name]}"; t="$REPLY"
+		if [ -n "${TZONE[$name]:-}" ]; then
+			mdeg "${TZONE[$name]}"; t="$REPLY"
 		elif [ -n "${HAL[$name]:-}" ]; then
 			fdeg "${HAL[$name]}"; t="$REPLY"
 		else
@@ -713,11 +828,11 @@ check_thermal() {
 	[ "$shown" -eq 0 ] && kv "Процессор" "нет данных"
 
 	# GPU / TPU / корпус / батарея
-	if [ -n "${TZ[G3D]:-}" ]; then mdeg "${TZ[G3D]}"; color_temp "$REPLY"; kv "Графика" "$REPLY"
+	if [ -n "${TZONE[G3D]:-}" ]; then mdeg "${TZONE[G3D]}"; color_temp "$REPLY"; kv "Графика" "$REPLY"
 	elif zone_max 'gpuss-*-usr' || zone_max 'gpu*'; then mdeg "$REPLY"; color_temp "$REPLY"; kv "Графика" "$REPLY"
 	elif rd "$R/sys/class/kgsl/kgsl-3d0/temp" && is_int "$REPLY"; then mdeg "$REPLY"; color_temp "$REPLY"; kv "Графика" "$REPLY"
 	fi
-	[ -n "${TZ[TPU]:-}" ] && { mdeg "${TZ[TPU]}"; color_temp "$REPLY"; kv "Нейроблок TPU" "$REPLY"; }
+	[ -n "${TZONE[TPU]:-}" ] && { mdeg "${TZONE[TPU]}"; color_temp "$REPLY"; kv "Нейроблок TPU" "$REPLY"; }
 
 	local skin=""
 	for name in "${!HAL_TYPE[@]}"; do
@@ -725,7 +840,7 @@ check_thermal() {
 	done
 	if [ -z "$skin" ]; then
 		for name in skin_therm xo_therm quiet_therm; do
-			[ -n "${TZ[$name]:-}" ] && { mdeg "${TZ[$name]}"; skin="$REPLY°C ${DIM}($name)${NC}"; break; }
+			[ -n "${TZONE[$name]:-}" ] && { mdeg "${TZONE[$name]}"; skin="$REPLY°C ${DIM}($name)${NC}"; break; }
 		done
 	else
 		skin="${skin/ /°C }"
@@ -748,6 +863,7 @@ check_thermal() {
 		IFS= read -r type 2>/dev/null < "$cd/type" || continue
 		case "$type" in
 			*backlight*|*brightness*|battery|*modem*|*-tj) continue ;;
+			chg_mdis|dc_icl) continue ;;   # [3.8] зарядка — в «Батарее», строка «Контроллер»
 		esac
 		IFS= read -r cur 2>/dev/null < "$cd/cur_state" || continue
 		is_int "$cur" && [ "$cur" -gt 0 ] || continue
@@ -876,21 +992,30 @@ detect_ltpo() {
 
 # ── Батарея ──────────────────────────────────────────────────────────────────
 
+# [3.7] Батарея: нет данных — «н/д», а не 0 °C / 0% (раньше пустое чтение
+# выглядело как реальный ноль). Температура с десятыми, ёмкость больше паспортной
+# показывается как есть (у новой батареи это норма, паспорт — гарантированный
+# минимум). Добавлены технология, даты производства и первого применения (Pixel),
+# модель и подлинность батареи (Qualcomm bms / Maxim), в -e — сопротивление.
 check_battery() {
 	section "БАТАРЕЯ"
-	local b="$R/sys/class/power_supply/battery"
+	local b="$R/sys/class/power_supply/battery" bms="$R/sys/class/power_supply/bms"
 	if [ ! -d "$b" ]; then kv "Батарея" "нет данных"; return; fi
 
-	local cap status temp=0 volt=0 cur_ua="" health cycles full design
-	rd "$b/capacity"; cap="$REPLY"; is_int "$cap" || cap=0
+	local cap="" status temp="" tdeg="" volt="" cur_ua="" health cycles full design tech
+	rd "$b/capacity" && is_int "$REPLY" && cap="$REPLY"
 	rd "$b/status"; status="$REPLY"
-	rd "$b/temp" && is_int "$REPLY" && temp=$((REPLY / 10))
-	rd "$b/voltage_now" && is_int "$REPLY" && volt=$((REPLY / 1000))
+	if rd "$b/temp" && is_int "$REPLY"; then
+		temp=$((REPLY / 10))                     # целые °C — для порога
+		tdeg=$(awk -v t="$REPLY" 'BEGIN { printf "%.1f", t / 10 }')
+	fi
+	rd "$b/voltage_now" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && volt=$((REPLY / 1000))
 	rd "$b/current_now" && is_int "$REPLY" && cur_ua="$REPLY"
 	rd "$b/health"; health="$REPLY"
 	rd "$b/cycle_count"; cycles="$REPLY"
 	rd "$b/charge_full"; full="$REPLY"
 	rd "$b/charge_full_design"; design="$REPLY"
+	rd "$b/technology"; tech="$REPLY"
 
 	# Знак тока у вендоров разный (Pixel: разряд < 0, Qualcomm: разряд > 0) — приводим к
 	# «минус = разряд» по статусу
@@ -910,23 +1035,40 @@ check_battery() {
 		*) st_ru="${status:-?}" ;;
 	esac
 	local cap_c=""
-	[ "$status" = "Discharging" ] && [ "$cap" -lt 20 ] && cap_c="$RED"
-	kv "Уровень" "${cap_c}${cap}%${cap_c:+$NC} · $st_ru"
+	[ -n "$cap" ] && [ "$status" = "Discharging" ] && [ "$cap" -lt 20 ] && cap_c="$RED"
+	local cap_s="н/д"
+	[ -n "$cap" ] && cap_s="${cap_c}${cap}%${cap_c:+$NC}"
+	kv "Уровень" "$cap_s · $st_ru"
 
 	# Источник питания
-	local src="" ps tp on
+	# [3.8.1] Формат «USB PD, быстрая · 8.3 В · до 20 Вт»: единицы прямо в тексте
+	# (раньше «(8 В)» читалось двусмысленно), напряжение с десятыми.
+	local src="" ps tp on pmax=""
 	for ps in "$R"/sys/class/power_supply/*; do
 		rd "$ps/online" && [ "$REPLY" = "1" ] || continue
 		rd "$ps/type"; tp="$REPLY"
 		case "${ps##*/}:$tp" in
 			wireless:*|*:Wireless) src="беспроводная" ;;
 			usb:*|*:USB*)
-				local uv=0; rd "$ps/voltage_now" && is_int "$REPLY" && uv=$((REPLY / 1000))
-				if [ "$uv" -gt 6000 ]; then src="USB, быстрая ($((uv / 1000)) В)"
-				elif [ -z "$src" ]; then src="USB"; fi ;;
+				local uv=0 proto="USB"
+				rd "$ps/voltage_now" && is_int "$REPLY" && uv=$((REPLY / 1000))
+				case "$tp" in USB_PD*) proto="USB PD" ;; esac   # [3.7] протокол, если драйвер сообщает
+				if [ "$uv" -gt 6000 ]; then
+					src="$proto, быстрая · $(awk -v v="$uv" 'BEGIN { printf "%.1f", v / 1000 }') В"
+				elif [ -z "$src" ]; then src="$proto"; fi
+				# Предел мощности от драйвера (Qualcomm power_max)
+				rd "$ps/power_max" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && [ "$REPLY" -lt 500 ] && pmax="$REPLY" ;;
 			*:Mains|main:*|ac:*) [ -z "$src" ] && src="сеть" ;;
 		esac
 	done
+	# [3.8.1] Иначе — договорённость телефона с зарядником из BatteryService
+	# (Max charging current × voltage, Pixel): это предел, а не текущая мощность.
+	if [ -n "$src" ] && [ -z "$pmax" ] && [ "$src" != "беспроводная" ]; then
+		pmax=$(dumpsys battery 2>/dev/null | awk -F': ' '
+			/Max charging current:/ { i = $2 + 0 } /Max charging voltage:/ { v = $2 + 0 }
+			END { if (i > 0 && v > 0) { w = i * v / 1e12; if (w >= 1 && w < 500) printf "%.0f", w } }')
+	fi
+	[ -n "$pmax" ] && src="$src · до $pmax Вт"
 	# Battery Share (обратная беспроводная) — Pixel
 	local rn
 	for rn in "$R/sys/class/power_supply/wireless/reverse_chg_mode" "$R/sys/class/power_supply/wireless/wireless_out"; do
@@ -934,35 +1076,142 @@ check_battery() {
 	done
 	[ -n "$src" ] && kv "Питание" "$src"
 
+	# [3.8] Режимы зарядки и время до заряда. Переключатели живут в Settings
+	# Intelligence / SystemUI, но применяются через Health HAL — читаем результат
+	# в ядре, стандартные узлы healthd (AOSP, Android 14+):
+	#   charging_policy: 1 обычная · 2 LONG_LIFE («Максимум 80%») · 3 ADAPTIVE
+	#   charging_state:  1 обычная · 2 холодно · 3 жарко · 4 LONG_LIFE · 5 ADAPTIVE
+	# Где узлов нет (F3: HAL отвечает INVALID), режимы не выдумываем.
+	local pol="" cst="" modes="" eta="" bd
+	rd "$b/charging_policy" && is_int "$REPLY" && pol="$REPLY"
+	rd "$b/charging_state" && is_int "$REPLY" && cst="$REPLY"
+	case "$pol" in 2) modes="максимум 80%" ;; 3) modes="адаптивная зарядка" ;; esac
+	case "$cst" in
+		2) modes="${modes:+$modes · }${YELLOW}ограничена: холодно${NC}" ;;
+		3) modes="${modes:+$modes · }${YELLOW}ограничена: жарко${NC}" ;;
+	esac
+	# Battery Defender (Pixel): сам ограничивает заряд, если телефон долго на
+	# зарядке в тепле. DISCONNECTED/CONNECTED — штатные состояния «не активен».
+	prop vendor.battery.defender.state; bd="$REPLY"
+	case "$bd" in ""|DISCONNECTED|CONNECTED) ;; *) modes="${modes:+$modes · }${YELLOW}защита батареи${NC} ${DIM}($bd)${NC}" ;; esac
+	[ "$(settings get global low_power 2>/dev/null)" = "1" ] && modes="${modes:+$modes · }энергосбережение"
+
+	if [ "$status" = "Charging" ] && [ -n "$cap" ] && [ "$cap" -lt 100 ]; then
+		local ttf="" dl="" ua=0 now tgt=100 rate_eta=""
+		rd "$b/time_to_full_now" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && ttf="$REPLY"
+		rd "$b/charge_deadline" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && dl="$REPLY"
+		[ -n "$cur_ua" ] && ua=${cur_ua#-}
+		[ "$pol" = "2" ] && tgt=80
+		# Своя оценка по току: недостающие проценты × ёмкость / ток. Оптимистична —
+		# к концу заряда ток падает, поэтому со знаком «≈» и только при токе ≥ 50 мА.
+		if [ "$cap" -lt "$tgt" ] && [ "$ua" -ge 50000 ] && is_int "${full:-x}" && [ "$full" -gt 0 ]; then
+			fmt_dur $(( full * (tgt - cap) / 100 * 3600 / ua )); rate_eta="≈${REPLY#\~} ${DIM}(по току)${NC}"
+		fi
+		case "$pol" in
+			3)  # Адаптивная: драйвер Pixel отдаёт срок в секундах от текущего момента
+				[ -z "$dl" ] && dl="$ttf"
+				if [ -n "$dl" ]; then
+					printf -v now '%(%s)T' -1
+					printf -v eta '%(%H:%M)T' $((now + dl)); eta="зарядится к $eta"
+				fi ;;
+			2)  # Лимит 80%: time_to_full_now драйвера считает до 100%, поэтому своя оценка
+				if [ "$cap" -ge 80 ]; then eta="держит 80%"
+				elif [ -n "$rate_eta" ]; then eta="до 80% через $rate_eta"; fi ;;
+			*)  if [ -n "$ttf" ]; then fmt_dur "$ttf"; eta="полный заряд через $REPLY"
+				elif [ -n "$rate_eta" ]; then eta="полный заряд через $rate_eta"; fi ;;
+		esac
+		[ -z "$modes" ] && modes="обычная зарядка"
+	fi
+	[ -n "$modes" ] && kv "Режимы" "$modes${eta:+ · $eta}"
+
 	# Здоровье: ёмкость по датчику к паспортной
 	local hp="" h_ru
 	case "$health" in
 		Good) h_ru="хорошее" ;; Overheat) h_ru="${RED}перегрев${NC}" ;; Dead) h_ru="${RED}неисправна${NC}" ;;
-		Cold) h_ru="холодная" ;; "Over voltage") h_ru="${RED}перенапряжение${NC}" ;; *) h_ru="${health:-?}" ;;
+		Cold) h_ru="холодная" ;; "Over voltage") h_ru="${RED}перенапряжение${NC}" ;; *) h_ru="${health:-н/д}" ;;
 	esac
-	if is_int "${full:-x}" && is_int "${design:-x}" && [ "$design" -gt 0 ]; then
+	if is_int "${full:-x}" && is_int "${design:-x}" && [ "$design" -gt 0 ] && [ "$full" -gt 0 ]; then
 		local pct=$(( full * 100 / design ))
-		if [ "$pct" -gt 100 ]; then hp="100% ${DIM}(датчик: $pct% — ещё калибруется)${NC}"
-		elif [ "$pct" -lt 80 ]; then hp="${YELLOW}$pct%${NC} ${DIM}($((full / 1000)) из $((design / 1000)) мА·ч)${NC}"
+		if [ "$pct" -lt 80 ]; then hp="${YELLOW}$pct%${NC} ${DIM}($((full / 1000)) из $((design / 1000)) мА·ч)${NC}"
 		else hp="$pct% ${DIM}($((full / 1000)) из $((design / 1000)) мА·ч)${NC}"; fi
 	fi
 	kv "Здоровье" "$h_ru${hp:+ · ёмкость $hp}"
 	is_int "${cycles:-x}" && kv "Циклы" "$cycles"
 
-	local tc=""
-	[ "$temp" -ge "$BATT_TEMP_WARN" ] && tc="$RED"
-	kv "Температура" "${tc}${temp}°C${tc:+$NC}"
-	if [ -n "$cur_ua" ] && [ "$volt" -gt 0 ]; then
+	# [3.7] Паспорт батареи: технология, модель, подлинность, даты (что есть)
+	local info="" btype="" auth="" mdate="" fdate=""
+	if rd "$bms/battery_type" && [ -n "$REPLY" ] && [ "$REPLY" != "Unknown" ]; then btype="$REPLY"; fi
+	if rd "$bms/authentic" && is_int "$REPLY"; then auth="$REPLY"
+	elif rd "$R/sys/class/power_supply/batt_verify/authen_result" && is_int "$REPLY"; then auth="$REPLY"; fi
+	if rd "$b/manufacturing_date" && is_int "$REPLY" && [ "$REPLY" -gt 946684800 ]; then
+		printf -v mdate '%(%d.%m.%Y)T' "$REPLY"
+	fi
+	if rd "$b/first_usage_date" && is_int "$REPLY" && [ "$REPLY" -gt 946684800 ]; then
+		printf -v fdate '%(%d.%m.%Y)T' "$REPLY"
+	fi
+	[ -n "$tech" ] && info="$tech"
+	[ -n "$btype" ] && info="${info:+$info · }$btype"
+	case "$auth" in
+		1) info="${info:+$info · }${GREEN}подлинная${NC}" ;;
+		0) info="${info:+$info · }${YELLOW}не прошла проверку подлинности${NC}" ;;
+	esac
+	[ -n "$mdate" ] && info="${info:+$info · }произведена $mdate"
+	[ -n "$fdate" ] && info="${info:+$info · }в работе с $fdate"
+	[ -n "$info" ] && kv "Батарея" "$info"
+
+	if [ -n "$tdeg" ]; then
+		local tc=""
+		[ "$temp" -ge "$BATT_TEMP_WARN" ] && tc="$RED"
+		kv "Температура" "${tc}${tdeg}°C${tc:+$NC}"
+	else
+		kv "Температура" "н/д"
+	fi
+
+	# [3.8] Контроллер заряда: температура и ограничение зарядки из-за нагрева.
+	# Pixel: зоны charge_therm / usb_pwr_therm, охлаждение chg_mdis, dc_icl;
+	# Qualcomm: зона charger_therm0 (или battery/charger_temp), охлаждение battery.
+	local ct="" usbt="" lim="" cd ctype ccur cmax
+	if zone_max 'charge_therm' || zone_max 'charger_therm*'; then mdeg "$REPLY"; color_temp "$REPLY"; ct="$REPLY"
+	elif rd "$b/charger_temp" && is_int "$REPLY" && [ "$REPLY" -gt 0 ]; then
+		fdeg "$(awk -v t="$REPLY" 'BEGIN { print t / 10 }')"; color_temp "$REPLY"; ct="$REPLY"
+	fi
+	zone_max 'usb_pwr_therm' && { mdeg "$REPLY"; color_temp "$REPLY"; usbt="$REPLY"; }
+	for cd in "$R"/sys/class/thermal/cooling_device*; do
+		IFS= read -r ctype 2>/dev/null < "$cd/type" || continue
+		case "$ctype" in chg_mdis|dc_icl|battery) ;; *) continue ;; esac
+		IFS= read -r ccur 2>/dev/null < "$cd/cur_state" || continue
+		is_int "$ccur" && [ "$ccur" -gt 0 ] || continue
+		IFS= read -r cmax 2>/dev/null < "$cd/max_state"
+		lim="${YELLOW}зарядка ограничена${NC} ${DIM}($ccur из ${cmax:-?})${NC}"; break
+	done
+	if [ -n "$ct" ] || [ -n "$usbt" ]; then
+		local cl="${ct:-н/д}"
+		[ -n "$usbt" ] && cl="$cl · USB-порт $usbt"
+		kv "Контроллер" "$cl${lim:+ · $lim}"
+	fi
+	if [ -n "$cur_ua" ] && [ -n "$volt" ]; then
 		local ma=$((cur_ua / 1000)) w
 		w=$(awk -v v="$volt" -v i="$ma" 'BEGIN { printf "%.2f", v * i / 1000000 }')
 		kv "Ток" "$ma мА · ${w#-} Вт · $volt мВ"
-	else
+	elif [ -n "$volt" ]; then
 		kv "Напряжение" "$volt мВ"
 	fi
-	note "Ток: минус — разряд, плюс — заряд."
+	[ -n "$cur_ua" ] && note "Ток: минус — разряд, плюс — заряд."
 
-	if [ "$temp" -ge "$BATT_TEMP_WARN" ]; then
-		verdict 1 "батарея перегрета: ${temp}°C"
+	# [3.7] Внутреннее сопротивление (-e): растёт с износом. Драйверы отдают его в мкОм
+	# без документации единиц, поэтому только в расширенном режиме и с пометкой.
+	if [ "$EXTENDED" -eq 1 ]; then
+		local res=""
+		for rn in "$b/resistance" "$bms/resistance"; do
+			rd "$rn" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && { res="$REPLY"; break; }
+		done
+		[ -n "$res" ] && kv "Сопротивление" "$(( (res + 500) / 1000 )) мОм ${DIM}(внутреннее, по датчику)${NC}"
+	fi
+
+	if [ -n "$temp" ] && [ "$temp" -ge "$BATT_TEMP_WARN" ]; then
+		verdict 1 "батарея перегрета: ${tdeg}°C"
+	elif [ -z "$cap" ] && [ -z "$temp" ]; then
+		verdict 1 "данные батареи недоступны"
 	else
 		verdict 0 ""
 	fi
@@ -1122,6 +1371,33 @@ check_network() {
 	mobile_info && kv "Сотовая" "$REPLY"
 	[ -n "$NET_DNS" ] && kv "DNS" "$NET_DNS"
 
+	# [3.9] Модем: температура и ограничение сети из-за нагрева.
+	# Pixel (модем Exynos): зоны cp_on_chip_*, ограничение — статус датчика
+	# усилителя cellular-emergency в Thermal HAL (отдельных устройств охлаждения нет).
+	# Qualcomm: зоны modem-N-usr, ограничение — устройства охлаждения modem_*.
+	local mt="" mlim="" cd ctype ccur cmax
+	if zone_max 'cp_on_chip_*' || zone_max 'modem-[0-9]-usr'; then
+		mdeg "$REPLY"; color_temp "$REPLY"; mt="$REPLY"
+		for cd in "$R"/sys/class/thermal/cooling_device*; do
+			IFS= read -r ctype 2>/dev/null < "$cd/type" || continue
+			case "$ctype" in modem_*) ;; *) continue ;; esac
+			IFS= read -r ccur 2>/dev/null < "$cd/cur_state" || continue
+			is_int "$ccur" && [ "$ccur" -gt 0 ] || continue
+			IFS= read -r cmax 2>/dev/null < "$cd/max_state"
+			local why
+			case "$ctype" in
+				modem_pa*) why="усилитель" ;; modem_tj) why="чип" ;; modem_*skin*) why="корпус" ;;
+				modem_current|modem_bcl) why="питание" ;; modem_charge_state) why="зарядка" ;;
+				modem_mmw*) why="mmWave" ;; *) why="${ctype#modem_}" ;;
+			esac
+			mlim="${YELLOW}ограничен${NC} ${DIM}($why, $ccur из ${cmax:-?})${NC}"; break
+		done
+		if [ -z "$mlim" ] && is_int "${HAL_STAT[cellular-emergency]:-x}" && [ "${HAL_STAT[cellular-emergency]}" -gt 0 ]; then
+			mlim="${YELLOW}ограничен${NC} ${DIM}(перегрев усилителя)${NC}"
+		fi
+		kv "Модем" "$mt${mlim:+ · $mlim}"
+	fi
+
 	# Доступность: 3 пинга на хост; среднее и разброс (mdev) из той же серии
 	local host out ok=0 avg mdev loss
 	for host in 1.1.1.1 8.8.8.8 google.com; do
@@ -1226,30 +1502,94 @@ check_logcat() {
 
 # ── Процессы ─────────────────────────────────────────────────────────────────
 
+# [3.9] «Топ процессов» в духе htop. %CPU из ps — среднее за всё время жизни
+# процесса, поэтому берём второй кадр toybox top: реальная загрузка за 1 с.
+# Из того же кадра — память (RES), так что обе таблицы согласованы. Потоки ядра
+# ([kworker/…], [sugov:4]) и сам top скрыты, как в htop по умолчанию.
+# Имена длиннее колонки обрезаются посередине: начало…конец.
+mid_trunc() {   # mid_trunc "строка" ширина → REPLY
+	local t="$1" w="$2" h
+	if [ "${#t}" -le "$w" ] || [ "$w" -lt 5 ]; then REPLY="$t"; return; fi
+	h=$(( (w - 1) / 2 ))
+	REPLY="${t:0:$h}…${t: -$((w - 1 - h))}"
+}
+
 print_top() {
+	local raw tasks="" rows=5 sub="(замер за 1 с)"
+	[ "$EXTENDED" -eq 1 ] && rows=10
+	raw=$(top -b -n 2 -d 1 -m 1000 2>/dev/null)
+	# Записи «pid|cpu|res_kb|имя» из второго кадра
 	local data
-	data=$(ps -Ao pid,comm,%cpu,rss --sort=-%cpu 2>/dev/null | awk 'NR > 1 && NR <= 6')
-	[ -z "$data" ] && data=$(ps -Ao pid,comm,%cpu,rss -k -%cpu 2>/dev/null | awk 'NR > 1 && NR <= 6')
+	data=$(printf '%s\n' "$raw" | awk '
+		/^ *PID +USER/ { frame++; next }
+		/^Tasks:/ { if (frame >= 1) tasks = $0; next }
+		frame < 2 { next }
+		NF >= 12 && $1 ~ /^[0-9]+$/ {
+			name = $12; for (i = 13; i <= NF; i++) name = name " " $i
+			if (name ~ /^\[/ || name ~ /^top -b/) next
+			r = $6; m = 1
+			if (r ~ /[Kk]$/) m = 1; else if (r ~ /M$/) m = 1024; else if (r ~ /G$/) m = 1048576
+			sub(/[KkMG]$/, "", r)
+			printf "%s|%s|%d|%s\n", $1, $9, r * m, name
+		}
+		END { if (tasks != "") print "T|" tasks }')
+	if ! printf '%s' "$data" | grep -q '^[0-9]'; then
+		# Запасной путь: ps (среднее с запуска процесса)
+		data=$(ps -A -o pid,%cpu,rss,name 2>/dev/null | awk 'NR > 1 && $4 !~ /^\[/ && !seen[$1]++ { printf "%s|%s|%s|%s\n", $1, $2, $3, $4 }')
+		sub="(по ps: среднее с запуска)"
+	fi
 	[ -z "$data" ] && return
-	section "ТОП ПРОЦЕССОВ" "(по CPU)"
-	# [3.2] Строка «PID 1234 : имя · CPU % · ОЗУ МБ» — в общей колонке, как остальные
-	local pid comm cpu rss name mem mc
-	while read -r pid comm cpu rss; do
-		name="$comm"
-		case "$comm" in
-			app_process*|main|base|sh)
-				if can_read "$R/proc/$pid/cmdline"; then
-					IFS= read -r -d '' name < "$R/proc/$pid/cmdline"
-					name="${name##*/}"; [ -z "$name" ] && name="$comm"
-				fi ;;
-		esac
-		mem="?"; mc=""
-		if is_int "${rss:-x}"; then
-			mem=$(( (rss + 512) / 1024 ))
-			[ "$rss" -ge 1048576 ] && mc="$RED" || { [ "$rss" -ge 524288 ] && mc="$YELLOW"; }
+	section "ТОП ПРОЦЕССОВ" "$sub"
+
+	# Задачи: процессы и состояния из top, потоки — знаменатель из /proc/loadavg
+	local tl tot run zom thr=""
+	tl=$(printf '%s\n' "$data" | sed -n 's/^T|//p')
+	if [ -n "$tl" ]; then
+		read -r tot run zom <<< "$(printf '%s' "$tl" | awk '{
+			for (i = 1; i <= NF; i++) { if ($(i+1) ~ /^total/) t = $i; if ($(i+1) ~ /^running/) r = $i; if ($(i+1) ~ /^zombie/) z = $i }
+			print t + 0, r + 0, z + 0 }')"
+		rd "$R/proc/loadavg" && thr="${REPLY#* * * */}" && thr="${thr%% *}"
+		local tline="$tot процессов"
+		if is_int "${thr:-x}"; then
+			# Разряды пробелом: 9700 → «9 700»
+			local th="" t="$thr"
+			while [ "${#t}" -gt 3 ]; do th=" ${t: -3}$th"; t="${t:0:${#t}-3}"; done
+			tline="$tline · $t$th потоков"
 		fi
-		kv "PID $pid" "${name:0:40} ${DIM}·${NC} ${cpu}% ${DIM}·${NC} ${mc}${mem} МБ${mc:+$NC}"
-	done <<< "$data"
+		tline="$tline · работают $run"
+		[ "${zom:-0}" -gt 0 ] && tline="$tline · ${YELLOW}зомби $zom${NC}"
+		kv "Задачи" "$tline"
+	fi
+
+	# Ширина колонки имени: экран минус «  PID(7)  ЦП(5)  ОЗУ(7)  »
+	local nw=40
+	[ "$TERM_COLS" -gt 0 ] && nw=$((TERM_COLS - 27))
+	[ "$nw" -lt 12 ] && nw=12
+
+	local title key
+	for key in cpu mem; do
+		if [ "$key" = cpu ]; then title="По процессору"; else title="По памяти"; fi
+		local bar="── $title "; local bl; char_len "$bar"; bl=$REPLY
+		local fill=$(( (TERM_COLS > 0 ? TERM_COLS : 53) - 2 - bl )); [ "$fill" -lt 3 ] && fill=3
+		printf -v REPLY '%*s' "$fill" ""; bar="$bar${REPLY// /─}"
+		emit "  ${DIM}$bar${NC}"
+		emit "  ${BOLD}$(printf '%7s  %5s  %7s  %s' PID 'ЦП, %' 'ОЗУ, МБ' ПРОЦЕСС)${NC}"
+		local sorted pid cpu res name cc mc mb
+		if [ "$key" = cpu ]; then sorted=$(printf '%s\n' "$data" | grep '^[0-9]' | sort -t'|' -k2,2gr -k3,3nr | head -n "$rows")
+		else sorted=$(printf '%s\n' "$data" | grep '^[0-9]' | sort -t'|' -k3,3nr | head -n "$rows"); fi
+		while IFS='|' read -r pid cpu res name; do
+			[ -n "$pid" ] || continue
+			cc=""; mc=""
+			case "${cpu%%.*}" in ''|*[!0-9]*) ;; *) [ "${cpu%%.*}" -ge 50 ] && cc="$RED" || { [ "${cpu%%.*}" -ge 20 ] && cc="$YELLOW"; } ;; esac
+			mb="?"
+			if is_int "${res:-x}"; then
+				mb=$(( (res + 512) / 1024 ))
+				[ "$res" -ge 1048576 ] && mc="$RED" || { [ "$res" -ge 524288 ] && mc="$YELLOW"; }
+			fi
+			mid_trunc "$name" "$nw"
+			emit "  $(printf '%7s' "$pid")  ${cc}$(printf '%5s' "$cpu")${cc:+$NC}  ${mc}$(printf '%7s' "$mb")${mc:+$NC}  $REPLY"
+		done <<< "$sorted"
+	done
 }
 
 # ── Ввод-вывод ───────────────────────────────────────────────────────────────
@@ -1364,8 +1704,19 @@ check_pixel_security() {
 	if [ -e "$R/dev/aoc" ] || [ -d "$R/sys/devices/platform/aoc" ]; then
 		kv "AOC" "есть ${DIM}(Always-On Compute)${NC}"
 	fi
-	prop gsm.version.baseband
-	[ -n "$REPLY" ] && kv "Модем" "${REPLY%%,*}"
+	# [3.7.1] Модем сверяем с тем, что ожидает прошивка (ro.build.expect.baseband):
+	# расхождение бывает после ручной прошивки без radio-образа или кривой OTA.
+	local bb exp_bb
+	prop gsm.version.baseband; bb="${REPLY%%,*}"
+	prop ro.build.expect.baseband; exp_bb="$REPLY"
+	if [ -n "$bb" ]; then
+		if [ -n "$exp_bb" ] && [ "$bb" != "$exp_bb" ]; then
+			kv "Модем" "$bb ${YELLOW}⚠ ВНИМАНИЕ: прошивка ожидает $exp_bb${NC}"
+			raise_status 1
+		else
+			kv "Модем" "$bb"
+		fi
+	fi
 	kv "Статус AVB" "$VB_LABEL"
 }
 
@@ -1381,13 +1732,16 @@ detect_root() {
 		ROOT_INFO="Magisk ${v:-?}${vc:+ ($vc)}"; ROOT_KIND="MAGISK"
 		# Zygisk: настройка в БД Magisk + реальное присутствие в zygote64
 		local on="" active=0 pid
-		on=$(magisk --sqlite "SELECT value FROM settings WHERE key='zygisk'" 2>/dev/null)
+		# [3.7] Если --sqlite не сработал, настройка неизвестна («?») — тогда не называем
+		# активный Zygisk сторонним: это может быть и встроенный Zygisk Magisk.
+		on=$(magisk --sqlite "SELECT value FROM settings WHERE key='zygisk'" 2>/dev/null) || on="?"
 		on="${on#value=}"
 		for pid in $(pidof zygote64 zygote 2>/dev/null); do
 			grep -q zygisk "$R/proc/$pid/maps" 2>/dev/null && { active=1; break; }
 		done
 		if [ "$on" = "1" ] && [ "$active" -eq 1 ]; then ZYGISK_INFO="${GREEN}включён и активен${NC}"
 		elif [ "$on" = "1" ]; then ZYGISK_INFO="${YELLOW}включён, но не загружен — нужна перезагрузка${NC}"
+		elif [ "$on" = "?" ] && [ "$active" -eq 1 ]; then ZYGISK_INFO="${GREEN}активен${NC} ${DIM}(настройку Magisk прочитать не удалось)${NC}"
 		elif [ "$active" -eq 1 ]; then ZYGISK_INFO="${GREEN}активен${NC} ${DIM}(сторонний: ZygiskNext/NeoZygisk)${NC}"
 		else ZYGISK_INFO="выключен"; fi
 	elif [ -d "$R/data/adb/ksu" ] || command -v ksud >/dev/null 2>&1; then
@@ -1435,6 +1789,31 @@ print_system() {
 	prop ro.build.description; [ -n "$REPLY" ] && kv "Прошивка" "$REPLY"
 	local vk egl
 	prop ro.hardware.vulkan; vk="$REPLY"; prop ro.hardware.egl; egl="$REPLY"
+	# [3.7] Версия загрузчика и ревизия платы. Pixel отдаёт версию в ro.bootloader
+	# («ripcurrent-…»); Xiaomi пишет туда «unknown» — тогда строку не показываем.
+	local bl rev hv hc hl
+	prop ro.bootloader; bl="$REPLY"
+	[ -z "$bl" ] || [ "$bl" = "unknown" ] && { prop ro.boot.bootloader; bl="$REPLY"; }
+	# [3.7.1] Сверка с ro.build.expect.bootloader: Google шьёт загрузчик с каждой
+	# прошивкой, и расхождение значит, что его пропустили при ручной прошивке.
+	if [ -n "$bl" ] && [ "$bl" != "unknown" ]; then
+		local exp_bl; prop ro.build.expect.bootloader; exp_bl="$REPLY"
+		if [ -n "$exp_bl" ] && [ "$bl" != "$exp_bl" ]; then
+			kv "Bootloader" "$bl ${YELLOW}⚠ ВНИМАНИЕ: прошивка ожидает $exp_bl${NC}"
+			raise_status 1
+		else
+			kv "Bootloader" "$bl"
+		fi
+	fi
+	prop ro.boot.hwversion; hv="$REPLY"
+	if [ -n "$hv" ]; then
+		prop ro.boot.hwc; hc="$REPLY"; prop ro.boot.hwlevel; hl="$REPLY"
+		rev="$hv${hc:+ · $hc}${hl:+ · $hl}"          # Xiaomi: 9.19.0 · GLOBAL · MP
+	else
+		prop ro.boot.hardware.revision; rev="$REPLY"   # Pixel: MP1.0
+		[ -z "$rev" ] && { prop ro.revision; [ "$REPLY" != "0" ] && rev="$REPLY"; }
+	fi
+	[ -n "$rev" ] && kv "Ревизия" "$rev"
 	kv "Драйверы" "Vulkan: ${vk:-по умолчанию} · EGL: ${egl:-по умолчанию}"
 }
 
@@ -1448,6 +1827,23 @@ mod_prop() {   # mod_prop ФАЙЛ КЛЮЧ → REPLY (без управляющ
 	REPLY=$(sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1)
 	REPLY="${REPLY//[[:cntrl:]]/}"
 	[ -n "$REPLY" ]
+}
+
+# [3.10] Строка модуля «  вкл.     Название · версия»: колонка статуса 8 символов,
+# длинный хвост переносится под название (отступ 11), а не на начало строки.
+tag_line() {
+	local tag="$1" text="$2" first=1 ln
+	if [ "$TERM_COLS" -gt 0 ] && [ "$BRIEF_MODE" -eq 0 ]; then
+		strip_ansi "$text"; char_len "$REPLY"
+		if [ $((11 + REPLY)) -gt "$TERM_COLS" ]; then
+			wrap_text "$text" $((TERM_COLS - 11))
+			while IFS= read -r ln; do
+				if [ "$first" -eq 1 ]; then emit "  $tag $ln"; first=0; else emit "           $ln"; fi
+			done <<< "$REPLY"
+			return
+		fi
+	fi
+	emit "  $tag $text"
 }
 
 # [3.4] Было print_magisk_modules: секция универсальная — теперь print_modules,
@@ -1491,13 +1887,240 @@ print_modules() {
 		# Колонка статуса шириной 8 символов
 		char_len "$st"; printf -v sp '%*s' $((8 - REPLY)) ""
 		tag="${stc}${st}${NC}${sp}"
-		emit "  ${tag} ${BOLD}${name}${NC}${ver:+ ${DIM}·${NC} $ver}${vc:+ ${DIM}($vc)${NC}}"
+		tag_line "$tag" "${BOLD}${name}${NC}${ver:+ ${DIM}·${NC} $ver}${vc:+ ${DIM}($vc)${NC}}"
 		if [ -n "$desc" ]; then
-			[ ${#desc} -gt 160 ] && desc="${desc:0:157}..."
-			emit "           ${DIM}${desc}${NC}"
+			# [3.9] На экране — перенос целиком, без экрана (файл, конвейер) — обрезка
+			[ "$TERM_COLS" -eq 0 ] && [ ${#desc} -gt 160 ] && desc="${desc:0:157}..."
+			wrap_emit 11 "${DIM}${desc}${NC}"
 		fi
 	done
 	[ "$pend" -eq 1 ] && note "обновлён / удалится / новый — изменения применятся после перезагрузки"
+}
+
+# ── Модули LSPosed ───────────────────────────────────────────────────────────
+# [3.10] Секция только с -e (как «Модули Magisk») и только если фреймворк стоит:
+# LSPosed или его форк Vector (JingMatrix), id zygisk_vector / zygisk_lsposed.
+# Источники (сверено с исходниками Vector 2.2):
+#   • список и вкл./выкл. — CLI фреймворка: cli --json modules ls (~1.5 с, Java);
+#     версия API фреймворка — cli --json status («API Version», есть с 2.2);
+#   • описание и API модуля — кэш менеджера module-detection.tsv (Vector 2.1+,
+#     ModuleDetectionCache.kt): описание там уже взято из ресурсов APK на языке
+#     системы. Кэш появляется после первого открытия списка модулей в менеджере;
+#   • в строке модуля — имя пакета: подписи приложения нет ни в CLI, ни в кэше,
+#     а у большинства модулей она лежит в resources.arsc, который без Java не прочесть.
+# Без кэша описание и API читаются из APK так же, как это делает менеджер
+# (ModuleDetection.kt): module.prop нового API или meta-data xposed* старого.
+LSP_AXML_AWK='
+# AXML (двоичный AndroidManifest.xml) из od -An -v -tu1 → строки:
+#   D<TAB>описание приложения (строкой или @), M<TAB>имя meta-data<TAB>тип<TAB>значение
+function u16(o) { return b[o] + b[o+1] * 256 }
+function u32(o) { return b[o] + b[o+1] * 256 + b[o+2] * 65536 + b[o+3] * 16777216 }
+# Байт → текст для printf %b: не-ASCII как \xHH (awk на Android может сам
+# перекодировать %c > 127 в UTF-8), обратный слэш удваивается, управляющие — пробел
+function bt(c) { return c >= 128 ? sprintf("\\x%02x", c) : c == 92 ? "\\\\" : c < 32 ? " " : sprintf("%c", c) }
+function utf8(c) {   # кодовая точка UTF-16 → байты UTF-8
+	if (c < 128) return bt(c)
+	if (c < 2048) return bt(192 + int(c / 64)) bt(128 + c % 64)
+	return bt(224 + int(c / 4096)) bt(128 + int(c / 64) % 64) bt(128 + c % 64)
+}
+function str(i,    o, n, s, k) {
+	if (i < 0 || i >= scount || i == 4294967295) return ""
+	o = sp + sstart + u32(sp + shdr + 4 * i)
+	s = ""
+	if (sutf8) {
+		o += (b[o] >= 128) ? 2 : 1                       # длина в символах
+		n = b[o]; o++; if (n >= 128) { n = (n - 128) * 256 + b[o]; o++ }
+		for (k = 0; k < n; k++) s = s bt(b[o + k])
+	} else {
+		n = u16(o); o += 2; if (n >= 32768) { n = (n - 32768) * 65536 + u16(o); o += 2 }
+		for (k = 0; k < n; k++) s = s utf8(u16(o + 2 * k))
+	}
+	return s
+}
+{ for (i = 1; i <= NF; i++) b[nb++] = $i + 0 }
+END {
+	if (nb < 8 || u16(0) != 3) exit 1
+	o = u16(2)
+	while (o + 8 <= nb) {
+		t = u16(o); h = u16(o + 2); sz = u32(o + 4); if (sz < 8) break
+		if (t == 1) {                                      # пул строк
+			sp = o; shdr = h; scount = u32(o + 8); sutf8 = int(u32(o + 16) / 256) % 2; sstart = u32(o + 20)
+		} else if (t == 384) {                             # карта ресурсов
+			for (k = 0; (k + 1) * 4 <= sz - h; k++) rid[k] = u32(o + h + 4 * k)
+		} else if (t == 258) {                             # начало элемента
+			e = o + h; tag = str(u32(e + 4)); as = u16(e + 8); asz = u16(e + 10); ac = u16(e + 12)
+			split("", A); split("", AT); split("", AD); split("", AR)
+			for (k = 0; k < ac; k++) {
+				a = e + as + k * asz; ni = u32(a + 4); nm = str(ni)
+				if (ni in rid) { if (rid[ni] == 16842753) nm = "label"; else if (rid[ni] == 16842755) nm = "name"; else if (rid[ni] == 16842788) nm = "value"; else if (rid[ni] == 16843056) nm = "description" }
+				AR[nm] = u32(a + 8); AT[nm] = b[a + 15]; AD[nm] = u32(a + 16)
+			}
+			if (tag == "application") {
+				if ("description" in AT) print "D\t" (AT["description"] == 3 ? str(AR["description"]) : "@")
+			} else if (tag == "meta-data" && ("name" in AT)) {
+				mn = str(AR["name"])
+				if (mn ~ /^xposed/) {
+					if (!("value" in AT)) print "M\t" mn "\t-\t"
+					else if (AT["value"] == 3) print "M\t" mn "\ts\t" str(AR["value"])
+					else if (AT["value"] == 1) print "M\t" mn "\tr\t"
+					else print "M\t" mn "\ti\t" AD["value"]
+				}
+			}
+		}
+		o += sz
+	}
+}
+'
+LSP_CACHE_AWK='
+# Кэш менеджера Vector: пакет → «legacy<TAB>minApi<TAB>targetApi<TAB>описание» (описание
+# раскодировано из base64 и экранировано для printf %b). Из нескольких записей пакета — с большим versionCode.
+function bt(c) { return c >= 128 ? sprintf("\\x%02x", c) : c == 92 ? "\\\\" : c < 32 ? " " : sprintf("%c", c) }
+function b64(s,    i, c, v, n, bits, out) {
+	out = ""; v = 0; bits = 0
+	for (i = 1; i <= length(s); i++) {
+		c = index(B64, substr(s, i, 1)); if (c == 0) continue
+		v = v * 64 + c - 1; bits += 6
+		if (bits >= 8) { bits -= 8; n = int(v / 2 ^ bits); v -= n * 2 ^ bits; out = out bt(n) }
+	}
+	return out
+}
+BEGIN { FS = "\t"; B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" }
+NF == 10 && $4 == "1" && (!($1 in vc) || $2 + 0 > vc[$1]) { vc[$1] = $2 + 0; rec[$1] = $5 "\t" $6 "\t" $7 "\t" b64($10) }
+END { for (p in rec) print p "\t" rec[p] }
+'
+
+print_lsposed() {
+	local m id fwdir="" desc0
+	for m in "$R"/data/adb/modules/*/; do
+		m="${m%/}"; id="${m##*/}"
+		case "${id,,}" in *lsposed*|*vector*) ;; *) continue ;; esac
+		mod_prop "$m/module.prop" description; desc0="$REPLY"
+		case "${id,,}:${desc0,,}" in *lsposed*|*xposed*) fwdir="$m"; break ;; esac
+	done
+	[ -n "$fwdir" ] || return 0
+
+	local fork fwver api="" cli="" to="" sub
+	mod_prop "$fwdir/module.prop" name; fork="${REPLY:-${fwdir##*/}}"
+	fork="${fork#Zygisk - }"; fork="${fork#Riru - }"
+	mod_prop "$fwdir/module.prop" version; fwver="${REPLY%% (*}"
+	for m in "$R/data/adb/lspd/cli" "$fwdir/cli"; do [ -f "$m" ] && { cli="$m"; break; }; done
+	command -v timeout >/dev/null 2>&1 && to="timeout 20"
+
+	# Список модулей: пакет<TAB>enabled|disabled
+	local list="" cli_ok=0
+	if [ -n "$cli" ] && [ ! -e "$fwdir/disable" ]; then
+		api=$($to sh "$cli" --json status 2>/dev/null | awk -F': *' '/"API Version"/ { gsub(/[^0-9]/, "", $2); print $2; exit }')
+		list=$($to sh "$cli" --json modules ls 2>/dev/null | awk '
+			/"success": *true/ { ok = 1 }
+			/"PACKAGE"/ { p = $0; sub(/^[^:]*: *"/, "", p); sub(/".*/, "", p) }
+			/"STATUS"/  { s = $0; sub(/^[^:]*: *"/, "", s); sub(/".*/, "", s); if (p != "") print p "\t" s; p = "" }
+			END { if (ok) print "OK" }')
+		[[ "$list" == *OK ]] && cli_ok=1
+		list="${list%OK}"; list="${list%$'\n'}"
+	fi
+
+	# Кэш менеджера: встроенный менеджер живёт в com.android.shell, отдельный — в своём пакете
+	local cache=""
+	for m in "$R"/data/user/0/com.android.shell/cache/module-detection.tsv "$R"/data/user/0/*/cache/module-detection.tsv; do
+		[ -f "$m" ] && { cache="$m"; break; }
+	done
+	local -A C_LEG=() C_MIN=() C_TGT=() C_DSC=()
+	local pkg leg mn tg d
+	if [ -n "$cache" ]; then
+		while IFS=$'\t' read -r pkg leg mn tg d; do
+			[ -n "$pkg" ] || continue
+			C_LEG[$pkg]="$leg"; C_MIN[$pkg]="$mn"; C_TGT[$pkg]="$tg"; C_DSC[$pkg]="$d"
+		done < <(LC_ALL=C awk "$LSP_CACHE_AWK" "$cache" 2>/dev/null)
+		# CLI не ответил — список хотя бы из кэша, без статуса
+		if [ "$cli_ok" -eq 0 ]; then
+			list=""
+			for pkg in "${!C_LEG[@]}"; do list+="$pkg"$'\t'"?"$'\n'; done
+			list=$(printf '%s' "$list" | sort)
+		fi
+	fi
+
+	sub="($fork${fwver:+ $fwver}${api:+ · API $api})"
+	[ -e "$fwdir/disable" ] && sub="($fork${fwver:+ $fwver} · отключён)"
+	section "МОДУЛИ LSPOSED" "$sub"
+	[ "$cli_ok" -eq 0 ] && [ -n "$cli" ] && [ ! -e "$fwdir/disable" ] && note "CLI фреймворка не ответил — статус модулей неизвестен"
+	if [ -z "$list" ]; then
+		emit "  ${RED}Модули не установлены, не обнаружены или не активированы${NC}"
+		return 0
+	fi
+
+	local st tag stc sp out ver cp apk name apis desc dref nocache=0
+	local p_desc p_min p_tgt m_dsc m_min k a b c
+	while IFS=$'\t' read -r pkg st; do
+		[ -n "$pkg" ] || continue
+		case "$st" in
+			enabled)  st="вкл.";  stc="$GREEN" ;;
+			disabled) st="выкл."; stc="$YELLOW" ;;
+			*)        st="?";     stc="$DIM" ;;
+		esac
+		char_len "$st"; printf -v sp '%*s' $((8 - REPLY)) ""
+		tag="${stc}${st}${NC}${sp}"
+
+		out=$(dumpsys package "$pkg" 2>/dev/null)
+		ver=$(printf '%s\n' "$out" | sed -n 's/^ *versionName=//p' | head -n 1)
+		cp=$(printf '%s\n' "$out" | sed -n 's/^ *codePath=//p' | head -n 1)
+
+		# Метаданные из APK: module.prop нового API и манифест (двоичный AXML)
+		p_desc=""; p_min=""; p_tgt=""; m_dsc=""; m_min=""; dref=0
+		apk="$R$cp/base.apk"
+		if [ -n "$cp" ] && [ -f "$apk" ] && command -v unzip >/dev/null 2>&1; then
+			out=$(unzip -p "$apk" META-INF/xposed/module.prop 2>/dev/null | tr -d '\r')
+			if [ -n "$out" ]; then
+				p_desc=$(printf '%s\n' "$out" | sed -n 's/^description=//p' | head -n 1)
+				p_min=$(printf '%s\n' "$out" | sed -n 's/^minApiVersion=\([0-9]*\).*/\1/p' | head -n 1)
+				p_tgt=$(printf '%s\n' "$out" | sed -n 's/^targetApiVersion=\([0-9]*\).*/\1/p' | head -n 1)
+			fi
+			while IFS=$'\t' read -r k a b c; do
+				case "$k" in
+					D) if [ "$a" = "@" ]; then dref=1; else printf -v m_dsc '%b' "$a"; fi ;;
+					M) case "$a:$b" in
+						xposeddescription:s) printf -v m_dsc '%b' "$c" ;;
+						xposeddescription:r) dref=1 ;;
+						xposedminversion:i) m_min="$c" ;;
+						xposedminversion:s) m_min="${c%%[!0-9]*}" ;;
+					   esac ;;
+				esac
+			done < <(unzip -p "$apk" AndroidManifest.xml 2>/dev/null | od -An -v -tu1 | LC_ALL=C awk "$LSP_AXML_AWK" 2>/dev/null)
+		fi
+
+		name="$pkg"
+
+		# API: кэш → module.prop → xposedminversion
+		# [3.10.1] Внутри «API 93 (старый)» — неразрывные пробелы (U+00A0, байты C2 A0):
+		# перенос не отрывает «(старый)» от номера. На экране это обычный пробел.
+		local nb=$'\xc2\xa0'
+		apis=""
+		if [ -n "${C_LEG[$pkg]+x}" ]; then
+			if [ "${C_LEG[$pkg]}" = "1" ]; then
+				[ "${C_MIN[$pkg]:-0}" -gt 0 ] && apis="API$nb${C_MIN[$pkg]}$nb(старый)"
+			else
+				a="${C_TGT[$pkg]:-0}"; [ "$a" -gt 0 ] || a="${C_MIN[$pkg]:-0}"
+				[ "$a" -gt 0 ] && apis="API$nb$a"
+			fi
+		elif [ -n "$p_tgt$p_min" ]; then apis="API$nb${p_tgt:-$p_min}"
+		elif [ -n "$m_min" ]; then apis="API$nb$m_min$nb(старый)"
+		fi
+
+		tag_line "$tag" "${BOLD}${name}${NC}${ver:+ ${DIM}·${NC} $ver}${apis:+ ${DIM}·${NC} $apis}"
+
+		# Описание: кэш (уже из ресурсов, на языке системы) → module.prop → манифест
+		desc=""
+		if [ -n "${C_LEG[$pkg]+x}" ]; then
+			printf -v desc '%b' "${C_DSC[$pkg]}"
+			[ -z "$desc" ] && desc="описание отсутствует"
+		elif [ -n "$p_desc" ]; then desc="$p_desc"
+		elif [ -n "$m_dsc" ]; then desc="$m_dsc"
+		elif [ "$dref" -eq 1 ]; then desc="описание недоступно"; nocache=1
+		else desc="описание отсутствует"; fi
+		desc="${desc//[[:cntrl:]]/ }"
+		[ "$TERM_COLS" -eq 0 ] && [ ${#desc} -gt 160 ] && desc="${desc:0:157}..."
+		wrap_emit 11 "${DIM}${desc}${NC}"
+	done <<< "$list"
+	[ "$nocache" -eq 1 ] && note "Описания хранятся в ресурсах APK: откройте список модулей в менеджере $fork — он сохранит их в кэш, и скрипт их покажет."
 }
 
 # [3.1] Ядро: полный разбор /proc/version — версия, сборщик, компилятор и линкер,
@@ -1784,6 +2407,7 @@ run_monitor() {
 	print_system
 	if [ "$EXTENDED" -eq 1 ]; then
 		print_modules
+		print_lsposed
 		print_kernel_extended
 	fi
 
@@ -1815,7 +2439,7 @@ show_help() {
   -b, --brief           только предупреждения и критичные события
   -d, --dry-run [секции] заголовок и список секций; с именами — только они:
                         -d cpu,thermal   ·   -d all — все секции подряд
-  -e, --extended        расширенно: модули root, ядро, сборка, драйверы
+  -e, --extended        расширенно: модули root и LSPosed, ядро, сборка, драйверы
   -s, --net-speed       тест скорости сети (нужен iperf3)
   -c, --clear-log       очистить лог-файл и выйти
 
@@ -2001,3 +2625,40 @@ fi
 #  на ядрах, где faccessat врёт (KernelSU, Zen-Itsu), пропадали CPU, UFS,
 #  ZRAM, PSI и статус AVB. DNS: несколько серверов выводятся через запятую
 #  (с 3.1 они склеивались в «10.11.12.1310.11.12.14»).
+#
+# Изменения v3.7: батарея — технология, модель и подлинность (bms/Maxim), даты
+#  производства и первого применения (Pixel), температура с десятыми, ёмкость
+#  выше паспортной без «калибруется», «н/д» вместо 0 °C/0% при недоступных
+#  данных, в -e — внутреннее сопротивление; СИСТЕМА -e — Bootloader и ревизия
+#  платы. По аудиту ChatGPT: загрузка CPU «н/д» без /proc/stat, Zygisk не
+#  называется сторонним, если настройку Magisk прочитать не удалось, PSI
+#  считается и при одной строке, пояснение к MONITOR_SYSROOT.
+#
+# Изменения v3.7.1: «Bootloader» (-e) и «Модем» (Pixel) сверяются с версиями,
+#  которые ожидает прошивка (ro.build.expect.*); при расхождении — ВНИМАНИЕ.
+#
+# Изменения v3.7.2: объём сброса zram на диск считается по реальному размеру
+#  страницы (getconf PAGESIZE), а не по фиксированным 4 КБ — готовность к 16K.
+#
+# Изменения v3.8: «Батарея» — строка «Режимы» (максимум 80%, адаптивная зарядка,
+#  защита батареи Pixel, энергосбережение, ограничение по температуре) со временем:
+#  «полный заряд через ~N», «до 80% через ≈N», «зарядится к чч:мм»; строка
+#  «Контроллер» — температура зарядки, USB-порта и ограничение зарядки из-за нагрева.
+#  Охлаждение зарядки (chg_mdis, dc_icl) убрано из «Троттлинга», чтобы не дублировать.
+#
+# Изменения v3.8.1: «Питание» — «USB PD, быстрая · 8.3 В · до 20 Вт»: напряжение
+#  с десятыми и единицей в тексте; предел мощности на Pixel из BatteryService.
+#
+# Изменения v3.9: «Топ процессов» в духе htop — замер за 1 с (второй кадр top),
+#  таблицы «По процессору» и «По памяти» (5 строк, с -e — 10), строка «Задачи»,
+#  длинные имена обрезаются посередине. Перенос длинных строк под колонку
+#  значений по ширине терминала (MONITOR_COLS=N — вручную, 0 — выкл.).
+#  «Сеть»: строка «Модем» — температура и ограничение из-за нагрева.
+#
+# Изменения v3.10: новая секция «Модули LSPosed» (-e, только если стоит LSPosed
+#  или Vector): имя пакета, статус из CLI фреймворка, версия, API (новый / «старый»
+#  XposedBridge), описание из кэша менеджера Vector 2.1+ или из APK. «Модули Magisk»: длинная строка модуля переносится
+#  под название.
+#
+# Изменения v3.10.1: «Модули LSPosed» — «API 93 (старый)» переносится целиком
+#  (неразрывные пробелы), а не обрывается перед «(старый)».
