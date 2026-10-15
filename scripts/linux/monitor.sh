@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.12 — мониторинг состояния rooted Android
+# monitor.sh v3.13 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.12"
+readonly VERSION="3.13"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -1695,6 +1695,299 @@ check_partitions() {
 	done
 }
 
+# ── Другие подключения ───────────────────────────────────────────────────────
+# [3.13] Bluetooth, NFC и оплата, точка доступа, USB, UWB, ИК-порт.
+# Сверено с пробами на Pixel 8 Pro (Android 17) и POCO F3 (Android 16).
+
+# dumpsys bluetooth_manager → строки с полями через TAB:
+#   S  состояние адаптера (ON/OFF/…)
+#   B  MAC  подключено(0/1)  транспорт  CoD  имя        — сохранённые устройства
+#   M  MAC  ключ  значение                               — метаданные устройства
+#   C  MAC  кодек                                        — кодек A2DP
+# Метаданные — BluetoothDevice.METADATA_*: Android 17 пишет их номерами
+# (BluetoothStorageManager.Database), Android 16 — именами (custom metadata(…)).
+# Номера сверены на одних и тех же наушниках, подключённых к обоим телефонам.
+BT_AWK='
+BEGIN {
+	split("manufacturer_name model_name software_version hardware_version companion_app main_icon is_untethered_headset untethered_left_icon untethered_right_icon untethered_case_icon untethered_left_battery untethered_right_battery untethered_case_battery untethered_left_charging untethered_right_charging untethered_case_charging enhanced_settings_ui_uri device_type main_battery main_charging main_low_battery_threshold untethered_left_low_battery_threshold untethered_right_low_battery_threshold untethered_case_low_battery_threshold spatial_audio fastpair_customized le_audio", kn, " ")
+	want["hardware_version"] = want["is_untethered_headset"] = want["device_type"] = want["le_audio"] = 1
+	want["untethered_left_battery"] = want["untethered_right_battery"] = want["untethered_case_battery"] = 1
+	want["untethered_left_charging"] = want["untethered_right_charging"] = want["untethered_case_charging"] = 1
+	want["main_battery"] = want["main_charging"] = 1
+}
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+function meta(mac, k, v) { v = trim(v); if ((k in want) && v != "" && v != "null") print "M\t" mac "\t" k "\t" v }
+!st && /^  [Ss]tate: *[A-Z_]+/ { s = $0; sub(/^  [Ss]tate: */, "", s); print "S\t" trim(s); st = 1 }
+/^  Bonded devices:/ { bond = 1; next }
+bond && /^  [A-Za-z]/ { bond = 0 }
+bond && /^    [0-9A-Fa-fX:][0-9A-Fa-fX:]*\(/ {
+	mac = substr($0, 5, 17)
+	c = ($0 ~ /ACL BR\/EDR:Y/ || $0 ~ /ACL BR\/EDR:[YN] LE:Y/) ? 1 : 0
+	t = ($0 ~ /\[ *LE *\]/) ? "LE" : ($0 ~ /\[ *DUAL *\]/) ? "DUAL" : "BR"
+	cod = ""; if (match($0, /\[0x[0-9A-Fa-f]+\]/)) cod = substr($0, RSTART + 1, RLENGTH - 2)
+	n = $0; while ((i = index(n, "] ")) > 0) n = substr(n, i + 2)
+	print "B\t" mac "\t" c "\t" t "\t" cod "\t" trim(n)
+}
+# Android 17: «  Device: MAC [Persist on Disk] {» … «      10   100» … «  }»
+/^  Device: [0-9A-Fa-fX:]+ / { dev = $2; next }
+dev != "" && /^  }/ { dev = ""; next }
+dev != "" && /^      [0-9]+ +[^ ]/ { k = $1 + 1; v = $0; sub(/^ *[0-9]+ +/, "", v); if (k in kn) meta(dev, kn[k], v); next }
+# Android 16: «  MAC last_active_time=… {… custom metadata(k=v|k=v|…) …}»
+/^  [0-9A-Fa-fX:]+ last_active_time=/ && /custom metadata\(/ {
+	mac = $1; s = $0; sub(/.*custom metadata\(/, "", s); sub(/\), hfp client.*/, "", s)
+	n = split(s, kvs, "|")
+	for (i = 1; i <= n; i++) { j = index(kvs[i], "="); if (j) meta(mac, substr(kvs[i], 1, j - 1), substr(kvs[i], j + 1)) }
+}
+/=== A2dpStateMachine for / { a2 = $4 }
+a2 != "" && /mCodecConfig: \{codecName:/ { s = $0; sub(/.*codecName:/, "", s); sub(/,.*/, "", s); print "C\t" a2 "\t" s; a2 = "" }
+'
+
+# bt_type CoD тип_из_метаданных → REPLY (тип устройства для списка сохранённых)
+bt_type() {
+	REPLY=""
+	case "$2" in
+		"Untethered Headset") REPLY="наушники"; return ;;
+		Headset) REPLY="гарнитура"; return ;;
+		Speaker) REPLY="колонка"; return ;;
+		Watch) REPLY="часы"; return ;;
+	esac
+	[[ "$1" =~ ^0x[0-9A-Fa-f]+$ ]] || return
+	local cod=$(( $1 )) maj
+	maj=$(( (cod >> 8) & 0x1F ))
+	case $maj in
+		1) REPLY="компьютер" ;;
+		2) REPLY="телефон" ;;
+		4) REPLY="аудио" ;;
+		5) if [ $(( cod & 0xC0 )) -eq 64 ]; then REPLY="клавиатура"
+		   elif [ $(( cod & 0xC0 )) -eq 128 ]; then REPLY="мышь"
+		   elif [ $(( (cod >> 2) & 0xF )) -eq 2 ]; then REPLY="геймпад"
+		   else REPLY="периферия"; fi ;;
+		7) REPLY="носимое" ;;
+	esac
+}
+
+check_connections() {
+	section "ДРУГИЕ ПОДКЛЮЧЕНИЯ"
+	local tether
+	tether=$(dumpsys tethering 2>/dev/null | awk '/^  Tether state:/ { f = 1; next } f && /^  [A-Za-z]/ { exit } f && / - TetheredState/ { printf "%s ", $1 }')
+
+	# ── Bluetooth
+	local bt line typ mac c tr cod name k v
+	bt=$(dumpsys bluetooth_manager 2>/dev/null | LC_ALL=C awk "$BT_AWK" 2>/dev/null)
+	if [ -n "$bt" ]; then
+		local state="" n_on=0
+		local -a macs=() conn=()
+		local -A BN=() BC=() BT=() MD=() CD=()
+		while IFS=$'\t' read -r typ mac c tr cod name; do
+			case "$typ" in
+				S) state="$mac" ;;
+				B) macs+=("$mac"); BN[$mac]="$name"; BC[$mac]="$cod"; BT[$mac]="$tr"
+				   [ "$c" = "1" ] && { conn+=("$mac"); n_on=$((n_on + 1)); } ;;
+				M) MD["$mac|$c"]="$tr" ;;
+				C) CD[$mac]="$c" ;;
+			esac
+		done <<< "$bt"
+		if [ "$state" = "ON" ]; then
+			local extra=""
+			[[ " $tether" == *" bt-pan "* ]] && extra=" · режим модема"
+			if [ "$n_on" -gt 0 ]; then
+				kv "Bluetooth" "${GREEN}вкл.${NC} · подключено: $n_on$extra"
+			else
+				kv "Bluetooth" "${GREEN}вкл.${NC}$extra"
+			fi
+			local d bat l r cs ch fp
+			for d in "${conn[@]}"; do
+				bat=""
+				l="${MD[$d|untethered_left_battery]:-}"; r="${MD[$d|untethered_right_battery]:-}"; cs="${MD[$d|untethered_case_battery]:-}"
+				if is_int "${l:-x}" || is_int "${r:-x}"; then
+					is_int "${l:-x}" && [ "$l" -ge 0 ] && bat="Л $l%"
+					is_int "${r:-x}" && [ "$r" -ge 0 ] && bat="${bat:+$bat · }П $r%"
+					[ "${MD[$d|untethered_left_charging]:-}" = "true" ] && [ "${MD[$d|untethered_right_charging]:-}" = "true" ] && bat="$bat (заряжаются)"
+					if is_int "${cs:-x}" && [ "$cs" -ge 0 ]; then
+						bat="$bat · кейс $cs%"
+						[ "${MD[$d|untethered_case_charging]:-}" = "true" ] && bat="$bat (заряжается)"
+					fi
+				elif is_int "${MD[$d|main_battery]:-x}" && [ "${MD[$d|main_battery]}" -ge 0 ]; then
+					bat="заряд ${MD[$d|main_battery]}%"
+					[ "${MD[$d|main_charging]:-}" = "true" ] && bat="$bat (заряжается)"
+				fi
+				ch="${CD[$d]:-}"
+				[ -z "$ch" ] && [ "${MD[$d|le_audio]:-}" = "true" ] && [ "${BT[$d]}" != "BR" ] && ch="LE Audio"
+				fp=""; [[ "${MD[$d|hardware_version]:-}" == FAST_PAIR_* ]] && fp=" ${DIM}· Fast Pair${NC}"
+				wrap_emit 18 "${BOLD}${BN[$d]:-$d}${NC}${ch:+ · $ch}${bat:+ · $bat}$fp"
+			done
+			if [ "$EXTENDED" -eq 1 ] && [ "${#macs[@]}" -gt 0 ]; then
+				kv "Сохранённые" "${#macs[@]}"
+				for d in "${macs[@]}"; do
+					bt_type "${BC[$d]}" "${MD[$d|device_type]:-}"
+					wrap_emit 18 "${BN[$d]:-$d}${REPLY:+ ${DIM}· $REPLY${NC}}"
+				done
+			fi
+		else
+			kv "Bluetooth" "выкл."
+		fi
+	fi
+
+	# ── NFC и бесконтактная оплата. Приложение оплаты с Android 15 — системная
+	# роль кошелька («Current wallet payment service»), а не настройка
+	# nfc_payment_default_component; на старых — «Preferred payment service».
+	local nfc
+	nfc=$(dumpsys nfc 2>/dev/null)
+	if [[ "$nfc" == *mState=* ]]; then
+		local ns chip="" sec="" pay pkg desc
+		ns=$(printf '%s\n' "$nfc" | sed -n 's/^mState=//p' | head -n 1)
+		if compgen -G "$R/dev/st21nfc" >/dev/null || compgen -G "$R/dev/st54*" >/dev/null; then chip="STMicroelectronics"
+		elif compgen -G "$R/dev/nq-nci" >/dev/null || compgen -G "$R/dev/pn5*" >/dev/null || compgen -G "$R/dev/nxp*" >/dev/null; then chip="NXP"
+		elif compgen -G "$R/dev/sec-nfc" >/dev/null; then chip="Samsung"; fi
+		prop vendor.qti.nfc.fwver; [ -n "$REPLY" ] && chip="${chip:-контроллер} · прошивка $REPLY"
+		[[ "$nfc" == *mIsSecureNfcEnabled=true* ]] && sec=" · только при разблокировке"
+		case "$ns" in
+			on)  kv "NFC" "${GREEN}вкл.${NC}${chip:+ · $chip}$sec" ;;
+			off) kv "NFC" "выкл.${chip:+ · $chip}" ;;
+			*)   kv "NFC" "${ns:-?}${chip:+ · $chip}" ;;
+		esac
+		pay=$(printf '%s\n' "$nfc" | sed -n 's/.*Current wallet payment service: ComponentInfo{\([^}]*\)}.*/\1/p' | head -n 1)
+		[ -z "$pay" ] && pay=$(printf '%s\n' "$nfc" | sed -n 's/.*[Pp]referred payment service: ComponentInfo{\([^}]*\)}.*/\1/p' | head -n 1)
+		if [ -n "$pay" ]; then
+			pkg="${pay%%/*}"
+			desc=$(printf '%s\n' "$nfc" | grep -F "ComponentInfo{$pay} (Description: " | head -n 1 | sed 's/.*(Description: \([^)]*\)).*/\1/')
+			[ "$desc" = "null" ] && desc=""
+			if [ -n "$desc" ]; then kv "Оплата" "$desc ${DIM}($pkg)${NC}"; else kv "Оплата" "$pkg"; fi
+		else
+			kv "Оплата" "${YELLOW}приложение не выбрано${NC}"
+		fi
+	fi
+
+	# ── Точка доступа: настройки из WifiConfigStoreSoftAp.xml (на Android 17 —
+	# в /data/misc_ce, на 16 — в /data/misc); состояние — по dumpsys tethering,
+	# а частоты и клиенты — из dumpsys wifi, только если точка работает.
+	local ap="" f
+	for f in "$R/data/misc_ce/0/apexdata/com.android.wifi/WifiConfigStoreSoftAp.xml" \
+		"$R/data/misc/apexdata/com.android.wifi/WifiConfigStoreSoftAp.xml"; do
+		can_read "$f" && grep -q '<SoftAp>' "$f" 2>/dev/null && { ap="$f"; break; }
+	done
+	local ap_on=0 i
+	for i in $tether; do case "$i" in wlan*|softap*|ap_br*|swlan*) ap_on=1 ;; esac; done
+	if [ -n "$ap" ] || [ "$ap_on" -eq 1 ]; then
+		local ssid="" secu="" bands="" hid="" maxc="" auto="" tmo="" out=""
+		if [ -n "$ap" ]; then
+			IFS=$'\t' read -r ssid secu bands hid maxc auto tmo < <(awk '
+				/name="WifiSsid"/ { s = $0; sub(/.*name="WifiSsid">/, "", s); sub(/<\/string>.*/, "", s); gsub(/^"|"$/, "", s) }
+				/name="SecurityType"/ { t = $0; sub(/.*value="/, "", t); sub(/".*/, "", t) }
+				/name="Band"/ { b = $0; sub(/.*value="/, "", b); sub(/".*/, "", b); bl = bl (bl == "" ? "" : ",") b }
+				/name="HiddenSSID"/ { h = ($0 ~ /value="true"/) }
+				/name="MaxNumberOfClients"/ { m = $0; sub(/.*value="/, "", m); sub(/".*/, "", m) }
+				/name="AutoShutdownEnabled"/ { a = ($0 ~ /value="true"/) }
+				/name="ShutdownTimeoutMillis"/ { o = $0; sub(/.*value="/, "", o); sub(/".*/, "", o) }
+				END { printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s, t, bl, h + 0, m, a + 0, o }' "$ap" 2>/dev/null)
+		fi
+		# SoftApConfiguration.SECURITY_TYPE_*: 0 открытая, 1 WPA2, 2 WPA2/WPA3,
+		# 3 WPA3, 4/5 OWE. Band — битовая маска: 1 = 2,4 ГГц, 2 = 5, 4 = 6.
+		case "$secu" in
+			0) secu="${YELLOW}без пароля${NC}" ;; 1) secu="WPA2" ;; 2) secu="WPA2/WPA3" ;;
+			3) secu="WPA3" ;; 4|5) secu="OWE" ;; *) secu="" ;;
+		esac
+		# Две записи — мостовой режим (две сети одновременно): у каждой берём
+		# старший диапазон. Одна запись с несколькими битами — выбор системы.
+		local bl="" b bt2 nb=0
+		for b in ${bands//,/ }; do nb=$((nb + 1)); done
+		for b in ${bands//,/ }; do
+			if [ "$nb" -gt 1 ]; then
+				case "$b" in 1) bt2="2,4" ;; 2|3) bt2="5" ;; 4|5|6|7) bt2="6" ;; *) bt2="" ;; esac
+			else
+				case "$b" in 1) bt2="2,4" ;; 2) bt2="5" ;; 3) bt2="2,4/5" ;; 4) bt2="6" ;; 6) bt2="5/6" ;; 7) bt2="2,4/5/6" ;; *) bt2="" ;; esac
+			fi
+			[ -n "$bt2" ] && bl="${bl:+$bl + }$bt2"
+		done
+		[ -n "$bl" ] && bl="$bl ГГц"
+		if [ "$ap_on" -eq 1 ]; then
+			local live fr="" cl="" std="" idle=""
+			live=$(dumpsys wifi 2>/dev/null | awk '
+				/^Dump of SoftApManager/ { f = 1 }
+				f && /^getConnectedClientList\(\)\.size\(\):/ { c = $2 }
+				f && /^mCurrentSoftApInfoMap/ {
+					s = $0
+					while (match(s, /frequency= *[0-9]+/)) { q = substr(s, RSTART, RLENGTH); gsub(/[^0-9]/, "", q); fl = fl " " q; s = substr(s, RSTART + RLENGTH) }
+					if (match($0, /wifiStandard= *[0-9]+/)) { w = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", w) }
+					if (match($0, /mIdleShutdownTimeoutMillis= *[0-9]+/)) { t = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", t) }
+				}
+				f && /^SoftApManager:/ { exit }
+				END { printf "%s\t%s\t%s\t%s\n", fl, c, w, t }')
+			IFS=$'\t' read -r fr cl std idle <<< "$live"
+			local fq h24=0 h5=0 h6=0 fb=""
+			for fq in $fr; do
+				if [ "$fq" -lt 3000 ]; then h24=1; elif [ "$fq" -lt 5925 ]; then h5=1; else h6=1; fi
+			done
+			[ "$h24" -eq 1 ] && fb="2,4"
+			[ "$h5" -eq 1 ] && fb="${fb:+$fb + }5"
+			[ "$h6" -eq 1 ] && fb="${fb:+$fb + }6"
+			[ -n "$fb" ] && bl="$fb ГГц"
+			{ is_int "${tmo:-x}" && [ "$tmo" -gt 0 ]; } || { is_int "${idle:-x}" && tmo="$idle"; }
+			# ScanResult.WIFI_STANDARD_*: 4 — 802.11n, 5 — ac, 6 — ax, 8 — be
+			case "$std" in 4) std="Wi-Fi 4" ;; 5) std="Wi-Fi 5" ;; 6) std="Wi-Fi 6" ;; 8) std="Wi-Fi 7" ;; *) std="" ;; esac
+			out="${GREEN}вкл.${NC}"
+			[ -n "$ssid" ] && out="$out · «$ssid»"
+			out="$out${secu:+ · $secu}${bl:+ · $bl}${std:+ · $std}${cl:+ · клиентов: $cl}"
+		else
+			out="выкл."
+			[ -n "$ssid" ] && out="$out · «$ssid»"
+			out="$out${secu:+ · $secu}${bl:+ · $bl}"
+		fi
+		[ "$hid" = "1" ] && out="$out · скрытая"
+		is_int "${maxc:-x}" && [ "$maxc" -gt 0 ] && out="$out · до $maxc клиентов"
+		if [ "$auto" = "1" ]; then
+			if is_int "${tmo:-x}" && [ "$tmo" -gt 0 ]; then out="$out · автоотключение $((tmo / 60000)) мин"
+			else out="$out · автоотключение"; fi
+		fi
+		kv "Точка доступа" "$out"
+	fi
+
+	# ── USB: порт Type-C, источник питания, функции и максимальная скорость порта
+	local pres="" typ2="" pr="" dr="" fn="" spd="" u
+	rd "$R/sys/class/power_supply/usb/present" && pres="$REPLY"
+	rd "$R/sys/class/power_supply/usb/real_type" && typ2="$REPLY"
+	if [ -z "$typ2" ] || [ "$typ2" = "Unknown" ]; then
+		rd "$R/sys/class/power_supply/usb/usb_type" && [[ "$REPLY" =~ \[([A-Za-z_]+)\] ]] && typ2="${BASH_REMATCH[1]}"
+	fi
+	rd "$R/sys/class/typec/port0/power_role" && [[ "$REPLY" =~ \[([a-z]+)\] ]] && pr="${BASH_REMATCH[1]}"
+	rd "$R/sys/class/typec/port0/data_role" && [[ "$REPLY" =~ \[([a-z]+)\] ]] && dr="${BASH_REMATCH[1]}"
+	for u in "$R"/sys/class/udc/*/maximum_speed; do rd "$u" && spd="$REPLY" && break; done
+	prop sys.usb.config; fn="$REPLY"
+	case "$spd" in super-speed*) spd="USB 3" ;; high-speed) spd="USB 2.0" ;; *) spd="" ;; esac
+	if [ -n "$pres$pr$spd" ]; then
+		local st2=""
+		if [ "$dr" = "host" ]; then st2="${GREEN}OTG${NC} (устройство подключено к телефону)"
+		elif [ "$pres" = "1" ]; then
+			case "$typ2" in
+				USB_PD|USB_PD_DRP) st2="зарядка USB PD" ;;
+				DCP|USB_DCP|USB_HVDCP*|HVDCP*) st2="зарядное устройство" ;;
+				SDP|USB) st2="компьютер" ;;
+				CDP|USB_CDP) st2="компьютер (зарядный порт)" ;;
+				*) st2="подключён" ;;
+			esac
+		else st2="не подключён"; fi
+		local fns=""
+		[ -n "$fn" ] && [ "$fn" != "none" ] && fns="${fn^^}" && fns="${fns//,/, }"
+		[[ " $tether" == *" ncm"* || " $tether" == *" rndis"* || " $tether" == *" usb"* ]] && fns="${fns:+$fns, }режим модема"
+		kv "USB" "$st2${spd:+ · порт $spd}${fns:+ · $fns}"
+	fi
+
+	# ── UWB (перенесено из «Google Pixel»): служба и переключатель в настройках
+	local uwb
+	uwb=$(dumpsys uwb 2>/dev/null | awk '/settings_toggle=/ { t = ($0 ~ /settings_toggle=true/) ? "on" : "off" } /^Device state =/ { s = $4 } END { if (s != "") print t " " s }')
+	if [ -n "$uwb" ]; then
+		case "$uwb" in
+			"on READY"*) kv "UWB" "${GREEN}включён${NC}" ;;
+			off*)        kv "UWB" "выключен" ;;
+			*)           kv "UWB" "${uwb#* } ${DIM}(состояние службы)${NC}" ;;
+		esac
+	fi
+
+	# ── ИК-порт (пульт): устройство lirc
+	compgen -G "$R/dev/lirc*" >/dev/null && kv "ИК-порт" "есть"
+	return 0
+}
+
 # ── Pixel ────────────────────────────────────────────────────────────────────
 
 check_pixel_security() {
@@ -1799,16 +2092,7 @@ check_pixel_security() {
 		kv "Отпечаток" "$fpl"
 	fi
 
-	# [3.11] UWB: состояние службы и переключатель в настройках
-	local uwb
-	uwb=$(dumpsys uwb 2>/dev/null | awk '/settings_toggle=/ { t = ($0 ~ /settings_toggle=true/) ? "on" : "off" } /^Device state =/ { s = $4 } END { if (s != "") print t " " s }')
-	if [ -n "$uwb" ]; then
-		case "$uwb" in
-			"on READY"*) kv "UWB" "${GREEN}включён${NC}" ;;
-			off*)        kv "UWB" "выключен" ;;
-			*)           kv "UWB" "${uwb#* } ${DIM}(состояние службы)${NC}" ;;
-		esac
-	fi
+	# [3.13] UWB перенесён в «Другие подключения»
 	# [3.7.1] Модем сверяем с тем, что ожидает прошивка (ro.build.expect.baseband):
 	# расхождение бывает после ручной прошивки без radio-образа или кривой OTA.
 	local bb exp_bb
@@ -1896,6 +2180,24 @@ print_system() {
 	[[ "$off" =~ ^[+-][0-9]{4}$ ]] && off="UTC${off:0:3}:${off:3:2}" || off=""
 	[ "$(settings get global auto_time_zone 2>/dev/null)" = "1" ] && auto=" ${DIM}· авто${NC}"
 	[ -n "$tz$off" ] && kv "Часовой пояс" "${tz:-?}${off:+ ($off)}$auto"
+	# [3.12.1] Формат часов: settings system time_12_24 = 12 / 24. Пусто — включено
+	# «Использовать формат языка»: тогда формат задаёт первый язык системы.
+	# 12-часовой по умолчанию (CLDR) — у США, Канады, Австралии, Новой Зеландии,
+	# Индии, Филиппин, Пакистана, Египта, Саудовской Аравии, Кореи и Тайваня.
+	local f12 lc
+	f12=$(settings get system time_12_24 2>/dev/null)
+	case "$f12" in
+		12|24) kv "Формат часов" "$f12-часовой" ;;
+		*)
+			prop persist.sys.locale; lc="${REPLY%%,*}"
+			[ -z "$lc" ] && { prop ro.product.locale; lc="$REPLY"; }
+			lc="${lc%%-u-*}"; lc="${lc//_/-}"
+			case "$lc" in
+				*-US|*-CA|*-AU|*-NZ|*-IN|*-PH|*-PK|*-EG|*-SA|*-KR|*-TW|ko|hi) f12=12 ;;
+				*) f12=24 ;;
+			esac
+			kv "Формат часов" "$f12-часовой ${DIM}(по языку${lc:+ $lc})${NC}" ;;
+	esac
 	detect_root
 	kv "Root" "${GREEN}есть${NC} · $ROOT_INFO"
 	[ -n "$ZYGISK_INFO" ] && kv "Zygisk" "$ZYGISK_INFO"
@@ -2532,6 +2834,7 @@ run_monitor() {
 	check_battery
 	check_wakelocks
 	check_network
+	check_connections
 	check_iperf3_speed
 	check_logcat
 	print_top
@@ -2825,3 +3128,13 @@ fi
 #  строка «DRM» (Widevine: программная или аппаратная защита, версия CDM).
 #  Заголовок «Модули Magisk/KernelSU/APatch» — с версией менеджера; в «Root»
 #  версия больше не дублируется.
+#
+# Изменения v3.12.1: «Система» — формат часов (12- или 24-часовой; если включено
+#  «Использовать формат языка» — по первому языку системы).
+#
+# Изменения v3.13: новая секция «Другие подключения» под «Сетью»: Bluetooth
+#  (вкл./выкл., подключённые устройства с кодеком и зарядом — у наушников с Fast
+#  Pair по каждому наушнику и кейсу; с -e — сохранённые устройства), NFC с
+#  контроллером и приложением бесконтактной оплаты, точка доступа (настройки,
+#  а если работает — частоты, стандарт и клиенты), USB (источник питания,
+#  OTG, скорость порта, функции), UWB (перенесён из «Google Pixel»), ИК-порт.
