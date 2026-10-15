@@ -1674,7 +1674,9 @@ check_partitions() {
 # [3.11] Последний замер приложения «Термометр» (Pixel 8 Pro – 10 Pro XL).
 # Значение берём у приложения, а не у датчика: сырой сигнал MLX90632 (≈6 °C при
 # показанных 4,5 °C) приложение пересчитывает закрытым алгоритмом с учётом
-# материала и окружения. Файл files/object_temperature.pb — protobuf:
+# материала и окружения. Замеры температуры тела приложение хранит отдельно
+# (bodytemperature/) — их не читаем: это медицинские данные.
+# Файл files/object_temperature.pb — protobuf:
 #   1 { 1: float °C, 2: Timestamp { 1: секунды, 2: наносекунды } }
 PIXEL_THERMO_AWK='
 # Последний замер Pixel Thermometer (files/object_temperature.pb, protobuf):
@@ -1717,12 +1719,7 @@ check_pixel_security() {
 	kv "Платформа" "$gen ${DIM}($plat)${NC}"
 
 	if [ -d "$R/sys/class/edgetpu" ] || compgen -G "$R/dev/edgetpu*" >/dev/null; then
-		# [3.11] Версия прошивки TPU: «1.0 vii=2 kci=3 cl=…» → «1.0»
-		local tfw="" f
-		for f in "$R"/sys/class/edgetpu/*/device/firmware_version; do
-			rd "$f" && [ -n "$REPLY" ] && { tfw="${REPLY%% *}"; break; }
-		done
-		kv "Нейроблок TPU" "${GREEN}есть${NC}${tfw:+ · прошивка $tfw} ${DIM}(edgetpu)${NC}"
+		kv "Нейроблок TPU" "${GREEN}есть${NC} ${DIM}(edgetpu)${NC}"
 	else
 		kv "Нейроблок TPU" "не найден"
 	fi
@@ -1749,7 +1746,7 @@ check_pixel_security() {
 			printf -v when '%(%d.%m.%Y)T' "$ts"; printf -v today '%(%d.%m.%Y)T' -1
 			if [ "$when" = "$today" ]; then printf -v when 'сегодня %(%H:%M)T' "$ts"
 			else printf -v when '%(%d.%m.%Y %H:%M)T' "$ts"; fi
-			kv "Термометр" "${tt}°C ${DIM}· последний замер ${when}${NC}"
+			kv "Термометр" "${tt}°C ${DIM}· объект · ${when}${NC}"
 		else
 			kv "Термометр" "есть ${DIM}(MLX90632) · замеров нет${NC}"
 		fi
@@ -2761,7 +2758,7 @@ fi
 #  (неразрывные пробелы), а не обрывается перед «(старый)».
 #
 # Изменения v3.11: «Google Pixel» — последний замер приложения «Термометр»
-#  (Pixel 8 Pro – 10 Pro XL), прошивки TPU и Titan, сборка AICore (среда
+#  предметов (Pixel 8 Pro – 10 Pro XL), прошивка Titan, сборка AICore (среда
 #  Gemini Nano), сканер отпечатков, UWB. Проверено на Pixel 8 Pro.
 #  «Модули LSPosed»: на старом LSPosed без CLI и кэша — подсказка про Vector 2.2+
 #  вместо ложного «модулей нет».
