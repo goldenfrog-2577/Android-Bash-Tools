@@ -205,6 +205,27 @@ wrap_text() {
 		read -ra words <<< "$seg"
 		for word in "${words[@]}"; do
 			strip_ansi "$word"; char_len "$REPLY"; wlen=$REPLY
+			# [3.13.1] Слово длиннее строки (версия ядра, имя сборки) — режем после
+			# «- = / . , _» (знак остаётся в конце строки); если их нет — по символам.
+			# Раньше такое слово уходило целиком, и его переносил уже терминал —
+			# с начала строки, мимо колонки значений.
+			if [ "$wlen" -gt "$w" ] && [[ "$word" != *$'\e'* ]]; then
+				[ "$llen" -gt 0 ] && out="$out$line"$'\n'
+				line=""; llen=0
+				local part rest2="$word" plen
+				while [ -n "$rest2" ]; do
+					if [[ "$rest2" =~ ^([^-=/.,_]*[-=/.,_])(.+)$ ]]; then part="${BASH_REMATCH[1]}"; rest2="${BASH_REMATCH[2]}"
+					else part="$rest2"; rest2=""; fi
+					char_len "$part"; plen=$REPLY
+					while [ "$plen" -gt "$w" ]; do      # кусок без дефисов длиннее строки
+						[ "$llen" -gt 0 ] && { out="$out$line"$'\n'; line=""; llen=0; }
+						out="$out${part:0:$w}"$'\n'; part="${part:$w}"; char_len "$part"; plen=$REPLY
+					done
+					if [ $((llen + plen)) -le "$w" ]; then line="$line$part"; llen=$((llen + plen))
+					else out="$out$line"$'\n'; line="$part"; llen=$plen; fi
+				done
+				continue
+			fi
 			if [ "$llen" -gt 0 ] && [ $((llen + 1 + wlen)) -le "$w" ]; then
 				line="$line $word"; llen=$((llen + 1 + wlen))
 			else
@@ -3145,4 +3166,7 @@ fi
 #  OTG, скорость порта, функции), UWB (перенесён из «Google Pixel»), ИК-порт.
 #
 # Изменения v3.13.1: «Точка доступа» — имя без XML-экранирования
-#  (было «&quot;Pixel 8 Pro&quot;»).
+#  (было «&quot;Pixel 8 Pro&quot;»). Перенос строк: слово длиннее строки
+#  (например, версия ядра 4.19.325-cip135-…) режется по дефисам, точкам, «=»
+#  и «/» и продолжается
+#  с колонки значений, а не с начала строки.
