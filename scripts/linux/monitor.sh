@@ -1779,7 +1779,7 @@ check_pixel_security() {
 		local fpl=""
 		[ "$udfps" -eq 1 ] && fpl="под экраном"
 		[ -n "$fpv" ] && fpl="${fpl:+$fpl · }$fpv"
-		kv "Отпечатки" "$fpl"
+		kv "Отпечаток" "$fpl"
 	fi
 
 	# [3.11] UWB: состояние службы и переключатель в настройках
