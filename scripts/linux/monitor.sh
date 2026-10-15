@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.11.1 — мониторинг состояния rooted Android
+# monitor.sh v3.12 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.11.1"
+readonly VERSION="3.12"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -946,13 +946,32 @@ check_gpu() {
 	fi
 
 	# Экран: разрешение и текущая частота обновления (период vsync из SurfaceFlinger)
-	local res period hz=""
-	res=$(wm size 2>/dev/null | awk -F': ' '/Override/ {o=$2} /Physical/ {p=$2} END {print (o ? o " (физ. " p ")" : p)}')
+	local res period hz="" wsz
+	wsz=$(wm size 2>/dev/null)
+	res=$(printf '%s\n' "$wsz" | awk -F': ' '/Override/ {o=$2} /Physical/ {p=$2} END {print (o ? o " (физ. " p ")" : p)}')
 	period=$(dumpsys SurfaceFlinger --latency 2>/dev/null | head -n 1)
 	is_int "${period:-x}" && [ "$period" -gt 0 ] && hz=$(( (1000000000 + period / 2) / period ))
 	detect_ltpo
 	kv "Экран" "${res:-?}${hz:+ · $hz Гц}${REPLY:+ · $REPLY}"
 	[ -n "$PANEL_MODEL" ] && kv "Панель" "$PANEL_MODEL"
+
+	# [3.12] Плотность и минимальная ширина (smallest width, dp) — то, по чему
+	# приложения выбирают раскладку. sw = короткая сторона × 160 / dpi, с
+	# округлением, как в системе (Pixel 8 Pro: 1344 × 160 / 480 = 448 dp).
+	# Если плотность или размер изменены (wm density / wm size), берём изменённые.
+	local dens a b
+	dens=$(wm density 2>/dev/null | awk -F': ' '/Override/ {o=$2} /Physical/ {p=$2} END {print p " " o}')
+	read -r a b <<< "$dens"
+	if is_int "${a:-x}" && [ "$a" -gt 0 ]; then
+		local d="${b:-$a}" sz w h sw=""
+		sz=$(printf '%s\n' "$wsz" | awk -F': ' '/Override/ {o=$2} /Physical/ {p=$2} END {print (o ? o : p)}')
+		w="${sz%%x*}"; h="${sz##*x}"
+		if is_int "${d:-x}" && [ "$d" -gt 0 ] && is_int "${w:-x}" && is_int "${h:-x}"; then
+			[ "$h" -lt "$w" ] && w="$h"
+			sw=$(( (w * 160 + d / 2) / d ))
+		fi
+		kv "Плотность" "$d dpi${b:+ ${DIM}(физ. $a)${NC}}${sw:+ · $sw dp}"
+	fi
 }
 
 # [3.1] LTPO / адаптивная частота экрана → REPLY («LTPO 1–120 Гц» или пусто).
@@ -1678,35 +1697,6 @@ check_partitions() {
 
 # ── Pixel ────────────────────────────────────────────────────────────────────
 
-# [3.11] Последний замер приложения «Термометр» (Pixel 8 Pro – 10 Pro XL).
-# Значение берём у приложения, а не у датчика: сырой сигнал MLX90632 (≈6 °C при
-# показанных 4,5 °C) приложение пересчитывает закрытым алгоритмом с учётом
-# материала и окружения. Замеры температуры тела приложение хранит отдельно
-# (bodytemperature/) — их не читаем: это медицинские данные.
-# Файл files/object_temperature.pb — protobuf:
-#   1 { 1: float °C, 2: Timestamp { 1: секунды, 2: наносекунды } }
-PIXEL_THERMO_AWK='
-# Последний замер Pixel Thermometer (files/object_temperature.pb, protobuf):
-#   1 { 1: float °C, 2: Timestamp { 1: секунды, 2: наносекунды } } → «°C<TAB>секунды»
-function varint(   v, m, c) { v = 0; m = 1; do { c = b[P++]; v += (c % 128) * m; m *= 128 } while (c >= 128 && P < n); return v }
-function flt(o,   ex, mt) {
-	ex = (b[o + 3] % 128) * 2 + int(b[o + 2] / 128); mt = (b[o + 2] % 128) * 65536 + b[o + 1] * 256 + b[o]
-	return (b[o + 3] >= 128 ? -1 : 1) * (ex == 0 ? mt * 2 ^ -149 : (1 + mt / 8388608) * 2 ^ (ex - 127))
-}
-function walk(e, path,   k, f, w, l, p) {
-	while (P < e) {
-		k = varint(); f = int(k / 8); w = k % 8; p = path "." f
-		if (w == 0) { k = varint(); if (p == ".1.2.1") sec = k }
-		else if (w == 5) { if (p == ".1.1") t = flt(P); P += 4 }
-		else if (w == 1) P += 8
-		else if (w == 2) { l = varint(); walk(P + l, p) }
-		else return
-	}
-}
-{ for (i = 1; i <= NF; i++) b[n++] = $i + 0 }
-END { P = 0; walk(n, ""); if (t != "" && sec > 0) printf "%.1f\t%d\n", t, sec }
-'
-
 check_pixel_security() {
 	prop ro.product.manufacturer
 	[[ "${REPLY,,}" == *google* ]] || return 0
@@ -1739,24 +1729,44 @@ check_pixel_security() {
 	else
 		kv "Чип защиты" "${YELLOW}не найден${NC}"
 	fi
+	# [3.12] AOC — отдельный экономичный процессор для «Always-On»-функций
 	if [ -e "$R/dev/aoc" ] || [ -d "$R/sys/devices/platform/aoc" ]; then
-		kv "AOC" "есть ${DIM}(Always-On Compute)${NC}"
+		kv "AOC" "${GREEN}есть${NC} ${DIM}(Always-On Compute)${NC}"
+	else
+		kv "AOC" "${RED}нет${NC}"
 	fi
 
-	# [3.11] Термометр: датчик MLX90632 в списке сенсоров → последний замер приложения
-	if dumpsys sensorservice 2>/dev/null | grep -q 'fir_temperature'; then
-		local tf="$R/data/user/0/com.google.android.apps.pixel.health/files/object_temperature.pb" tt="" ts="" when today
-		if [ -f "$tf" ]; then
-			read -r tt ts <<< "$(od -An -v -tu1 "$tf" 2>/dev/null | LC_ALL=C awk "$PIXEL_THERMO_AWK" 2>/dev/null)"
+	# [3.12] DRM: Widevine по данным его HAL (dumpsys …IDrmFactory/widevine).
+	# Уровень L1/L3 из поля default_security_level не берём: на Pixel 8 Pro оно
+	# отставало на одно переключение (L1 при программном модуле). Надёжно другое:
+	# модуль OEMCrypto. «Software» — программная защита, это всегда L3;
+	# иначе — аппаратный модуль в доверенной среде (TEE). Программный режим
+	# включается в «Для разработчиков» → «Настройки DRM для медиаконтента»
+	# (свойство persist.drm.forcel3.enabled).
+	local wv wsoc wtee wcdm force
+	wv=$(dumpsys android.hardware.drm.IDrmFactory/widevine 2>/dev/null)
+	if [[ "$wv" == *oemcrypto_build_info* ]]; then
+		wsoc=$(printf '%s\n' "$wv" | sed -n 's/.*"soc_model": *"\([^"]*\)".*/\1/p' | head -n 1)
+		wtee=$(printf '%s\n' "$wv" | sed -n 's/.*"tee_os": *"\([^"]*\)".*/\1/p' | head -n 1)
+		wcdm=$(printf '%s\n' "$wv" | sed -n 's/^ *version_widevine_cdm: *\([0-9.]*\).*/\1/p' | head -n 1)
+		prop persist.drm.forcel3.enabled; force="$REPLY"
+		if [ "$wsoc" = "Software" ]; then
+			kv "DRM" "Widevine ${YELLOW}L3 · программная защита${NC}${wcdm:+ ${DIM}· CDM $wcdm${NC}}"
+			[ "$force" = "true" ] && [ "$EXTENDED" -eq 1 ] && note "включено в «Для разработчиков» → «Настройки DRM для медиаконтента»"
+		elif [ -n "$wsoc" ]; then
+			wtee="${wtee:-TEE}"; [ "$wtee" = "TRUSTY" ] && wtee="Trusty"
+			kv "DRM" "Widevine ${GREEN}аппаратная защита${NC} ${DIM}($wtee)${NC}${wcdm:+ ${DIM}· CDM $wcdm${NC}}"
 		fi
-		if [ -n "$tt" ] && is_int "${ts:-x}"; then
-			printf -v when '%(%d.%m.%Y)T' "$ts"; printf -v today '%(%d.%m.%Y)T' -1
-			if [ "$when" = "$today" ]; then printf -v when 'сегодня %(%H:%M)T' "$ts"
-			else printf -v when '%(%d.%m.%Y %H:%M)T' "$ts"; fi
-			kv "Термометр" "${tt}°C ${DIM}· объект · ${when}${NC}"
-		else
-			kv "Термометр" "есть ${DIM}(MLX90632) · замеров нет${NC}"
-		fi
+	fi
+
+	# [3.12] Термометр: только наличие датчика. Название — первое слово имени
+	# сенсора типа fir_temperature («MLX90632 FIR Temperature | Melexis …»).
+	local fir
+	fir=$(dumpsys sensorservice 2>/dev/null | awk -F'|' '/fir_temperature\(/ { n = $1; sub(/^[^)]*\) */, "", n); split(n, a, " "); print a[1]; exit }')
+	if [ -n "$fir" ]; then
+		kv "Термометр" "есть · датчик $fir"
+	else
+		kv "Термометр" "нет"
 	fi
 
 	# [3.11] AICore — системная среда Gemini Nano. Сборка из versionName
@@ -1817,14 +1827,15 @@ check_pixel_security() {
 
 # ── Система ──────────────────────────────────────────────────────────────────
 
-ROOT_INFO=""; ZYGISK_INFO=""; ROOT_KIND="ROOT"   # ROOT_KIND — для заголовка «МОДУЛИ …»
+# [3.12] ROOT_VER — версия менеджера root для подзаголовка «Модули …»
+ROOT_INFO=""; ZYGISK_INFO=""; ROOT_KIND="ROOT"; ROOT_VER=""   # ROOT_KIND — для заголовка «МОДУЛИ …»
 detect_root() {
-	ROOT_INFO=""; ZYGISK_INFO=""; ROOT_KIND="ROOT"
+	ROOT_INFO=""; ZYGISK_INFO=""; ROOT_KIND="ROOT"; ROOT_VER=""
 	if command -v magisk >/dev/null 2>&1 || [ -d "$R/data/adb/magisk" ]; then
 		local v vc
 		v=$(magisk -v 2>/dev/null); v="${v%%:*}"
 		vc=$(magisk -V 2>/dev/null)
-		ROOT_INFO="Magisk ${v:-?}${vc:+ ($vc)}"; ROOT_KIND="MAGISK"
+		ROOT_INFO="Magisk"; ROOT_KIND="MAGISK"; ROOT_VER="Magisk ${v:-?}${vc:+ · $vc}"
 		# Zygisk: настройка в БД Magisk + реальное присутствие в zygote64
 		local on="" active=0 pid
 		# [3.7] Если --sqlite не сработал, настройка неизвестна («?») — тогда не называем
@@ -1841,8 +1852,24 @@ detect_root() {
 		else ZYGISK_INFO="выключен"; fi
 	elif [ -d "$R/data/adb/ksu" ] || command -v ksud >/dev/null 2>&1; then
 		ROOT_INFO="KernelSU"; ROOT_KIND="KERNELSU"
+		# [3.12] По исходникам ksud (не проверено на устройстве): «ksud -V» →
+		# «ksud v1.0.5 (uapi: 2)», «ksud debug version» → «Kernel Version: 12345»
+		local k kv_ kc t=""
+		command -v timeout >/dev/null 2>&1 && t="timeout 5"
+		for k in ksud "$R/data/adb/ksud"; do command -v "$k" >/dev/null 2>&1 && break; k=""; done
+		if [ -n "$k" ]; then
+			kv_=$($t "$k" -V 2>/dev/null | head -n 1); kv_="${kv_#ksud }"; kv_="${kv_%% (*}"
+			kc=$($t "$k" debug version 2>/dev/null | sed -n 's/^Kernel Version: *//p')
+			ROOT_VER="KernelSU${kv_:+ $kv_}${kc:+ · $kc}"
+		fi
 	elif [ -d "$R/data/adb/ap" ] || command -v apd >/dev/null 2>&1; then
 		ROOT_INFO="APatch"; ROOT_KIND="APATCH"
+		# [3.12] По исходникам apd (не проверено): «apd -V» → «apd 11142» (код версии)
+		local a av t=""
+		command -v timeout >/dev/null 2>&1 && t="timeout 5"
+		for a in apd "$R/data/adb/apd"; do command -v "$a" >/dev/null 2>&1 && break; a=""; done
+		[ -n "$a" ] && av=$($t "$a" -V 2>/dev/null | head -n 1) && av="${av#apd }"
+		ROOT_VER="APatch${av:+ $av}"
 	else
 		ROOT_INFO="root (метод не определён)"
 	fi
@@ -1862,6 +1889,13 @@ uptime_str() {
 print_system() {
 	section "СИСТЕМА"
 	uptime_str; kv "Время работы" "$REPLY"
+	# [3.12] Часовой пояс: имя зоны + смещение от UTC; «авто» — по сети
+	local tz off auto
+	prop persist.sys.timezone; tz="$REPLY"
+	off=$(date +%z 2>/dev/null)
+	[[ "$off" =~ ^[+-][0-9]{4}$ ]] && off="UTC${off:0:3}:${off:3:2}" || off=""
+	[ "$(settings get global auto_time_zone 2>/dev/null)" = "1" ] && auto=" ${DIM}· авто${NC}"
+	[ -n "$tz$off" ] && kv "Часовой пояс" "${tz:-?}${off:+ ($off)}$auto"
 	detect_root
 	kv "Root" "${GREEN}есть${NC} · $ROOT_INFO"
 	[ -n "$ZYGISK_INFO" ] && kv "Zygisk" "$ZYGISK_INFO"
@@ -1947,7 +1981,7 @@ print_modules() {
 	[ -z "$ROOT_INFO" ] && detect_root
 	local dir="$R/data/adb/modules" upd="$R/data/adb/modules_update"
 	[ -d "$dir" ] || [ -d "$upd" ] || [ "$ROOT_KIND" != "ROOT" ] || return 0
-	section "МОДУЛИ $ROOT_KIND"
+	section "МОДУЛИ $ROOT_KIND" "${ROOT_VER:+($ROOT_VER)}"
 
 	local -a ids=()
 	local m id
@@ -2784,3 +2818,10 @@ fi
 #  процесс с тем же PID за работающий монитор; «Ток» при статусах «заряжена» и
 #  «не заряжается» — без знака с пометкой «направление не определено»;
 #  строка «Страница» не выводит «0 КБ».
+#
+# Изменения v3.12: «Система» — часовой пояс со смещением от UTC. «Графика» —
+#  плотность (dpi) и минимальная ширина (dp). «Google Pixel» — «Термометр» только
+#  сообщает, есть ли датчик и как он называется; «AOC» — есть/нет цветом; новая
+#  строка «DRM» (Widevine: программная или аппаратная защита, версия CDM).
+#  Заголовок «Модули Magisk/KernelSU/APatch» — с версией менеджера; в «Root»
+#  версия больше не дублируется.
