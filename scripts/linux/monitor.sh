@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.10.1 — мониторинг состояния rooted Android
+# monitor.sh v3.11 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.10.1"
+readonly VERSION="3.11"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -1671,6 +1671,35 @@ check_partitions() {
 
 # ── Pixel ────────────────────────────────────────────────────────────────────
 
+# [3.11] Последний замер приложения «Термометр» (Pixel 8 Pro – 10 Pro XL).
+# Значение берём у приложения, а не у датчика: сырой сигнал MLX90632 (≈6 °C при
+# показанных 4,5 °C) приложение пересчитывает закрытым алгоритмом с учётом
+# материала и окружения. Замеры температуры тела приложение хранит отдельно
+# (bodytemperature/) — их не читаем: это медицинские данные.
+# Файл files/object_temperature.pb — protobuf:
+#   1 { 1: float °C, 2: Timestamp { 1: секунды, 2: наносекунды } }
+PIXEL_THERMO_AWK='
+# Последний замер Pixel Thermometer (files/object_temperature.pb, protobuf):
+#   1 { 1: float °C, 2: Timestamp { 1: секунды, 2: наносекунды } } → «°C<TAB>секунды»
+function varint(   v, m, c) { v = 0; m = 1; do { c = b[P++]; v += (c % 128) * m; m *= 128 } while (c >= 128 && P < n); return v }
+function flt(o,   ex, mt) {
+	ex = (b[o + 3] % 128) * 2 + int(b[o + 2] / 128); mt = (b[o + 2] % 128) * 65536 + b[o + 1] * 256 + b[o]
+	return (b[o + 3] >= 128 ? -1 : 1) * (ex == 0 ? mt * 2 ^ -149 : (1 + mt / 8388608) * 2 ^ (ex - 127))
+}
+function walk(e, path,   k, f, w, l, p) {
+	while (P < e) {
+		k = varint(); f = int(k / 8); w = k % 8; p = path "." f
+		if (w == 0) { k = varint(); if (p == ".1.2.1") sec = k }
+		else if (w == 5) { if (p == ".1.1") t = flt(P); P += 4 }
+		else if (w == 1) P += 8
+		else if (w == 2) { l = varint(); walk(P + l, p) }
+		else return
+	}
+}
+{ for (i = 1; i <= NF; i++) b[n++] = $i + 0 }
+END { P = 0; walk(n, ""); if (t != "" && sec > 0) printf "%.1f\t%d\n", t, sec }
+'
+
 check_pixel_security() {
 	prop ro.product.manufacturer
 	[[ "${REPLY,,}" == *google* ]] || return 0
@@ -1696,13 +1725,72 @@ check_pixel_security() {
 	fi
 
 	prop ro.strongbox.model; local sb="$REPLY"
+	# [3.11] Прошивка Titan: vendor.nos.citadel.version = «0.1.114/3f217f1f 0.3.2/…» → «0.1.114»
+	prop vendor.nos.citadel.version; local tv="${REPLY%%/*}"
 	if [ -e "$R/dev/gsc0" ] || [ -e "$R/dev/citadel0" ] || [ -n "$sb" ]; then
-		kv "Чип защиты" "${GREEN}${sb:-Titan M}${NC} ${DIM}(StrongBox)${NC}"
+		kv "Чип защиты" "${GREEN}${sb:-Titan M}${NC}${tv:+ · прошивка $tv} ${DIM}(StrongBox)${NC}"
 	else
 		kv "Чип защиты" "${YELLOW}не найден${NC}"
 	fi
 	if [ -e "$R/dev/aoc" ] || [ -d "$R/sys/devices/platform/aoc" ]; then
 		kv "AOC" "есть ${DIM}(Always-On Compute)${NC}"
+	fi
+
+	# [3.11] Термометр: датчик MLX90632 в списке сенсоров → последний замер приложения
+	if dumpsys sensorservice 2>/dev/null | grep -q 'fir_temperature'; then
+		local tf="$R/data/user/0/com.google.android.apps.pixel.health/files/object_temperature.pb" tt="" ts="" when today
+		if [ -f "$tf" ]; then
+			read -r tt ts <<< "$(od -An -v -tu1 "$tf" 2>/dev/null | LC_ALL=C awk "$PIXEL_THERMO_AWK" 2>/dev/null)"
+		fi
+		if [ -n "$tt" ] && is_int "${ts:-x}"; then
+			printf -v when '%(%d.%m.%Y)T' "$ts"; printf -v today '%(%d.%m.%Y)T' -1
+			if [ "$when" = "$today" ]; then printf -v when 'сегодня %(%H:%M)T' "$ts"
+			else printf -v when '%(%d.%m.%Y %H:%M)T' "$ts"; fi
+			kv "Термометр" "${tt}°C ${DIM}· объект · ${when}${NC}"
+		else
+			kv "Термометр" "есть ${DIM}(MLX90632) · замеров нет${NC}"
+		fi
+	fi
+
+	# [3.11] AICore — системная среда Gemini Nano. Сборка из versionName
+	# («0.release.prod_aicore_20260917.00_RC01» → 17.09.2026). Есть ли скачанная
+	# модель, по файлам не видно — поэтому про модель не пишем.
+	local ai
+	ai=$(dumpsys package com.google.android.aicore 2>/dev/null | sed -n 's/^ *versionName=//p' | head -n 1)
+	if [ -n "$ai" ]; then
+		if [[ "$ai" =~ _(20[0-9]{2})([01][0-9])([0-3][0-9]) ]]; then
+			ai="сборка ${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
+		fi
+		pm list packages -d 2>/dev/null | grep -qx 'package:com.google.android.aicore' && ai="${YELLOW}отключён${NC} ${DIM}($ai)${NC}"
+		kv "AICore" "$ai ${DIM}(среда Gemini Nano)${NC}"
+	fi
+
+	# [3.11] Сканер отпечатков: производитель — по службе vendor.fingerprint-<имя>,
+	# «под экраном» — по свойствам persist.vendor.udfps.*
+	local k fpv="" udfps=0
+	for k in "${!PROP[@]}"; do
+		case "$k" in
+			init.svc.vendor.fingerprint-*) fpv="${k#init.svc.vendor.fingerprint-}" ;;
+			persist.vendor.udfps.*) udfps=1 ;;
+		esac
+	done
+	if [ -n "$fpv" ] || [ "$udfps" -eq 1 ]; then
+		case "$fpv" in goodix) fpv="Goodix" ;; fpc) fpv="FPC" ;; qcom|qti) fpv="Qualcomm" ;; esac
+		local fpl=""
+		[ "$udfps" -eq 1 ] && fpl="под экраном"
+		[ -n "$fpv" ] && fpl="${fpl:+$fpl · }$fpv"
+		kv "Отпечаток" "$fpl"
+	fi
+
+	# [3.11] UWB: состояние службы и переключатель в настройках
+	local uwb
+	uwb=$(dumpsys uwb 2>/dev/null | awk '/settings_toggle=/ { t = ($0 ~ /settings_toggle=true/) ? "on" : "off" } /^Device state =/ { s = $4 } END { if (s != "") print t " " s }')
+	if [ -n "$uwb" ]; then
+		case "$uwb" in
+			"on READY"*) kv "UWB" "${GREEN}включён${NC}" ;;
+			off*)        kv "UWB" "выключен" ;;
+			*)           kv "UWB" "${uwb#* } ${DIM}(состояние службы)${NC}" ;;
+		esac
 	fi
 	# [3.7.1] Модем сверяем с тем, что ожидает прошивка (ro.build.expect.baseband):
 	# расхождение бывает после ручной прошивки без radio-образа или кривой OTA.
@@ -2043,6 +2131,12 @@ print_lsposed() {
 	[ -e "$fwdir/disable" ] && sub="($fork${fwver:+ $fwver} · отключён)"
 	section "МОДУЛИ LSPOSED" "$sub"
 	[ "$cli_ok" -eq 0 ] && [ -n "$cli" ] && [ ! -e "$fwdir/disable" ] && note "CLI фреймворка не ответил — статус модулей неизвестен"
+	# [3.11] Старый LSPosed без CLI и без кэша: список модулей скрипту не прочитать —
+	# не пишем «модулей нет», а говорим, что нужен свежий Vector.
+	if [ -z "$cli" ] && [ -z "$cache" ]; then
+		emit "  ${YELLOW}Список модулей недоступен: нужен свежий форк Vector от JingMatrix (2.2+)${NC}"
+		return 0
+	fi
 	if [ -z "$list" ]; then
 		emit "  ${RED}Модули не установлены, не обнаружены или не активированы${NC}"
 		return 0
@@ -2662,3 +2756,9 @@ fi
 #
 # Изменения v3.10.1: «Модули LSPosed» — «API 93 (старый)» переносится целиком
 #  (неразрывные пробелы), а не обрывается перед «(старый)».
+#
+# Изменения v3.11: «Google Pixel» — последний замер приложения «Термометр»
+#  предметов (Pixel 8 Pro – 10 Pro XL), прошивка Titan, сборка AICore (среда
+#  Gemini Nano), сканер отпечатков, UWB. Проверено на Pixel 8 Pro.
+#  «Модули LSPosed»: на старом LSPosed без CLI и кэша — подсказка про Vector 2.2+
+#  вместо ложного «модулей нет».
