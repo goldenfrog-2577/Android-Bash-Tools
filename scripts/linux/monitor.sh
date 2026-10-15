@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.13.1 — мониторинг состояния rooted Android
+# monitor.sh v3.14 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.13.1"
+readonly VERSION="3.14"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -993,6 +993,26 @@ check_gpu() {
 		fi
 		kv "Плотность" "$d dpi${b:+ ${DIM}(физ. $a)${NC}}${sw:+ · $sw dp}"
 	fi
+
+	# [3.14] Аппаратные видеокодеки (порядок — от новых форматов к старым)
+	local -a cxf=()
+	local f cx dec="" enc="" fm k2 v2
+	for f in "$R"/vendor/etc/media_codecs*.xml "$R"/odm/etc/media_codecs*.xml; do can_read "$f" && cxf+=("$f"); done
+	if [ "${#cxf[@]}" -gt 0 ]; then
+		cx=$(LC_ALL=C awk "$CODEC_AWK" "${cxf[@]}" 2>/dev/null | sort -u)
+		for fm in AV1 HEVC VP9 "Dolby Vision" APV H.264 VP8 MPEG-4 MPEG-2 H.263; do
+			while IFS=$'\t' read -r k2 v2; do
+				[ "$v2" = "$fm" ] || continue
+				[ "$k2" = "D" ] && dec="${dec:+$dec · }$fm"
+				[ "$k2" = "E" ] && enc="${enc:+$enc · }$fm"
+			done <<< "$cx"
+		done
+		if [ -n "$dec" ]; then
+			[[ " $dec " == *" AV1 "* ]] || dec="$dec ${DIM}(AV1 — только программно)${NC}"
+			kv "Видеодекодеры" "$dec"
+		fi
+		[ "$EXTENDED" -eq 1 ] && [ -n "$enc" ] && kv "Видеокодеры" "$enc"
+	fi
 }
 
 # [3.1] LTPO / адаптивная частота экрана → REPLY («LTPO 1–120 Гц» или пусто).
@@ -1360,6 +1380,67 @@ load_connectivity() {
 	fi
 }
 
+# [3.14] Аппаратные видеокодеки: списки вендора /vendor/etc и /odm/etc
+# media_codecs*.xml. Программные кодеки Google (c2.android.*, OMX.google.*) и
+# помеченные software-codec не считаем: они есть на любом телефоне.
+# c2.google.* в /vendor — это аппаратный блок Tensor (BigOcean), а не программа.
+CODEC_AWK='
+# media_codecs*.xml → «D|E<TAB>формат» для аппаратных видеокодеков
+function attr(s, a,   r) { r = ""; if (match(s, a "=\"[^\"]*\"")) { r = substr(s, RSTART + length(a) + 2, RLENGTH - length(a) - 3) } return r }
+function flush() {
+	if (nm != "" && !sw && nm !~ /^(c2\.android\.|OMX\.google\.|c2\.vda\.)/) for (t in ty) if (t in F) print sec "\t" F[t]
+	nm = ""; sw = 0; delete ty
+}
+BEGIN {
+	F["video/av01"] = "AV1"; F["video/hevc"] = "HEVC"; F["video/x-vnd.on2.vp9"] = "VP9"; F["video/dolby-vision"] = "Dolby Vision"
+	F["video/avc"] = "H.264"; F["video/x-vnd.on2.vp8"] = "VP8"; F["video/mp4v-es"] = "MPEG-4"; F["video/mpeg2"] = "MPEG-2"
+	F["video/3gpp"] = "H.263"; F["video/apv"] = "APV"
+}
+/<Decoders/ { sec = "D" } /<Encoders/ { sec = "E" }
+/<\/Decoders>|<\/Encoders>/ { flush(); sec = "" }
+sec != "" && /<MediaCodec[ >]/ {
+	flush(); nm = attr($0, "name"); t = attr($0, "type"); if (t != "") ty[t] = 1
+	if ($0 ~ /\/>[ \t]*$/) flush()
+	next
+}
+sec != "" && nm != "" && /<Type / { t = attr($0, "name"); if (t != "") ty[t] = 1 }
+sec != "" && nm != "" && /name="software-codec"/ { sw = 1 }
+sec != "" && /<\/MediaCodec>/ { flush() }
+'
+
+# [3.14] Сотовая: диапазон и агрегация частот из dumpsys telephony.registry.
+# По каждому Phone Id: mServiceState (регистрация, полосы всех несущих
+# mCellBandwidths, технология), mCellIdentity (mBands, mBandwidth обслуживающей
+# соты) и TelephonyDisplayInfo (overrideNetwork=NR_NSA — 5G поверх LTE).
+# Номера дополнительных несущих система не отдаёт — только их число и полосу.
+# Идентификаторы сот (Cell ID, TAC, PCI) не выводятся.
+BAND_AWK='
+function val(s, k,   r) {
+	r = ""
+	if (match(s, k "=\\[[^]]*\\]")) r = substr(s, RSTART + length(k) + 1, RLENGTH - length(k) - 1)
+	else if (match(s, k "=[^ ,}]*")) r = substr(s, RSTART + length(k) + 1, RLENGTH - length(k) - 1)
+	return r
+}
+function out() {
+	if (ph != "" && reg && typ != "") printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ph, typ, bands, bw, bws, rat, ovr
+	reg = 0; typ = ""; bands = ""; bw = ""; bws = ""; rat = ""; ovr = ""
+}
+/^  Phone Id=/ { out(); ph = $0; sub(/.*=/, "", ph); seen = 0; next }
+/^    mServiceState=/ && !seen {
+	seen = 1
+	reg = ($0 ~ /mVoiceRegState=0\(/ || $0 ~ /mDataRegState=0\(/)
+	bws = val($0, "mCellBandwidths")
+	rat = val($0, "getRilDataRadioTechnology"); if (rat ~ /IWLAN|Unknown/) rat = val($0, "getRilVoiceRadioTechnology")
+	sub(/^[0-9]+\(/, "", rat); sub(/\)$/, "", rat)
+}
+/^    mCellIdentity=CellIdentity/ {
+	typ = $0; sub(/^    mCellIdentity=CellIdentity/, "", typ); sub(/:.*/, "", typ)
+	bands = val($0, "mBands"); bw = val($0, "mBandwidth")
+}
+/^    mTelephonyDisplayInfo=/ { ovr = val($0, "overrideNetwork") }
+END { out() }
+'
+
 # Мобильная сеть: берём слот, где SIM реально вставлена (LOADED)
 mobile_info() {
 	local states ops types i=0 s
@@ -1416,6 +1497,32 @@ check_network() {
 	[ -n "$src" ] && kv "Локальный IP" "$src"
 	[ -n "$NET_WIFI" ] && kv "Wi-Fi" "$NET_WIFI"
 	mobile_info && kv "Сотовая" "$REPLY"
+	# [3.14] Диапазон обслуживающей соты; несколько несущих — агрегация (CA)
+	local bl ph typ bands bw bws rat ovr nc tot b
+	bl=$(dumpsys telephony.registry 2>/dev/null | awk "$BAND_AWK" 2>/dev/null)
+	while IFS=$'\t' read -r ph typ bands bw bws rat ovr; do
+		[ -n "$typ" ] || continue
+		bands="${bands#[}"; bands="${bands%]}"; bws="${bws#[}"; bws="${bws%]}"
+		local line="" pre=""
+		case "$typ" in
+			Lte) pre="B"; line="LTE" ;;
+			Nr)  pre="n"; line="5G" ;;
+			Wcdma|Tdscdma) line="3G" ;;
+			Gsm) line="2G" ;;
+			*) line="$typ" ;;
+		esac
+		[ -n "$bands" ] && [ -n "$pre" ] && line="$line $pre${bands//, /\/$pre}"
+		[ "$typ" = "Wcdma" ] && [ -n "$rat" ] && line="$line ($rat)"
+		nc=0; tot=0
+		for b in ${bws//,/ }; do is_int "$b" && [ "$b" -gt 0 ] && { nc=$((nc + 1)); tot=$((tot + b)); }; done
+		if [ "$nc" -ge 2 ]; then
+			line="$line · ${GREEN}CA ×$nc${NC} · $((tot / 1000)) МГц"
+		elif is_int "${bw:-x}" && [ "$bw" -gt 0 ] && [ "$bw" -lt 2147483647 ]; then
+			line="$line · $((bw / 1000)) МГц"
+		fi
+		case "$ovr" in NR_NSA|NR_NSA_MMWAVE|NR_ADVANCED) line="$line ${GREEN}+ 5G NSA${NC}" ;; esac
+		kv "Диапазон" "$line ${DIM}(SIM$((ph + 1)))${NC}"
+	done <<< "$bl"
 	[ -n "$NET_DNS" ] && kv "DNS" "$NET_DNS"
 
 	# [3.9] Модем: температура и ограничение сети из-за нагрева.
@@ -3170,3 +3277,8 @@ fi
 #  (например, версия ядра 4.19.325-cip135-…) режется по дефисам, точкам, «=»
 #  и «/» и продолжается
 #  с колонки значений, а не с начала строки.
+#
+# Изменения v3.14: «Графика» — аппаратные видеодекодеры (с -e — и кодеры) по
+#  спискам вендора; если AV1 нет — «только программно». «Сеть» — диапазон
+#  обслуживающей соты (LTE B7 · 20 МГц), агрегация частот (число несущих и
+#  суммарная полоса) и 5G NSA.
