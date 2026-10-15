@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.12 — мониторинг состояния rooted Android
+# monitor.sh v3.12.1 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.12"
+readonly VERSION="3.12.1"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -1896,6 +1896,24 @@ print_system() {
 	[[ "$off" =~ ^[+-][0-9]{4}$ ]] && off="UTC${off:0:3}:${off:3:2}" || off=""
 	[ "$(settings get global auto_time_zone 2>/dev/null)" = "1" ] && auto=" ${DIM}· авто${NC}"
 	[ -n "$tz$off" ] && kv "Часовой пояс" "${tz:-?}${off:+ ($off)}$auto"
+	# [3.12.1] Формат часов: settings system time_12_24 = 12 / 24. Пусто — включено
+	# «Использовать формат языка»: тогда формат задаёт первый язык системы.
+	# 12-часовой по умолчанию (CLDR) — у США, Канады, Австралии, Новой Зеландии,
+	# Индии, Филиппин, Пакистана, Египта, Саудовской Аравии, Кореи и Тайваня.
+	local f12 lc
+	f12=$(settings get system time_12_24 2>/dev/null)
+	case "$f12" in
+		12|24) kv "Формат часов" "$f12-часовой" ;;
+		*)
+			prop persist.sys.locale; lc="${REPLY%%,*}"
+			[ -z "$lc" ] && { prop ro.product.locale; lc="$REPLY"; }
+			lc="${lc%%-u-*}"; lc="${lc//_/-}"
+			case "$lc" in
+				*-US|*-CA|*-AU|*-NZ|*-IN|*-PH|*-PK|*-EG|*-SA|*-KR|*-TW|ko|hi) f12=12 ;;
+				*) f12=24 ;;
+			esac
+			kv "Формат часов" "$f12-часовой ${DIM}(по языку${lc:+ $lc})${NC}" ;;
+	esac
 	detect_root
 	kv "Root" "${GREEN}есть${NC} · $ROOT_INFO"
 	[ -n "$ZYGISK_INFO" ] && kv "Zygisk" "$ZYGISK_INFO"
@@ -2825,3 +2843,6 @@ fi
 #  строка «DRM» (Widevine: программная или аппаратная защита, версия CDM).
 #  Заголовок «Модули Magisk/KernelSU/APatch» — с версией менеджера; в «Root»
 #  версия больше не дублируется.
+#
+# Изменения v3.12.1: «Система» — формат часов (12- или 24-часовой; если включено
+#  «Использовать формат языка» — по первому языку системы).
