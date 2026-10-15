@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.13 — мониторинг состояния rooted Android
+# monitor.sh v3.13.1 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.13"
+readonly VERSION="3.13.1"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -205,6 +205,27 @@ wrap_text() {
 		read -ra words <<< "$seg"
 		for word in "${words[@]}"; do
 			strip_ansi "$word"; char_len "$REPLY"; wlen=$REPLY
+			# [3.13.1] Слово длиннее строки (версия ядра, имя сборки) — режем после
+			# «- = / . , _» (знак остаётся в конце строки); если их нет — по символам.
+			# Раньше такое слово уходило целиком, и его переносил уже терминал —
+			# с начала строки, мимо колонки значений.
+			if [ "$wlen" -gt "$w" ] && [[ "$word" != *$'\e'* ]]; then
+				[ "$llen" -gt 0 ] && out="$out$line"$'\n'
+				line=""; llen=0
+				local part rest2="$word" plen
+				while [ -n "$rest2" ]; do
+					if [[ "$rest2" =~ ^([^-=/.,_]*[-=/.,_])(.+)$ ]]; then part="${BASH_REMATCH[1]}"; rest2="${BASH_REMATCH[2]}"
+					else part="$rest2"; rest2=""; fi
+					char_len "$part"; plen=$REPLY
+					while [ "$plen" -gt "$w" ]; do      # кусок без дефисов длиннее строки
+						[ "$llen" -gt 0 ] && { out="$out$line"$'\n'; line=""; llen=0; }
+						out="$out${part:0:$w}"$'\n'; part="${part:$w}"; char_len "$part"; plen=$REPLY
+					done
+					if [ $((llen + plen)) -le "$w" ]; then line="$line$part"; llen=$((llen + plen))
+					else out="$out$line"$'\n'; line="$part"; llen=$plen; fi
+				done
+				continue
+			fi
 			if [ "$llen" -gt 0 ] && [ $((llen + 1 + wlen)) -le "$w" ]; then
 				line="$line $word"; llen=$((llen + 1 + wlen))
 			else
@@ -1872,7 +1893,12 @@ check_connections() {
 		local ssid="" secu="" bands="" hid="" maxc="" auto="" tmo="" out=""
 		if [ -n "$ap" ]; then
 			IFS=$'\t' read -r ssid secu bands hid maxc auto tmo < <(awk '
-				/name="WifiSsid"/ { s = $0; sub(/.*name="WifiSsid">/, "", s); sub(/<\/string>.*/, "", s); gsub(/^"|"$/, "", s) }
+				/name="WifiSsid"/ {
+					s = $0; sub(/.*name="WifiSsid">/, "", s); sub(/<\/string>.*/, "", s)
+					# [3.13.1] Значение экранировано по правилам XML: &quot;Имя&quot;
+					gsub(/&quot;/, "\"", s); gsub(/&apos;/, "\047", s); gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s)
+					gsub(/^"|"$/, "", s)
+				}
 				/name="SecurityType"/ { t = $0; sub(/.*value="/, "", t); sub(/".*/, "", t) }
 				/name="Band"/ { b = $0; sub(/.*value="/, "", b); sub(/".*/, "", b); bl = bl (bl == "" ? "" : ",") b }
 				/name="HiddenSSID"/ { h = ($0 ~ /value="true"/) }
@@ -3138,3 +3164,9 @@ fi
 #  контроллером и приложением бесконтактной оплаты, точка доступа (настройки,
 #  а если работает — частоты, стандарт и клиенты), USB (источник питания,
 #  OTG, скорость порта, функции), UWB (перенесён из «Google Pixel»), ИК-порт.
+#
+# Изменения v3.13.1: «Точка доступа» — имя без XML-экранирования
+#  (было «&quot;Pixel 8 Pro&quot;»). Перенос строк: слово длиннее строки
+#  (например, версия ядра 4.19.325-cip135-…) режется по дефисам, точкам, «=»
+#  и «/» и продолжается
+#  с колонки значений, а не с начала строки.
