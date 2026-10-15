@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.13 — мониторинг состояния rooted Android
+# monitor.sh v3.13.1 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.13"
+readonly VERSION="3.13.1"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -1874,7 +1874,7 @@ check_connections() {
 			IFS=$'\t' read -r ssid secu bands hid maxc auto tmo < <(awk '
 				/name="WifiSsid"/ {
 					s = $0; sub(/.*name="WifiSsid">/, "", s); sub(/<\/string>.*/, "", s)
-					# [3.13] Значение экранировано по правилам XML: &quot;Имя&quot;
+					# [3.13.1] Значение экранировано по правилам XML: &quot;Имя&quot;
 					gsub(/&quot;/, "\"", s); gsub(/&apos;/, "\047", s); gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s)
 					gsub(/^"|"$/, "", s)
 				}
@@ -3143,3 +3143,6 @@ fi
 #  контроллером и приложением бесконтактной оплаты, точка доступа (настройки,
 #  а если работает — частоты, стандарт и клиенты), USB (источник питания,
 #  OTG, скорость порта, функции), UWB (перенесён из «Google Pixel»), ИК-порт.
+#
+# Изменения v3.13.1: «Точка доступа» — имя без XML-экранирования
+#  (было «&quot;Pixel 8 Pro&quot;»).
