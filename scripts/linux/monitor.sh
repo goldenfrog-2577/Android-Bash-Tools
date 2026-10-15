@@ -1872,7 +1872,12 @@ check_connections() {
 		local ssid="" secu="" bands="" hid="" maxc="" auto="" tmo="" out=""
 		if [ -n "$ap" ]; then
 			IFS=$'\t' read -r ssid secu bands hid maxc auto tmo < <(awk '
-				/name="WifiSsid"/ { s = $0; sub(/.*name="WifiSsid">/, "", s); sub(/<\/string>.*/, "", s); gsub(/^"|"$/, "", s) }
+				/name="WifiSsid"/ {
+					s = $0; sub(/.*name="WifiSsid">/, "", s); sub(/<\/string>.*/, "", s)
+					# [3.13] Значение экранировано по правилам XML: &quot;Имя&quot;
+					gsub(/&quot;/, "\"", s); gsub(/&apos;/, "\047", s); gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s)
+					gsub(/^"|"$/, "", s)
+				}
 				/name="SecurityType"/ { t = $0; sub(/.*value="/, "", t); sub(/".*/, "", t) }
 				/name="Band"/ { b = $0; sub(/.*value="/, "", b); sub(/".*/, "", b); bl = bl (bl == "" ? "" : ",") b }
 				/name="HiddenSSID"/ { h = ($0 ~ /value="true"/) }
