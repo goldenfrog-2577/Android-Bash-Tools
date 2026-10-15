@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.11 — мониторинг состояния rooted Android
+# monitor.sh v3.11.1 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.11"
+readonly VERSION="3.11.1"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -1022,7 +1022,7 @@ check_battery() {
 	if [ -n "$cur_ua" ]; then
 		case "$status" in
 			Discharging) [ "$cur_ua" -gt 0 ] && cur_ua=$(( -cur_ua )) ;;
-			Charging|Full) [ "$cur_ua" -lt 0 ] && cur_ua=$(( -cur_ua )) ;;
+			Charging) [ "$cur_ua" -lt 0 ] && cur_ua=$(( -cur_ua )) ;;
 		esac
 	fi
 
@@ -1190,9 +1190,16 @@ check_battery() {
 		kv "Контроллер" "$cl${lim:+ · $lim}"
 	fi
 	if [ -n "$cur_ua" ] && [ -n "$volt" ]; then
-		local ma=$((cur_ua / 1000)) w
+		local ma=$((cur_ua / 1000)) w dir=""
 		w=$(awk -v v="$volt" -v i="$ma" 'BEGIN { printf "%.2f", v * i / 1000000 }')
-		kv "Ток" "$ma мА · ${w#-} Вт · $volt мВ"
+		# [3.11.1] Знак приводится только при «заряжается»/«разряжается». При «заряжена»,
+		# «не заряжается» и неизвестном статусе направление по драйверу не определить
+		# (у Qualcomm и Pixel знак противоположный) — показываем модуль без знака.
+		case "$status" in
+			Charging|Discharging) ;;
+			*) ma=${ma#-}; dir=" ${DIM}(направление не определено)${NC}" ;;
+		esac
+		kv "Ток" "$ma мА$dir · ${w#-} Вт · $volt мВ"
 	elif [ -n "$volt" ]; then
 		kv "Напряжение" "$volt мВ"
 	fi
@@ -2268,7 +2275,7 @@ print_kernel_extended() {
 	fi
 
 	local pg; pg=$(getconf PAGESIZE 2>/dev/null)
-	is_int "${pg:-x}" && kv "Страница" "$((pg / 1024)) КБ"
+	is_int "${pg:-x}" && [ "$pg" -gt 0 ] && kv "Страница" "$((pg / 1024)) КБ"   # [3.11.1] без «0 КБ»
 	if can_read "$R/proc/modules"; then
 		local nmod; nmod=$(grep -c '' "$R/proc/modules" 2>/dev/null)
 		kv "Модули ядра" "${nmod:-0} загружено"
@@ -2581,7 +2588,17 @@ acquire_lock() {
 	local pid
 	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 		pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+		# [3.11.1] PID мог достаться другому процессу после падения прежнего монитора:
+		# живым считаем только процесс, в командной строке которого есть имя скрипта.
+		# Если cmdline не прочитать — осторожно считаем его живым.
+		local cmd=""
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+			cmd=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline")
+			[ -n "$cmd" ] && [[ "$cmd" != *"${0##*/}"* ]] && pid=""
+		else
+			pid=""
+		fi
+		if [ -n "$pid" ]; then
 			printf '[!] Мониторинг уже запущен (PID %s). Если это не так: rm -r %s\n' "$pid" "$LOCK_DIR" >&2
 			return $EXIT_INTERNAL
 		fi
@@ -2762,3 +2779,8 @@ fi
 #  Gemini Nano), сканер отпечатков, UWB. Проверено на Pixel 8 Pro.
 #  «Модули LSPosed»: на старом LSPosed без CLI и кэша — подсказка про Vector 2.2+
 #  вместо ложного «модулей нет».
+#
+# Изменения v3.11.1 (по независимому аудиту): блокировка --loop не принимает чужой
+#  процесс с тем же PID за работающий монитор; «Ток» при статусах «заряжена» и
+#  «не заряжается» — без знака с пометкой «направление не определено»;
+#  строка «Страница» не выводит «0 КБ».
