@@ -2106,6 +2106,13 @@ check_connections() {
 		kv "Точка доступа" "$out"
 	fi
 
+	# [3.14.1] Геолокация: settings secure location_mode (0 — выключена)
+	local lm; lm=$(settings get secure location_mode 2>/dev/null)
+	case "$lm" in
+		0) kv "Геолокация" "выкл." ;;
+		[1-3]) kv "Геолокация" "${GREEN}вкл.${NC}" ;;
+	esac
+
 	# ── USB: порт Type-C, источник питания, функции и максимальная скорость порта
 	local pres="" typ2="" pr="" dr="" fn="" spd="" u
 	rd "$R/sys/class/power_supply/usb/present" && pres="$REPLY"
@@ -2117,7 +2124,15 @@ check_connections() {
 	rd "$R/sys/class/typec/port0/data_role" && [[ "$REPLY" =~ \[([a-z]+)\] ]] && dr="${BASH_REMATCH[1]}"
 	for u in "$R"/sys/class/udc/*/maximum_speed; do rd "$u" && spd="$REPLY" && break; done
 	prop sys.usb.config; fn="$REPLY"
-	case "$spd" in super-speed*) spd="USB 3" ;; high-speed) spd="USB 2.0" ;; *) spd="" ;; esac
+	# [3.14.1] Версия по максимальной скорости контроллера (udc/maximum_speed):
+	# high-speed — USB 2.0 (480 Мбит/с), super-speed — USB 3.0 (5 Гбит/с, она же
+	# USB 3.2 Gen 1), super-speed-plus — USB 3.2 (10 Гбит/с и выше)
+	case "$spd" in
+		super-speed-plus*) spd="USB 3.2 ${DIM}(10 Гбит/с)${NC}" ;;
+		super-speed)       spd="USB 3.0 ${DIM}(5 Гбит/с)${NC}" ;;
+		high-speed)        spd="USB 2.0 ${DIM}(480 Мбит/с)${NC}" ;;
+		*) spd="" ;;
+	esac
 	if [ -n "$pres$pr$spd" ]; then
 		local st2=""
 		if [ "$dr" = "host" ]; then st2="${GREEN}OTG${NC} (устройство подключено к телефону)"
@@ -2133,7 +2148,7 @@ check_connections() {
 		local fns=""
 		[ -n "$fn" ] && [ "$fn" != "none" ] && fns="${fn^^}" && fns="${fns//,/, }"
 		[[ " $tether" == *" ncm"* || " $tether" == *" rndis"* || " $tether" == *" usb"* ]] && fns="${fns:+$fns, }режим модема"
-		kv "USB" "$st2${spd:+ · порт $spd}${fns:+ · $fns}"
+		kv "USB" "$st2${spd:+ · $spd}${fns:+ · $fns}"
 	fi
 
 	# ── UWB (перенесено из «Google Pixel»): служба и переключатель в настройках
@@ -2146,13 +2161,6 @@ check_connections() {
 			*)           kv "UWB" "${uwb#* } ${DIM}(состояние службы)${NC}" ;;
 		esac
 	fi
-
-	# [3.14.1] Геолокация: settings secure location_mode (0 — выключена)
-	local lm; lm=$(settings get secure location_mode 2>/dev/null)
-	case "$lm" in
-		0) kv "Геолокация" "выкл." ;;
-		[1-3]) kv "Геолокация" "${GREEN}вкл.${NC}" ;;
-	esac
 
 	# ── ИК-порт (пульт): устройство lirc
 	compgen -G "$R/dev/lirc*" >/dev/null && kv "ИК-порт" "есть"
@@ -3324,4 +3332,5 @@ fi
 #
 # Изменения v3.14.1: «Батарея» — «Режим» вместо «Режимы». «Google Pixel» —
 #  «Термометр» есть/нет цветом. «Сеть» — частный DNS. «Другие подключения» —
-#  LE Audio и Auracast (трансляция / подключение), геолокация.
+#  LE Audio и Auracast (трансляция / подключение), геолокация под точкой доступа;
+#  USB — версия порта (USB 2.0 / 3.0 / 3.2) со скоростью.
