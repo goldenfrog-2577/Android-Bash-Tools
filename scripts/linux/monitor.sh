@@ -1630,7 +1630,7 @@ check_network() {
 		esac
 		local ovr1 ovr2
 		prop persist.dbg.volte_avail_ovr; ovr1="$REPLY"; prop persist.dbg.wfc_avail_ovr; ovr2="$REPLY"
-		[ -n "$call" ] && { [ "$ovr1" = "1" ] || [ "$ovr2" = "1" ]; } && call="$call · ${YELLOW}принудительно${NC}"
+		[ -n "$call" ] && { [ "$ovr1" = "1" ] || [ "$ovr2" = "1" ]; } && call="$call · принудительно"
 		[ -n "$call" ] && kv "Звонки" "$call"
 	fi
 	[ -n "$NET_DNS" ] && kv "DNS" "$NET_DNS"
