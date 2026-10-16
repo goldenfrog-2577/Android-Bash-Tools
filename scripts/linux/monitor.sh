@@ -2147,6 +2147,13 @@ check_connections() {
 		esac
 	fi
 
+	# [3.14.1] Геолокация: settings secure location_mode (0 — выключена)
+	local lm; lm=$(settings get secure location_mode 2>/dev/null)
+	case "$lm" in
+		0) kv "Геолокация" "выкл." ;;
+		[1-3]) kv "Геолокация" "${GREEN}вкл.${NC}" ;;
+	esac
+
 	# ── ИК-порт (пульт): устройство lirc
 	compgen -G "$R/dev/lirc*" >/dev/null && kv "ИК-порт" "есть"
 	return 0
@@ -2361,12 +2368,6 @@ print_system() {
 				*) f12=24 ;;
 			esac
 			kv "Формат часов" "$f12-часовой ${DIM}(по языку${lc:+ $lc})${NC}" ;;
-	esac
-	# [3.14.1] Геолокация: settings secure location_mode (0 — выключена)
-	local lm; lm=$(settings get secure location_mode 2>/dev/null)
-	case "$lm" in
-		0) kv "Геолокация" "выкл." ;;
-		[1-3]) kv "Геолокация" "${GREEN}вкл.${NC}" ;;
 	esac
 	detect_root
 	kv "Root" "${GREEN}есть${NC} · $ROOT_INFO"
@@ -3322,5 +3323,5 @@ fi
 #  суммарная полоса) и 5G NSA.
 #
 # Изменения v3.14.1: «Батарея» — «Режим» вместо «Режимы». «Google Pixel» —
-#  «Термометр» есть/нет цветом. «Сеть» — частный DNS. «Система» — геолокация.
-#  «Другие подключения» — LE Audio и Auracast (трансляция / подключение).
+#  «Термометр» есть/нет цветом. «Сеть» — частный DNS. «Другие подключения» —
+#  LE Audio и Auracast (трансляция / подключение), геолокация.
