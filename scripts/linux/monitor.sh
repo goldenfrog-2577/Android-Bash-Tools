@@ -619,7 +619,9 @@ check_memory() {
 		local ratio devs=""
 		ratio=$(awk -v o="$o_sum" -v u="$u_sum" 'BEGIN { printf "%.1f", o / u }')
 		[ "$nz" -gt 1 ] && devs=" ${DIM}($nz устройства)${NC}"
-		kv "ZRAM" "$(hsize_kb $((o_sum / 1024))) → $(hsize_kb $((u_sum / 1024))) ${DIM}(сжатие ×$ratio)${NC}${algos:+ · ${algos// //}}$devs"
+		# [3.15.4] Явные подписи: слева — данные в zram (несжатые), справа — сколько
+		# они занимают в RAM; объём самих устройств — в строке «Подкачка»
+		kv "ZRAM" "$(hsize_kb $((o_sum / 1024))) данных → $(hsize_kb $((u_sum / 1024))) в памяти ${DIM}(сжатие ×$ratio)${NC}${algos:+ · ${algos// //}}$devs"
 	fi
 	if [ "$swt" -gt 0 ]; then
 		local wb=""
