@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.14.1 — мониторинг состояния rooted Android
+# monitor.sh v3.15 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.14.1"
+readonly VERSION="3.15"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -1109,6 +1109,35 @@ check_battery() {
 	[ -n "$cap" ] && cap_s="${cap_c}${cap}%${cap_c:+$NC}"
 	kv "Уровень" "$cap_s · $st_ru"
 
+	# [3.15] Прогноз Device Health Services (как в настройках «Батарея»): DHS пишет
+	# в settings global время расчёта (battery_estimates_last_update_time, мс) и
+	# сколько осталось на тот момент (time_remaining_estimate_millis). Конец =
+	# расчёт + остаток. Только при разрядке и если прогноз ещё не прошёл.
+	# Как SettingsLib (PowerUtil): время окончания округляется до ближайших
+	# 15 минут — иначе строка расходится со шторкой на пару минут.
+	if [ "$status" = "Discharging" ]; then
+		local est upd use end now day wd
+		est=$(settings list global 2>/dev/null | grep -E '^(battery_estimates_last_update_time|time_remaining_estimate_millis|time_remaining_estimate_based_on_usage)=')
+		upd=$(printf '%s\n' "$est" | sed -n 's/^battery_estimates_last_update_time=//p')
+		end=$(printf '%s\n' "$est" | sed -n 's/^time_remaining_estimate_millis=//p')
+		use=$(printf '%s\n' "$est" | sed -n 's/^time_remaining_estimate_based_on_usage=//p')
+		printf -v now '%(%s)T' -1
+		if is_int "${upd:-x}" && is_int "${end:-x}" && [ "$end" -gt 0 ]; then
+			end=$(( (upd + end) / 1000 ))
+			end=$(( (end + 450) / 900 * 900 ))
+			if [ "$end" -gt "$now" ]; then
+				printf -v day '%(%Y%m%d)T' "$end"
+				if [ "$day" = "$(printf '%(%Y%m%d)T' -1)" ]; then printf -v wd '%(%H:%M)T' "$end"
+				else
+					printf -v wd '%(%u)T' "$end"
+					case "$wd" in 1) wd="пн" ;; 2) wd="вт" ;; 3) wd="ср" ;; 4) wd="чт" ;; 5) wd="пт" ;; 6) wd="сб" ;; 7) wd="вс" ;; esac
+					printf -v wd '%s %(%H:%M)T' "$wd" "$end"
+				fi
+				kv "Хватит до" "$wd${use:+ ${DIM}($([ "$use" = 1 ] && echo "по использованию" || echo "по среднему расходу"))${NC}}"
+			fi
+		fi
+	fi
+
 	# Источник питания
 	# [3.8.1] Формат «USB PD, быстрая · 8.3 В · до 20 Вт»: единицы прямо в тексте
 	# (раньше «(8 В)» читалось двусмысленно), напряжение с десятыми.
@@ -1368,7 +1397,16 @@ load_connectivity() {
 	if [ -n "$main" ]; then
 		IFS='|' read -r NET_TRANSPORT NET_IFACE NET_DNS ssid rssi fr ls <<< "$main"
 		if [ -n "$ssid" ]; then
-			NET_WIFI="«$ssid»${fr:+ · $fr МГц}${rssi:+ · $rssi дБм}${ls:+ · $ls Мбит/с}"
+			# [3.15] Качество сигнала — по порогам уровней Android (−55/−66/−77/−88 дБм)
+			local q=""
+			if is_int "${rssi:-x}"; then
+				if   [ "$rssi" -ge -55 ]; then q="отлично"
+				elif [ "$rssi" -ge -66 ]; then q="хорошо"
+				elif [ "$rssi" -ge -77 ]; then q="средне"
+				elif [ "$rssi" -ge -88 ]; then q="слабо"
+				else q="очень слабо"; fi
+			fi
+			NET_WIFI="«$ssid»${fr:+ · $fr МГц}${rssi:+ · $rssi дБм}${q:+ ${DIM}($q)${NC}}${ls:+ · $ls Мбит/с}"
 		fi
 	fi
 
@@ -1504,7 +1542,24 @@ check_network() {
 		kv "Подключение" "${GREEN}$kind${NC}$via ${DIM}($dev)${NC}"
 	fi
 	[ -n "$src" ] && kv "Локальный IP" "$src"
-	[ -n "$NET_WIFI" ] && kv "Wi-Fi" "$NET_WIFI"
+	# [3.15] Защита и стандарт подключения — из «cmd wifi status» (WifiInfo:
+	# «Security type: 2, … Wi-Fi standard: 11ac»). Номера — WifiInfo.SECURITY_TYPE_*.
+	if [ -n "$NET_WIFI" ]; then
+		local wi wsec wstd
+		wi=$(cmd wifi status 2>/dev/null | sed -n 's/^WifiInfo: //p' | head -n 1)
+		wsec=$(printf '%s' "$wi" | sed -n 's/.*Security type: \([0-9]*\).*/\1/p')
+		wstd=$(printf '%s' "$wi" | sed -n 's/.*Wi-Fi standard: \([0-9a-z]*\).*/\1/p')
+		case "$wsec" in
+			0) wsec="${YELLOW}открытая сеть${NC}" ;; 1) wsec="${YELLOW}WEP${NC}" ;; 2) wsec="WPA2" ;;
+			3) wsec="WPA2-Enterprise" ;; 4) wsec="WPA3" ;; 5|9) wsec="WPA3-Enterprise" ;; 6) wsec="OWE" ;;
+			7|8) wsec="WAPI" ;; 11|12) wsec="Passpoint" ;; 13) wsec="DPP" ;; *) wsec="" ;;
+		esac
+		case "$wstd" in
+			11n) wstd="Wi-Fi 4" ;; 11ac) wstd="Wi-Fi 5" ;; 11ax) wstd="Wi-Fi 6" ;; 11be) wstd="Wi-Fi 7" ;;
+			11ad) wstd="WiGig" ;; legacy|11a|11b|11g) wstd="Wi-Fi 1–3" ;; *) wstd="" ;;
+		esac
+		kv "Wi-Fi" "$NET_WIFI${wsec:+ · $wsec}${wstd:+ · $wstd}"
+	fi
 	mobile_info && kv "Сотовая" "$REPLY"
 	# [3.14] Диапазон обслуживающей соты; несколько несущих — агрегация (CA)
 	local bl ph typ bands bw bws rat ovr nc tot b
@@ -2386,6 +2441,24 @@ print_system() {
 		Permissive) kv "SELinux" "${YELLOW}Permissive${NC}" ;;
 		*)          kv "SELinux" "${se:-?}" ;;
 	esac
+	# [3.15] Обновления: патч безопасности системы и вендора (если отличается) и
+	# дата обновления системы Google Play — versionName пакета modulemetadata
+	# («2026-09-01S+»); у прошивок без mainline Google его нет.
+	# Отставание вендора не подсвечивается: на кастомных прошивках для старых
+	# устройств (POCO F3) свежего vendor уже не будет, предупреждать не о чем.
+	# Неразрывный пробел (U+00A0) держит дату вместе с подписью при переносе.
+	local sp vp mm upl="" nb=$'\xc2\xa0'
+	prop ro.build.version.security_patch; sp="$REPLY"
+	prop ro.vendor.build.security_patch; vp="$REPLY"
+	mm=$(dumpsys package com.google.android.modulemetadata 2>/dev/null | sed -n 's/^ *versionName=\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]\).*/\1/p' | head -n 1)
+	if [[ "$sp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
+		upl="патч безопасности от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
+		if [[ "$vp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] && [ "$vp" != "$sp" ]; then
+			upl="$upl · исправления производителя${nb}от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
+		fi
+	fi
+	[ -n "$mm" ] && upl="${upl:+$upl · }системное обновление Google${nb}Play${nb}от${nb}${mm:8:2}.${mm:5:2}.${mm:0:4}"
+	[ -n "$upl" ] && kv "Обновления" "$upl"
 	kv "Статус AVB" "$VB_LABEL"
 	note "ядро: ${VB_REAL:-${VB_DEVSTATE:-—}} · свойства: ${VB_PROP:-—}/flash.locked=${VB_LOCKPROP:-—}"
 	note "Вердикт Play Integrity выносят серверы Google — локально его не проверить."
@@ -2425,6 +2498,98 @@ print_system() {
 	fi
 	[ -n "$rev" ] && kv "Ревизия" "$rev"
 	kv "Драйверы" "Vulkan: ${vk:-по умолчанию} · EGL: ${egl:-по умолчанию}"
+}
+
+# ── Подмена (Evolution X) ────────────────────────────────────────────────────
+# [3.15] Только на Evolution X и только с -e. Подмена встроена в прошивку
+# (раздел «Spoofing» приложения Evolver), состояние — в системных настройках
+# (сверено с исходниками packages_apps_Evolver и frameworks_base):
+#   system spoof_trickystore_enabled / spoof_pif_enabled (по умолчанию 1);
+#   secure spoof_trickystore_keybox_source (official|user), _patch,
+#          _last_revocation_status / _reason / _check — проверка keybox самой прошивкой;
+#   secure spoof_pif_config — JSON с подменяемым отпечатком Pixel;
+#   secure pi_pp_spoof (1), pi_pp_model, pi_pp_targets — свойства Pixel;
+#   secure pi_tensor_spoof (0), tensor_targets — подмена Tensor;
+#   secure pi_photos_spoof (1), pi_snapchat_spoof (0).
+# Содержимое keybox (spoof_trickystore_keybox) не читается и не выводится.
+check_spoofing() {
+	prop ro.evolution.version; [ -n "$REPLY" ] || return 0
+	local ver; prop ro.evolution.display.version; ver="$REPLY"
+	section "ПОДМЕНА" "(Evolution X${ver:+ ${ver%%-*}})"
+
+	local sysl secl kb
+	sysl=$(settings list system 2>/dev/null | grep -E '^spoof_(trickystore|pif)_enabled=')
+	# keybox заменяем на «1» прямо в конвейере: его содержимое не попадает в память скрипта
+	secl=$(settings list secure 2>/dev/null | sed -E 's/^(spoof_trickystore_keybox)=.+$/\1=1/' | grep -E '^(spoof_trickystore_(keybox|keybox_source|patch|last_revocation_status|last_revocation_reason|last_revocation_check)|pi_pp_spoof|pi_pp_model|pi_pp_targets|pi_tensor_spoof|tensor_targets|pi_photos_spoof|pi_snapchat_spoof)=')
+	sv() {   # sv СПИСОК КЛЮЧ ПО_УМОЛЧАНИЮ → REPLY
+		REPLY=$(printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1)
+		[ -z "$REPLY" ] || [ "$REPLY" = "null" ] && REPLY="$3"
+		return 0
+	}
+	onoff() { if [ "$1" = "1" ]; then REPLY="${GREEN}вкл.${NC}"; else REPLY="выкл."; fi; }
+	ymd() { [[ "$1" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2}) ]] && REPLY="${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}" || REPLY="$1"; }
+	cnt() { local n; n=$(printf '%s' "$1" | tr ',' '\n' | grep -c .); REPLY="$n"; }
+
+	# Tricky Store: включён ли, keybox (есть ли и что сказала проверка прошивки), патч
+	local ts src st rs chk patch line
+	sv "$sysl" spoof_trickystore_enabled 1; onoff "$REPLY"; ts="$REPLY"
+	sv "$secl" spoof_trickystore_keybox 0; kb="$REPLY"
+	sv "$secl" spoof_trickystore_keybox_source ""; src="$REPLY"
+	sv "$secl" spoof_trickystore_last_revocation_status ""; st="$REPLY"
+	sv "$secl" spoof_trickystore_last_revocation_reason ""; rs="$REPLY"
+	sv "$secl" spoof_trickystore_last_revocation_check ""; chk="$REPLY"
+	sv "$secl" spoof_trickystore_patch ""; ymd "$REPLY"; patch="$REPLY"
+	if [ "$kb" != "1" ]; then line="keybox: ${RED}нет${NC}"
+	else
+		case "$st" in
+			VALID)          line="keybox: ${GREEN}действителен${NC}" ;;
+			EXPIRING_SOON)  line="keybox: ${YELLOW}скоро истечёт${NC}" ;;
+			REVOKED)        line="keybox: ${RED}отозван${NC}" ;;
+			SUSPENDED)      line="keybox: ${RED}приостановлен${NC}" ;;
+			CHAIN_INVALID)  line="keybox: ${RED}цепочка недействительна${NC}" ;;
+			UNTRUSTED_ROOT) line="keybox: ${RED}недоверенный корень${NC}" ;;
+			CHECKING)       line="keybox: проверяется" ;;
+			*)              line="keybox: есть ${DIM}(не проверялся)${NC}" ;;
+		esac
+		case "$src" in official) line="$line ${DIM}· официальный${NC}" ;; user) line="$line ${DIM}· свой${NC}" ;; esac
+	fi
+	kv "Tricky Store" "$ts · $line${patch:+ · патч $patch}"
+	if [ -n "$rs" ] || is_int "${chk:-x}"; then
+		local when=""
+		is_int "${chk:-x}" && [ "$chk" -gt 0 ] && printf -v when 'проверка %(%d.%m.%Y %H:%M)T' $((chk / 1000))
+		note "${when}${rs:+${when:+ · }причина: $rs}"
+	fi
+
+	# PIF: включён ли и под какой Pixel подделан отпечаток (модель и продукт из JSON)
+	local pif cfg model prod pp
+	sv "$sysl" spoof_pif_enabled 1; onoff "$REPLY"; pif="$REPLY"
+	cfg=$(settings get secure spoof_pif_config 2>/dev/null)
+	model=$(printf '%s' "$cfg" | grep -oE '"MODEL" *: *"[^"]*"' | head -n 1 | sed 's/.*: *"//; s/"$//')
+	prod=$(printf '%s' "$cfg" | grep -oE '"PRODUCT" *: *"[^"]*"' | head -n 1 | sed 's/.*: *"//; s/"$//')
+	pp=$(printf '%s' "$cfg" | grep -oE '"SECURITY_PATCH" *: *"[^"]*"' | head -n 1 | sed 's/.*: *"//; s/"$//')
+	[ -n "$pp" ] && { ymd "$pp"; pp="$REPLY"; }
+	if [ -n "$model" ]; then
+		kv "PIF" "$pif · $model${prod:+ ${DIM}($prod)${NC}}${pp:+ · патч $pp}"
+	else
+		kv "PIF" "$pif ${DIM}· конфиг не загружен${NC}"
+	fi
+
+	# Свойства Pixel и Tensor для выбранных приложений
+	local v m n
+	sv "$secl" pi_pp_spoof 1; onoff "$REPLY"; v="$REPLY"
+	sv "$secl" pi_pp_model ""; m="$REPLY"
+	sv "$secl" pi_pp_targets ""; if [ -n "$REPLY" ]; then cnt "$REPLY"; n="приложений: $REPLY"; else n="список по умолчанию"; fi
+	kv "Pixel Props" "$v${m:+ · модель $m} · $n"
+	sv "$secl" pi_tensor_spoof 0; onoff "$REPLY"; v="$REPLY"
+	sv "$secl" tensor_targets ""; if [ -n "$REPLY" ]; then cnt "$REPLY"; n=" · приложений: $REPLY"; else n=""; fi
+	kv "Tensor Props" "$v$n"
+
+	local ph sc
+	sv "$secl" pi_photos_spoof 1; onoff "$REPLY"; ph="$REPLY"
+	sv "$secl" pi_snapchat_spoof 0; onoff "$REPLY"; sc="$REPLY"
+	kv "Приложения" "Google Фото — $ph · Snapchat — $sc"
+	unset -f sv onoff ymd cnt
+	return 0
 }
 
 # [3.1] Модули: заголовок по типу root, статус у каждого модуля, версия через
@@ -2972,10 +3137,10 @@ run_dry() {
 		before=$EMIT_COUNT
 		"$f"
 		if [ "$EMIT_COUNT" -eq "$before" ]; then
-			short_name "$f"
+			short_name "$f"; local nm=$REPLY   # emit затирает REPLY
 			CUR_SECTION="ПРОБНЫЙ ЗАПУСК"
 			emit ""
-			emit "${DIM}[ $REPLY ] на этом устройстве данных для вывода нет${NC}"
+			emit "${DIM}[ $nm ] на этом устройстве данных для вывода нет${NC}"
 		fi
 	done
 
@@ -3023,6 +3188,7 @@ run_monitor() {
 	check_pixel_security
 	print_system
 	if [ "$EXTENDED" -eq 1 ]; then
+		check_spoofing
 		print_modules
 		print_lsposed
 		print_kernel_extended
@@ -3199,138 +3365,4 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Изменения v3 относительно v2 (кратко; подробно — в обсуждении этапа 2):
-#  Данные: износ UFS (health_descriptor — папка, версия из specification_version),
-#  Zygisk через magisk --sqlite + zygote64, TPU/Titan M2 по реальным путям,
-#  честный Verified Boot (ядро против свойств, ловит подмену), Thermal Status
-#  из Thermal HAL, датчики CPU из зон ядра (Qualcomm без HAL), троттлинг по
-#  охлаждающим устройствам, частоты по кластерам, DNS/Wi-Fi из dumpsys
-#  connectivity, SIM по gsm.sim.state, system-as-root и /mnt/vendor/persist,
-#  модель Mali из gpuinfo, тип ядра по версии, энтропия ≥5.18, аптайм из /proc.
-#  Скорость: getprop и dumpsys thermalservice — по одному вызову за проход
-#  (кэши v2 жили в подоболочках и не работали), ping — одна серия на хост.
-#  Безопасность: lock в /dev (mkdir, без подмены ссылок), без /tmp-файлов,
-#  лог без интерпретации \-последовательностей, logcat '*:E' в кавычках,
-#  серийник из cmdline маскируется.
-#  Удалено: «Play Integrity» (локально не определяется), bootstrap.sh-опечатка.
-
-
-#
-# Изменения v3.1 (косметика, отдельные блоки):
-#  Отступ перед двоеточием во всех строках, «Статус AVB»; кластеры CPU с типом
-#  ядер из /proc/cpuinfo и общим регулятором; русские подписи температур;
-#  LTPO по драйверу панели Pixel (panel_idle / min_vrefresh), запасной путь —
-#  dumpsys display; VPN поверх Wi-Fi определяется по транспортам VPN-сети,
-#  а не по первой сети в списке; топ процессов «PID : имя · CPU · ОЗУ МБ»;
-#  «Защитный чип»; модули — заголовок по типу root, статусы, описания;
-#  ядро — сборщик, компилятор/линкер, флаги и дата сборки, страница, модули.
-#
-# Изменения v3.2: «Ср. нагрузка» (load average за 1/5/15 мин) отдельной строкой,
-#  подсказка iperf3 — серой строкой в секции «СЕТЬ», топ процессов в общей
-#  колонке с подписью «PID N», «Чип защиты», «Время работы» вместо «Аптайм».
-#
-# Изменения v3.3: «Перегрев» вместо «Термостатус» (значения: нет / лёгкий / …);
-#  пробный запуск -d [секции]: секции находятся сами по вызову section в коде,
-#  выбор через запятую или all, код выхода — итог выбранных секций.
-#
-# Изменения v3.4: секция «ПАМЯТЬ» — тип памяти, доступно и кэш, zram со сжатием
-#  и алгоритмом, подкачка и сброс на диск (writeback), давление PSI, выгрузки
-#  lmkd, настройки vm в -e; статус — худшее из «занято %» и давления.
-#  Список секций в -d: порядок как в обычном проходе, заголовки с переменными
-#  раскрываются («МОДУЛИ MAGISK»), секция модулей теперь называется modules.
-#  ZRAM суммируется по всем активным устройствам (zram0 + добавленный zram1).
-#
-# Изменения v3.5: «Мониторинг» в заголовке и справке; «Настройки VM»; малые и
-#  большие ядра Qualcomm с собственными кодами (0x51) показываются настоящими
-#  ядрами ARM (у SM8250 — A55); «Энтропия» — фиксированные 256 распознаются по
-#  poolsize, а не по версии ядра (новый RNG перенесён и в 4.19, и в 5.4).
-#
-# Изменения v3.6 — по первому запуску на чужом устройстве (Redmi Note 13 Pro 5G):
-#  скрипт переходит в «/» до запуска — без этого при старте из недоступной
-#  root'у папки bash засыпал вывод ошибками getcwd.
-#  Проверка «можно ли прочитать» — открытием файла (can_read), а не [ -r ]:
-#  на ядрах, где faccessat врёт (KernelSU, Zen-Itsu), пропадали CPU, UFS,
-#  ZRAM, PSI и статус AVB. DNS: несколько серверов выводятся через запятую
-#  (с 3.1 они склеивались в «10.11.12.1310.11.12.14»).
-#
-# Изменения v3.7: батарея — технология, модель и подлинность (bms/Maxim), даты
-#  производства и первого применения (Pixel), температура с десятыми, ёмкость
-#  выше паспортной без «калибруется», «н/д» вместо 0 °C/0% при недоступных
-#  данных, в -e — внутреннее сопротивление; СИСТЕМА -e — Bootloader и ревизия
-#  платы. По аудиту ChatGPT: загрузка CPU «н/д» без /proc/stat, Zygisk не
-#  называется сторонним, если настройку Magisk прочитать не удалось, PSI
-#  считается и при одной строке, пояснение к MONITOR_SYSROOT.
-#
-# Изменения v3.7.1: «Bootloader» (-e) и «Модем» (Pixel) сверяются с версиями,
-#  которые ожидает прошивка (ro.build.expect.*); при расхождении — ВНИМАНИЕ.
-#
-# Изменения v3.7.2: объём сброса zram на диск считается по реальному размеру
-#  страницы (getconf PAGESIZE), а не по фиксированным 4 КБ — готовность к 16K.
-#
-# Изменения v3.8: «Батарея» — строка «Режимы» (максимум 80%, адаптивная зарядка,
-#  защита батареи Pixel, энергосбережение, ограничение по температуре) со временем:
-#  «полный заряд через ~N», «до 80% через ≈N», «зарядится к чч:мм»; строка
-#  «Контроллер» — температура зарядки, USB-порта и ограничение зарядки из-за нагрева.
-#  Охлаждение зарядки (chg_mdis, dc_icl) убрано из «Троттлинга», чтобы не дублировать.
-#
-# Изменения v3.8.1: «Питание» — «USB PD, быстрая · 8.3 В · до 20 Вт»: напряжение
-#  с десятыми и единицей в тексте; предел мощности на Pixel из BatteryService.
-#
-# Изменения v3.9: «Топ процессов» в духе htop — замер за 1 с (второй кадр top),
-#  таблицы «По процессору» и «По памяти» (5 строк, с -e — 10), строка «Задачи»,
-#  длинные имена обрезаются посередине. Перенос длинных строк под колонку
-#  значений по ширине терминала (MONITOR_COLS=N — вручную, 0 — выкл.).
-#  «Сеть»: строка «Модем» — температура и ограничение из-за нагрева.
-#
-# Изменения v3.10: новая секция «Модули LSPosed» (-e, только если стоит LSPosed
-#  или Vector): имя пакета, статус из CLI фреймворка, версия, API (новый / «старый»
-#  XposedBridge), описание из кэша менеджера Vector 2.1+ или из APK. «Модули Magisk»: длинная строка модуля переносится
-#  под название.
-#
-# Изменения v3.10.1: «Модули LSPosed» — «API 93 (старый)» переносится целиком
-#  (неразрывные пробелы), а не обрывается перед «(старый)».
-#
-# Изменения v3.11: «Google Pixel» — последний замер приложения «Термометр»
-#  предметов (Pixel 8 Pro – 10 Pro XL), прошивка Titan, сборка AICore (среда
-#  Gemini Nano), сканер отпечатков, UWB. Проверено на Pixel 8 Pro.
-#  «Модули LSPosed»: на старом LSPosed без CLI и кэша — подсказка про Vector 2.2+
-#  вместо ложного «модулей нет».
-#
-# Изменения v3.11.1 (по независимому аудиту): блокировка --loop не принимает чужой
-#  процесс с тем же PID за работающий монитор; «Ток» при статусах «заряжена» и
-#  «не заряжается» — без знака с пометкой «направление не определено»;
-#  строка «Страница» не выводит «0 КБ».
-#
-# Изменения v3.12: «Система» — часовой пояс со смещением от UTC. «Графика» —
-#  плотность (dpi) и минимальная ширина (dp). «Google Pixel» — «Термометр» только
-#  сообщает, есть ли датчик и как он называется; «AOC» — есть/нет цветом; новая
-#  строка «DRM» (Widevine: программная или аппаратная защита, версия CDM).
-#  Заголовок «Модули Magisk/KernelSU/APatch» — с версией менеджера; в «Root»
-#  версия больше не дублируется.
-#
-# Изменения v3.12.1: «Система» — формат часов (12- или 24-часовой; если включено
-#  «Использовать формат языка» — по первому языку системы).
-#
-# Изменения v3.13: новая секция «Другие подключения» под «Сетью»: Bluetooth
-#  (вкл./выкл., подключённые устройства с кодеком и зарядом — у наушников с Fast
-#  Pair по каждому наушнику и кейсу; с -e — сохранённые устройства), NFC с
-#  контроллером и приложением бесконтактной оплаты, точка доступа (настройки,
-#  а если работает — частоты, стандарт и клиенты), USB (источник питания,
-#  OTG, скорость порта, функции), UWB (перенесён из «Google Pixel»), ИК-порт.
-#
-# Изменения v3.13.1: «Точка доступа» — имя без XML-экранирования
-#  (было «&quot;Pixel 8 Pro&quot;»). Перенос строк: слово длиннее строки
-#  (например, версия ядра 4.19.325-cip135-…) режется по дефисам, точкам, «=»
-#  и «/» и продолжается
-#  с колонки значений, а не с начала строки.
-#
-# Изменения v3.14: «Графика» — «Видеодекодер»: какие форматы телефон аппаратно
-#  декодирует (если AV1 нет — «только программно»); с -e выше — «Видеокодер»
-#  (аппаратное кодирование). Берётся из списков кодеков вендора. «Сеть» — диапазон
-#  обслуживающей соты (LTE B7 · 20 МГц), агрегация частот (число несущих и
-#  суммарная полоса) и 5G NSA.
-#
-# Изменения v3.14.1: «Батарея» — «Режим» вместо «Режимы». «Google Pixel» —
-#  «Термометр» есть/нет цветом. «Сеть» — частный DNS. «Другие подключения» —
-#  LE Audio и Auracast (трансляция / подключение), геолокация под точкой доступа;
-#  USB — версия порта (USB 2.0 / 3.0 / 3.2) со скоростью.
+# [3.15] История изменений перенесена в monitor_changelog.md в корне репозитория.
