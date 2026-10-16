@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.15.2 — мониторинг состояния rooted Android
+# monitor.sh v3.15.3 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.15.2"
+readonly VERSION="3.15.3"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -2533,9 +2533,56 @@ uptime_str() {
 	REPLY="$REPLY$h ч $m мин"
 }
 
+# [3.15.3] Время экрана за сегодня — как «Цифровое благополучие»: из журнала
+# событий UsageStats за 24 часа (dumpsys usagestats, «Last 24 hour events»).
+# С полуночи суммируется время, пока окно приложения на переднем плане
+# (ACTIVITY_RESUMED → PAUSED/STOPPED, по instanceId) и экран включён
+# (SCREEN_INTERACTIVE); лаунчер, SystemUI и сервисы Google не считаются.
+# Разблокировки — KEYGUARD_HIDDEN за сегодня. Сверено с Wellbeing: Pixel 8 Pro
+# 8:16 против 8:19 и 19 = 19; POCO F3 2:29 против 2:36 и 13 = 13. Расхождение —
+# Custom Tabs: Android пишет их на Chrome, Wellbeing — на приложение-хозяина.
+SCR_AWK='
+function sod(s,  a) { split(s, a, ":"); return a[1] * 3600 + a[2] * 60 + a[3] }
+function adv(t,  p) { if (scr && t > prev) for (p in cnt) if (cnt[p] > 0) app[p] += t - prev; prev = t }
+/Last 24 hour events/ { on = 1; next }
+/In-memory daily stats/ { exit }
+!on || !/ type=/ { next }
+{
+	if (!match($0, /time="[0-9-]+ [0-9:]+"/)) next
+	d = substr($0, RSTART + 6, 10); t = sod(substr($0, RSTART + 17, 8))
+	match($0, /type=[A-Z_]+/); ty = substr($0, RSTART + 5, RLENGTH - 5)
+	pk = ""; if (match($0, /package=[^ ]+/)) pk = substr($0, RSTART + 8, RLENGTH - 8)
+	id = pk; if (match($0, /instanceId=[0-9-]+/)) id = pk "#" substr($0, RSTART + 11, RLENGTH - 11)
+	if (d < day) t = 0; else adv(t)
+	if (ty == "SCREEN_INTERACTIVE") scr = 1
+	else if (ty == "SCREEN_NON_INTERACTIVE") scr = 0
+	else if (ty == "ACTIVITY_RESUMED") { if (!(id in open)) { open[id] = pk; cnt[pk]++ } }
+	else if (ty == "ACTIVITY_PAUSED" || ty == "ACTIVITY_STOPPED") { if (id in open) { cnt[open[id]]--; delete open[id] } }
+	else if (ty == "KEYGUARD_HIDDEN" && d == day) unl++
+}
+END {
+	adv(now)
+	for (p in app) if (p != home && p !~ excl) tot += app[p]
+	if (tot > 0 || unl > 0) printf "%d %d\n", tot, unl
+}
+'
+
 print_system() {
 	section "СИСТЕМА"
 	uptime_str; kv "Время работы" "$REPLY"
+	# [3.15.3] Время экрана и разблокировки за сегодня (см. SCR_AWK)
+	local day sec home st_t st_u
+	printf -v day '%(%Y-%m-%d)T' -1; printf -v sec '%(%H:%M:%S)T' -1
+	sec=$(( 10#${sec:0:2} * 3600 + 10#${sec:3:2} * 60 + 10#${sec:6:2} ))
+	home=$(cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null | tail -n 1)
+	read -r st_t st_u < <(dumpsys usagestats 2>/dev/null | awk -v day="$day" -v now="$sec" -v home="${home%%/*}" \
+		-v excl='^(android|com\.android\.systemui|com\.google\.android\.gms|com\.google\.android\.permissioncontroller|com\.android\.permissioncontroller)$|launcher' \
+		"$SCR_AWK" 2>/dev/null)
+	if is_int "${st_t:-x}"; then
+		local h=$((st_t / 3600)) m=$(((st_t % 3600) / 60)) v
+		if [ "$h" -gt 0 ]; then v="$h ч $m мин"; else v="$m мин"; fi
+		kv "Время экрана" "$v${st_u:+ · разблокировок: $st_u}"
+	fi
 	# [3.12] Часовой пояс: имя зоны + смещение от UTC; «авто» — по сети
 	local tz off auto
 	prop persist.sys.timezone; tz="$REPLY"
