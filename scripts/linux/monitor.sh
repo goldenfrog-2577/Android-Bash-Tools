@@ -1827,6 +1827,12 @@ check_network() {
 	fi
 }
 
+# [3.15.4] Скорость из строки «receiver» iperf3 — по-русски, как в строке Wi-Fi:
+# «68.3 Mbits/sec» → «68.3 Мбит/с» (также Kbits / Gbits / bits)
+IPERF_RATE_AWK='/receiver/ { u = $(NF-1); sub(/bits\/sec$/, "", u)
+	r = (u == "K") ? "Кбит/с" : (u == "M") ? "Мбит/с" : (u == "G") ? "Гбит/с" : (u == "") ? "бит/с" : $(NF-1)
+	print $(NF-2), r }'
+
 check_iperf3_speed() {
 	[ "$BRIEF_MODE" -eq 1 ] && return
 	[ "$ENABLE_NET_TEST" -ne 1 ] && return   # [3.2] подсказка теперь в секции «СЕТЬ»
@@ -1848,7 +1854,7 @@ check_iperf3_speed() {
 		for try in 1 2 3; do
 			port=$((lo + RANDOM % (hi - lo + 1)))
 			out=$(timeout 8 iperf3 -c "$host" -p "$port" -R -t 5 2>&1)
-			down=$(printf '%s\n' "$out" | awk '/receiver/ { print $(NF-2), $(NF-1) }')
+			down=$(printf '%s\n' "$out" | awk "$IPERF_RATE_AWK")
 			[ -n "$down" ] && break
 			[[ "$out" == *busy* ]] || break      # не «занят» — сервер недоступен, дальше
 		done
@@ -1856,7 +1862,7 @@ check_iperf3_speed() {
 		server="$host:$port"
 		kv "Сервер" "$server"
 		kv "Загрузка" "$down"
-		up=$(timeout 8 iperf3 -c "$host" -p "$port" -t 5 2>/dev/null | awk '/receiver/ { print $(NF-2), $(NF-1) }')
+		up=$(timeout 8 iperf3 -c "$host" -p "$port" -t 5 2>/dev/null | awk "$IPERF_RATE_AWK")
 		kv "Отдача" "${up:-не удалось}"
 		return
 	done
