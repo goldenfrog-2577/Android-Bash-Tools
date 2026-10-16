@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.14 — мониторинг состояния rooted Android
+# monitor.sh v3.14.1 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.14"
+readonly VERSION="3.14.1"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -1191,7 +1191,7 @@ check_battery() {
 		esac
 		[ -z "$modes" ] && modes="обычная зарядка"
 	fi
-	[ -n "$modes" ] && kv "Режимы" "$modes${eta:+ · $eta}"
+	[ -n "$modes" ] && kv "Режим" "$modes${eta:+ · $eta}"   # [3.14.1] было «Режимы»
 
 	# Здоровье: ёмкость по датчику к паспортной
 	local hp="" h_ru
@@ -1533,6 +1533,16 @@ check_network() {
 		kv "Диапазон" "$line ${DIM}(SIM$((ph + 1)))${NC}"
 	done <<< "$bl"
 	[ -n "$NET_DNS" ] && kv "DNS" "$NET_DNS"
+	# [3.14.1] Частный DNS (DNS-over-TLS): off / opportunistic («авто», он же
+	# значение по умолчанию, если настройки нет) / hostname + адрес сервера
+	local pdm pds
+	pdm=$(settings get global private_dns_mode 2>/dev/null)
+	case "$pdm" in
+		off)      kv "Частный DNS" "выкл." ;;
+		hostname) pds=$(settings get global private_dns_specifier 2>/dev/null)
+		          kv "Частный DNS" "${GREEN}${pds:-?}${NC}" ;;
+		*)        kv "Частный DNS" "авто ${DIM}(если сеть поддерживает)${NC}" ;;
+	esac
 
 	# [3.9] Модем: температура и ограничение сети из-за нагрева.
 	# Pixel (модем Exynos): зоны cp_on_chip_*, ограничение — статус датчика
@@ -1964,6 +1974,18 @@ check_connections() {
 			kv "Bluetooth" "выкл."
 		fi
 	fi
+	# [3.14.1] LE Audio и Auracast — по профилям, включённым в стеке Bluetooth:
+	#   bap.unicast.client — LE Audio (наушники по LE);
+	#   bap.broadcast.source — сам телефон ведёт трансляцию Auracast;
+	#   bap.broadcast.assist — помогает наушникам подключиться к чужой трансляции.
+	local lea="" aur=""
+	prop bluetooth.profile.bap.unicast.client.enabled; [ "$REPLY" = "true" ] && lea=1
+	prop bluetooth.profile.bap.broadcast.source.enabled; [ "$REPLY" = "true" ] && aur="трансляция"
+	prop bluetooth.profile.bap.broadcast.assist.enabled; [ "$REPLY" = "true" ] && aur="${aur:+$aur и }подключение"
+	if [ -n "$lea$aur" ]; then
+		if [ -n "$lea" ]; then lea="${GREEN}есть${NC}"; else lea="нет"; fi
+		kv "LE Audio" "$lea${aur:+ · Auracast: $aur}"
+	fi
 
 	# ── NFC и бесконтактная оплата. Приложение оплаты с Android 15 — системная
 	# роль кошелька («Current wallet payment service»), а не настройка
@@ -2084,6 +2106,13 @@ check_connections() {
 		kv "Точка доступа" "$out"
 	fi
 
+	# [3.14.1] Геолокация: settings secure location_mode (0 — выключена)
+	local lm; lm=$(settings get secure location_mode 2>/dev/null)
+	case "$lm" in
+		0) kv "Геолокация" "выкл." ;;
+		[1-3]) kv "Геолокация" "${GREEN}вкл.${NC}" ;;
+	esac
+
 	# ── USB: порт Type-C, источник питания, функции и максимальная скорость порта
 	local pres="" typ2="" pr="" dr="" fn="" spd="" u
 	rd "$R/sys/class/power_supply/usb/present" && pres="$REPLY"
@@ -2095,7 +2124,15 @@ check_connections() {
 	rd "$R/sys/class/typec/port0/data_role" && [[ "$REPLY" =~ \[([a-z]+)\] ]] && dr="${BASH_REMATCH[1]}"
 	for u in "$R"/sys/class/udc/*/maximum_speed; do rd "$u" && spd="$REPLY" && break; done
 	prop sys.usb.config; fn="$REPLY"
-	case "$spd" in super-speed*) spd="USB 3" ;; high-speed) spd="USB 2.0" ;; *) spd="" ;; esac
+	# [3.14.1] Версия по максимальной скорости контроллера (udc/maximum_speed):
+	# high-speed — USB 2.0 (480 Мбит/с), super-speed — USB 3.0 (5 Гбит/с, она же
+	# USB 3.2 Gen 1), super-speed-plus — USB 3.2 (10 Гбит/с и выше)
+	case "$spd" in
+		super-speed-plus*) spd="USB 3.2 ${DIM}(10 Гбит/с)${NC}" ;;
+		super-speed)       spd="USB 3.0 ${DIM}(5 Гбит/с)${NC}" ;;
+		high-speed)        spd="USB 2.0 ${DIM}(480 Мбит/с)${NC}" ;;
+		*) spd="" ;;
+	esac
 	if [ -n "$pres$pr$spd" ]; then
 		local st2=""
 		if [ "$dr" = "host" ]; then st2="${GREEN}OTG${NC} (устройство подключено к телефону)"
@@ -2111,7 +2148,7 @@ check_connections() {
 		local fns=""
 		[ -n "$fn" ] && [ "$fn" != "none" ] && fns="${fn^^}" && fns="${fns//,/, }"
 		[[ " $tether" == *" ncm"* || " $tether" == *" rndis"* || " $tether" == *" usb"* ]] && fns="${fns:+$fns, }режим модема"
-		kv "USB" "$st2${spd:+ · порт $spd}${fns:+ · $fns}"
+		kv "USB" "$st2${spd:+ · $spd}${fns:+ · $fns}"
 	fi
 
 	# ── UWB (перенесено из «Google Pixel»): служба и переключатель в настройках
@@ -2199,9 +2236,9 @@ check_pixel_security() {
 	local fir
 	fir=$(dumpsys sensorservice 2>/dev/null | awk -F'|' '/fir_temperature\(/ { n = $1; sub(/^[^)]*\) */, "", n); split(n, a, " "); print a[1]; exit }')
 	if [ -n "$fir" ]; then
-		kv "Термометр" "есть · датчик $fir"
+		kv "Термометр" "${GREEN}есть${NC} · датчик $fir"   # [3.14.1] цвет, как у AOC
 	else
-		kv "Термометр" "нет"
+		kv "Термометр" "${RED}нет${NC}"
 	fi
 
 	# [3.11] AICore — системная среда Gemini Nano. Сборка из versionName
@@ -3292,3 +3329,8 @@ fi
 #  (аппаратное кодирование). Берётся из списков кодеков вендора. «Сеть» — диапазон
 #  обслуживающей соты (LTE B7 · 20 МГц), агрегация частот (число несущих и
 #  суммарная полоса) и 5G NSA.
+#
+# Изменения v3.14.1: «Батарея» — «Режим» вместо «Режимы». «Google Pixel» —
+#  «Термометр» есть/нет цветом. «Сеть» — частный DNS. «Другие подключения» —
+#  LE Audio и Auracast (трансляция / подключение), геолокация под точкой доступа;
+#  USB — версия порта (USB 2.0 / 3.0 / 3.2) со скоростью.
