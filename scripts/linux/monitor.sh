@@ -2444,22 +2444,20 @@ print_system() {
 	# [3.15] Обновления: патч безопасности системы и вендора (если отличается) и
 	# дата обновления системы Google Play — versionName пакета modulemetadata
 	# («2026-09-01S+»); у прошивок без mainline Google его нет.
-	local sp vp mm upl="" d1 d2
+	# Отставание вендора не подсвечивается: на кастомных прошивках для старых
+	# устройств (POCO F3) свежего vendor уже не будет, предупреждать не о чем.
+	# Неразрывный пробел (U+00A0) держит дату вместе с подписью при переносе.
+	local sp vp mm upl="" nb=$'\xc2\xa0'
 	prop ro.build.version.security_patch; sp="$REPLY"
 	prop ro.vendor.build.security_patch; vp="$REPLY"
 	mm=$(dumpsys package com.google.android.modulemetadata 2>/dev/null | sed -n 's/^ *versionName=\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]\).*/\1/p' | head -n 1)
 	if [[ "$sp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
-		upl="патч ${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
+		upl="патч безопасности от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
 		if [[ "$vp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] && [ "$vp" != "$sp" ]; then
-			d1=$(( ${sp:0:4} * 12 + 10#${sp:5:2} )); d2=$(( ${vp:0:4} * 12 + 10#${vp:5:2} ))
-			if [ $((d1 - d2)) -ge 6 ]; then
-				upl="$upl · вендор ${YELLOW}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]} (отстаёт на $((d1 - d2)) мес.)${NC}"
-			else
-				upl="$upl · вендор ${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
-			fi
+			upl="$upl · исправления производителя${nb}от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
 		fi
 	fi
-	[ -n "$mm" ] && upl="${upl:+$upl · }mainline ${mm:8:2}.${mm:5:2}.${mm:0:4}"
+	[ -n "$mm" ] && upl="${upl:+$upl · }системное обновление Google${nb}Play${nb}от${nb}${mm:8:2}.${mm:5:2}.${mm:0:4}"
 	[ -n "$upl" ] && kv "Обновления" "$upl"
 	kv "Статус AVB" "$VB_LABEL"
 	note "ядро: ${VB_REAL:-${VB_DEVSTATE:-—}} · свойства: ${VB_PROP:-—}/flash.locked=${VB_LOCKPROP:-—}"
