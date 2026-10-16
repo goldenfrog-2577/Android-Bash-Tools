@@ -1113,6 +1113,8 @@ check_battery() {
 	# в settings global время расчёта (battery_estimates_last_update_time, мс) и
 	# сколько осталось на тот момент (time_remaining_estimate_millis). Конец =
 	# расчёт + остаток. Только при разрядке и если прогноз ещё не прошёл.
+	# Как SettingsLib (PowerUtil): время окончания округляется до ближайших
+	# 15 минут — иначе строка расходится со шторкой на пару минут.
 	if [ "$status" = "Discharging" ]; then
 		local est upd use end now day wd
 		est=$(settings list global 2>/dev/null | grep -E '^(battery_estimates_last_update_time|time_remaining_estimate_millis|time_remaining_estimate_based_on_usage)=')
@@ -1122,6 +1124,7 @@ check_battery() {
 		printf -v now '%(%s)T' -1
 		if is_int "${upd:-x}" && is_int "${end:-x}" && [ "$end" -gt 0 ]; then
 			end=$(( (upd + end) / 1000 ))
+			end=$(( (end + 450) / 900 * 900 ))
 			if [ "$end" -gt "$now" ]; then
 				printf -v day '%(%Y%m%d)T' "$end"
 				if [ "$day" = "$(printf '%(%Y%m%d)T' -1)" ]; then printf -v wd '%(%H:%M)T' "$end"
