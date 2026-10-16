@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.15 — мониторинг состояния rooted Android
+# monitor.sh v3.15.1 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.15"
+readonly VERSION="3.15.1"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -994,6 +994,15 @@ check_gpu() {
 		kv "Плотность" "$d dpi${b:+ ${DIM}(физ. $a)${NC}}${sw:+ · $sw dp}"
 	fi
 
+	# [3.15.1] HDR-форматы экрана: HdrCapabilities из dumpsys display
+	# (Display.HdrCapabilities: 1 Dolby Vision · 2 HDR10 · 3 HLG · 4 HDR10+)
+	local hdr="" ht
+	for ht in $(dumpsys display 2>/dev/null | sed -n 's/.*mSupportedHdrTypes=\[\([0-9, ]*\)\].*/\1/p' | head -n 1 | tr ',' ' '); do
+		case "$ht" in 1) ht="Dolby Vision" ;; 2) ht="HDR10" ;; 3) ht="HLG" ;; 4) ht="HDR10+" ;; *) continue ;; esac
+		hdr="${hdr:+$hdr · }$ht"
+	done
+	[ -n "$hdr" ] && kv "HDR" "$hdr"
+
 	# [3.14] Аппаратные видеокодеки (порядок — от новых форматов к старым)
 	local -a cxf=()
 	local f cx dec="" enc="" fm k2 v2
@@ -1167,11 +1176,18 @@ check_battery() {
 			END { if (i > 0 && v > 0) { w = i * v / 1e12; if (w >= 1 && w < 500) printf "%.0f", w } }')
 	fi
 	[ -n "$pmax" ] && src="$src · до $pmax Вт"
-	# Battery Share (обратная беспроводная) — Pixel
-	local rn
-	for rn in "$R/sys/class/power_supply/wireless/reverse_chg_mode" "$R/sys/class/power_supply/wireless/wireless_out"; do
-		rd "$rn" && [ "$REPLY" = "1" ] && { src="${MAGENTA}раздаёт заряд (Battery Share)${NC}"; break; }
-	done
+	# Battery Share (обратная беспроводная) — Pixel.
+	# [3.15.1] Настоящие узлы — у беспроводного чипа: wireless/device/rtx_status
+	# (available → active при включении) и rtx (0 → 1); проверено на Pixel 8 Pro.
+	# Прежние reverse_chg_mode / wireless_out на Pixel не существуют.
+	local rn wd="$R/sys/class/power_supply/wireless/device"
+	if { rd "$wd/rtx_status" && [ "$REPLY" = "active" ]; } || { rd "$wd/rtx" && [ "$REPLY" = "1" ]; }; then
+		src="${MAGENTA}раздаёт заряд (Battery Share)${NC}"
+	else
+		for rn in "$R/sys/class/power_supply/wireless/reverse_chg_mode" "$R/sys/class/power_supply/wireless/wireless_out"; do
+			rd "$rn" && [ "$REPLY" = "1" ] && { src="${MAGENTA}раздаёт заряд (Battery Share)${NC}"; break; }
+		done
+	fi
 	[ -n "$src" ] && kv "Питание" "$src"
 
 	# [3.8] Режимы зарядки и время до заряда. Переключатели живут в Settings
@@ -1587,6 +1603,36 @@ check_network() {
 		case "$ovr" in NR_NSA|NR_NSA_MMWAVE|NR_ADVANCED) line="$line ${GREEN}+ 5G NSA${NC}" ;; esac
 		kv "Диапазон" "$line ${DIM}(SIM$((ph + 1)))${NC}"
 	done <<< "$bl"
+	# [3.15.1] Звонки через IMS: переключатели VoLTE и Wi-Fi Calling активной SIM
+	# (siminfo; -1 = «как в общих настройках» → settings global). Регистрацию IMS
+	# Android наружу не отдаёт (cmd phone ims только переключает), поэтому пишем,
+	# что включено, а не что работает. «принудительно» — доступность включена в
+	# обход оператора (persist.dbg.volte_avail_ovr / wfc_avail_ovr).
+	local si sv_vo sv_wf sv_wm call=""
+	si=$(content query --uri content://telephony/siminfo --projection sim_id:volte_vt_enabled:wfc_ims_enabled:wfc_ims_mode 2>/dev/null \
+		| grep -E 'sim_id=[0-9]' | head -n 1)
+	if [ -n "$si" ]; then
+		sv_vo=$(printf '%s' "$si" | sed -n 's/.*volte_vt_enabled=\(-\{0,1\}[0-9]*\).*/\1/p')
+		sv_wf=$(printf '%s' "$si" | sed -n 's/.*wfc_ims_enabled=\(-\{0,1\}[0-9]*\).*/\1/p')
+		sv_wm=$(printf '%s' "$si" | sed -n 's/.*wfc_ims_mode=\(-\{0,1\}[0-9]*\).*/\1/p')
+		case "$sv_vo" in 0|1) ;; *) sv_vo=$(settings get global enhanced_4g_mode_enabled 2>/dev/null) ;; esac
+		case "$sv_wf" in 0|1) ;; *) sv_wf=$(settings get global wfc_ims_enabled 2>/dev/null) ;; esac
+		case "$sv_wm" in 0|1|2) ;; *) sv_wm=$(settings get global wfc_ims_mode 2>/dev/null) ;; esac
+		case "$sv_vo" in 1) call="VoLTE ${GREEN}вкл.${NC}" ;; 0) call="VoLTE выкл." ;; esac
+		case "$sv_wf" in
+			1) call="${call:+$call · }Wi-Fi Calling ${GREEN}вкл.${NC}"
+			   case "$sv_wm" in
+				0) call="$call ${DIM}(только Wi-Fi)${NC}" ;;
+				1) call="$call ${DIM}(предпочт. моб. сеть)${NC}" ;;
+				2) call="$call ${DIM}(предпочт. Wi-Fi)${NC}" ;;
+			   esac ;;
+			0) call="${call:+$call · }Wi-Fi Calling выкл." ;;
+		esac
+		local ovr1 ovr2
+		prop persist.dbg.volte_avail_ovr; ovr1="$REPLY"; prop persist.dbg.wfc_avail_ovr; ovr2="$REPLY"
+		[ -n "$call" ] && { [ "$ovr1" = "1" ] || [ "$ovr2" = "1" ]; } && call="$call · принудительно"
+		[ -n "$call" ] && kv "Звонки" "$call"
+	fi
 	[ -n "$NET_DNS" ] && kv "DNS" "$NET_DNS"
 	# [3.14.1] Частный DNS (DNS-over-TLS): off / opportunistic («авто», он же
 	# значение по умолчанию, если настройки нет) / hostname + адрес сервера
@@ -2578,8 +2624,16 @@ check_spoofing() {
 	local v m n
 	sv "$secl" pi_pp_spoof 1; onoff "$REPLY"; v="$REPLY"
 	sv "$secl" pi_pp_model ""; m="$REPLY"
+	# [3.15.1] Название модели вместо кодового имени: из PIF, если подделан тот же
+	# Pixel, иначе из кэша Evolver (pi_pixel_device_cache: codename → model).
+	local mn=""
+	if [ -n "$m" ]; then
+		[ "$(printf '%s' "$cfg" | grep -oE '"DEVICE" *: *"[^"]*"' | head -n 1 | sed 's/.*: *"//; s/"$//')" = "$m" ] && mn="$model"
+		[ -z "$mn" ] && mn=$(settings get secure pi_pixel_device_cache 2>/dev/null | grep -oE "\"codename\":\"$m\",\"model\":\"[^\"]*\"" | head -n 1 | sed 's/.*"model":"//; s/"$//')
+		if [ -n "$mn" ]; then m="$mn ${DIM}($m)${NC}"; else m="модель $m"; fi
+	fi
 	sv "$secl" pi_pp_targets ""; if [ -n "$REPLY" ]; then cnt "$REPLY"; n="приложений: $REPLY"; else n="список по умолчанию"; fi
-	kv "Pixel Props" "$v${m:+ · модель $m} · $n"
+	kv "Pixel Props" "$v${m:+ · $m} · $n"
 	sv "$secl" pi_tensor_spoof 0; onoff "$REPLY"; v="$REPLY"
 	sv "$secl" tensor_targets ""; if [ -n "$REPLY" ]; then cnt "$REPLY"; n=" · приложений: $REPLY"; else n=""; fi
 	kv "Tensor Props" "$v$n"
