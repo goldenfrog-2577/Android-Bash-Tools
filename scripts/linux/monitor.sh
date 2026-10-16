@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.15.3 — мониторинг состояния rooted Android
+# monitor.sh v3.15.4 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.15.3"
+readonly VERSION="3.15.4"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -584,6 +584,14 @@ check_memory() {
 	if [ -n "$REPLY" ]; then
 		IFS=',' read -r _ dvend dtype _ <<< "$REPLY"
 		ddr="${dtype}${dvend:+, $dvend}"
+	elif can_read "$R/proc/device-tree/memory/ddr_device_type"; then
+		# [3.15.4] Qualcomm: тип памяти в device tree — 32-битное число (big-endian).
+		# 8 = LPDDR5 проверено на POCO F3 (SM8250, по спецификации LPDDR5); 7 = LPDDR4X
+		# и 9 = LPDDR5X — по нумерации Qualcomm, на устройствах не проверены.
+		# Неизвестный код не выводим.
+		local dt
+		dt=$(od -An -tu1 "$R/proc/device-tree/memory/ddr_device_type" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) v = v * 256 + $i } END { print v + 0 }')
+		case "$dt" in 7) ddr="LPDDR4X" ;; 8) ddr="LPDDR5" ;; 9) ddr="LPDDR5X" ;; esac
 	fi
 	kv "Всего" "$(hsize_kb "$total")${ddr:+ · $ddr}"
 	kv "Доступно" "$(hsize_kb "$avail") ($apct%) · кэш $(hsize_kb "$cached")"
@@ -834,12 +842,44 @@ check_thermal() {
 		color_temp "$t"; kv "${TLABEL[$name]}" "$REPLY"; shown=1
 		[ "${t%.*}" -gt "$max" ] && max="${t%.*}"
 	done
+	# [3.15.4] Qualcomm: датчики cpu-<группа>-<n>. Группа — физический кластер
+	# ядер, и он не всегда совпадает с кластером частот: у Snapdragon 870 (F3)
+	# группа 1 — это и средние ядра 4–6, и prime-ядро 7 (policy7). По device tree
+	# F3: cpu-1-0…3 — датчики tsens 7…10 (верх ядер 4…7), cpu-1-4…7 — tsens 11…14
+	# (низ ядер 4…7), как в sm8250.dtsi ядра Linux. Поэтому датчик n группы
+	# относим к ядру (n mod число ядер группы), а ядро — к кластеру cpufreq.
+	# Если групп столько же, сколько кластеров, получается прежний результат.
 	if [ "$shown" -eq 0 ]; then
-		local c
-		for c in 0 1 2 3; do
-			zone_max "cpu-$c-*-usr" || zone_max "cpu-$c-*" || continue
-			mdeg "$REPLY"; t="$REPLY"
-			color_temp "$t"; kv "Кластер $((c + 1))" "$REPLY"; shown=1
+		local -A ccl=() cmx=()
+		local -a gcores=()
+		local nc=0 pp cc g k zn zi
+		for pp in "$R"/sys/devices/system/cpu/cpufreq/policy*; do
+			rd "$pp/related_cpus" || continue
+			nc=$((nc + 1))
+			for cc in $REPLY; do ccl[$cc]=$nc; done
+		done
+		for g in 0 1 2 3; do
+			# ядра группы g: g-й кластер cpufreq; последняя группа — все оставшиеся
+			gcores=()
+			local last=1
+			for k in "${!TZONE[@]}"; do [[ "$k" == cpu-$((g + 1))-* ]] && last=0; done
+			for cc in $(printf '%s\n' "${!ccl[@]}" | sort -n); do
+				if [ "${ccl[$cc]}" -eq $((g + 1)) ] || { [ "$last" -eq 1 ] && [ "${ccl[$cc]}" -gt $((g + 1)) ]; }; then gcores+=("$cc"); fi
+			done
+			for k in "${!TZONE[@]}"; do
+				[[ "$k" =~ ^cpu-$g-([0-9]+)-usr$ ]] || continue
+				zi="${BASH_REMATCH[1]}"
+				if [ "${#gcores[@]}" -gt 0 ]; then zn="${ccl[${gcores[$((zi % ${#gcores[@]}))]}]}"; else zn=$((g + 1)); fi
+				if [ -z "${cmx[$zn]:-}" ] || [ "${TZONE[$k]}" -gt "${cmx[$zn]}" ]; then cmx[$zn]="${TZONE[$k]}"; fi
+			done
+			# зон с -usr нет — берём любые cpu-g-* целиком на кластер g+1 (как раньше)
+			if [ -z "${cmx[$((g + 1))]:-}" ] && zone_max "cpu-$g-*"; then
+				[[ " ${!cmx[*]} " == *" $((g + 1)) "* ]] || cmx[$((g + 1))]="$REPLY"
+			fi
+		done
+		for zn in $(printf '%s\n' "${!cmx[@]}" | sort -n); do
+			mdeg "${cmx[$zn]}"; t="$REPLY"
+			color_temp "$t"; kv "Кластер $zn" "$REPLY"; shown=1
 			[ "${t%.*}" -gt "$max" ] && max="${t%.*}"
 		done
 	fi
@@ -1793,14 +1833,28 @@ check_iperf3_speed() {
 		kv "iperf3" "не установлен"
 		return
 	fi
-	note "Идёт тест, до 20 секунд на сервер…"
-	local server down up
-	for server in iperf.he.net ping.online.net bouygues.iperf.fr speedtest.serverius.net; do
-		down=$(timeout 12 iperf3 -c "$server" -R -t 5 2>/dev/null | awk '/receiver/ { print $(NF-2), $(NF-1) }')
+	# [3.15.4] Публичные серверы со своими портами (список iperf.fr и
+	# iperf3-public-servers-list, проверено пробой 10.2026). Раньше все шли на
+	# 5201: ping.online.net слушает 5200–5209, bouygues.iperf.fr переехал на
+	# *.iperf.bytel.fr (9200–9240), serverius — speedtest1.serverius.net:5002.
+	# Каждый сервер принимает один тест за раз: «busy» — пробуем другой порт.
+	note "Идёт тест, до 15 секунд на сервер…"
+	local server down up hp host lo hi port try out
+	for hp in ping.online.net:5200-5209 speedtest1.serverius.net:5002-5002 paris.bbr.iperf.bytel.fr:9200-9240 \
+		speedtest.milkywan.fr:9200-9240 iperf3.moji.fr:5200-5240 speedtest.kamel.network:5201-5205 iperf.he.net:5201-5201; do
+		host="${hp%%:*}"; lo="${hp#*:}"; hi="${lo#*-}"; lo="${lo%-*}"
+		for try in 1 2 3; do
+			port=$((lo + RANDOM % (hi - lo + 1)))
+			out=$(timeout 8 iperf3 -c "$host" -p "$port" -R -t 5 2>&1)
+			down=$(printf '%s\n' "$out" | awk '/receiver/ { print $(NF-2), $(NF-1) }')
+			[ -n "$down" ] && break
+			[[ "$out" == *busy* ]] || break      # не «занят» — сервер недоступен, дальше
+		done
 		[ -n "$down" ] || continue
+		server="$host:$port"
 		kv "Сервер" "$server"
 		kv "Загрузка" "$down"
-		up=$(timeout 12 iperf3 -c "$server" -t 5 2>/dev/null | awk '/receiver/ { print $(NF-2), $(NF-1) }')
+		up=$(timeout 8 iperf3 -c "$host" -p "$port" -t 5 2>/dev/null | awk '/receiver/ { print $(NF-2), $(NF-1) }')
 		kv "Отдача" "${up:-не удалось}"
 		return
 	done
