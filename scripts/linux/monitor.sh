@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.15.1 — мониторинг состояния rooted Android
+# monitor.sh v3.15.2 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.15.1"
+readonly VERSION="3.15.2"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -1065,6 +1065,89 @@ detect_ltpo() {
 	elif is_int "${lo:-x}" && is_int "${hi:-x}" && [ "$lo" -lt 60 ]; then
 		REPLY="адаптивная $lo–$hi Гц"
 	fi
+	return 0
+}
+
+# ── Камеры ──────────────────────────────────────────────────────────────────
+
+# [3.15.2] Камеры (только с -e): характеристики из dumpsys media.camera.
+# Блок «static information» — логическая камера; у Pixel внутри ещё «Physical
+# camera N characteristics» — настоящие модули, их и берём. Одна камера в разных
+# режимах (кроп, бининг) склеивается по направлению, фокусному и диафрагме.
+# Мегапиксели — по полному разрешению: pixelArraySizeMaximumResolution (Pixel)
+# или qcfa_dimension (Qualcomm quad-bayer, F3), иначе pixelArraySize.
+# Эквивалент 35 мм = фокусное × 43.27 / диагональ сенсора. Роль: основная —
+# задняя с самым большим сенсором; шире ×0.75 — широкий угол; длиннее ×1.5 —
+# телефото, а при фокусе ближе 5 см (≥ 20 диоптрий) — макро.
+CAM_AWK='# Вход: dumpsys media.camera. Выход: по строке на камеру (TAB):
+# роль  Мп  f  экв_мм  ois  зум
+function flush(   k, mp, d, eq, a) {
+	if (!have) return
+	have = 0
+	if (logical && phys_seen) return          # логическая поверх физических — пропуск
+	if (foc == "" || fl == "" || sw == "") return
+	mp = pw * ph; if (mw * mh > mp) mp = mw * mh; if (qw * qh > mp) mp = qw * qh
+	d = sqrt(sw * sw + sh * sh); if (d <= 0) return
+	eq = fl * 43.27 / d
+	k = foc SUBSEP fl SUBSEP ap
+	# одна и та же камера в разных режимах (кроп, бининг): берём самый большой
+	# сенсор, а мегапиксели и OIS — максимум по всем вариантам
+	if (k in area) {
+		if (mp > MP[k]) MP[k] = mp
+		if (ois) OIS[k] = 1
+		if (area[k] >= sw * sh) return
+	} else { order[++n] = k; MP[k] = mp; OIS[k] = ois }
+	area[k] = sw * sh; EQ[k] = eq; F[k] = ap; MF[k] = mf; FAC[k] = foc
+}
+function start() { flush(); have = 1; foc = fl = ap = sw = sh = ""; pw = ph = mw = mh = qw = qh = 0; ois = 0; mf = 0; logical = 0 }
+function nums(s) { gsub(/[\[\]]/, "", s); return split(s, V, " ") }
+/static information: ==/ { start(); phys_seen = 0; next }
+/^== / { flush(); next }
+/^ *Physical camera [0-9]+ characteristics:/ { phys_seen = 1; start(); next }
+!have { next }
+/android\.lens\.facing \(/ { getline; nums($0); foc = V[1]; next }
+/android\.lens\.info\.availableApertures \(/ { getline; nums($0); ap = V[1] + 0; next }
+/android\.lens\.info\.availableFocalLengths \(/ { getline; nums($0); fl = V[1] + 0; next }
+/android\.lens\.info\.availableOpticalStabilization \(/ { getline; c = nums($0); for (i = 1; i <= c; i++) if (V[i] == 1) ois = 1; next }
+/android\.lens\.info\.minimumFocusDistance \(/ { getline; nums($0); mf = V[1] + 0; next }
+/android\.sensor\.info\.physicalSize \(/ { getline; nums($0); sw = V[1] + 0; sh = V[2] + 0; next }
+/android\.sensor\.info\.pixelArraySize \(/ { getline; nums($0); pw = V[1] + 0; ph = V[2] + 0; next }
+/android\.sensor\.info\.pixelArraySizeMaximumResolution \(/ { getline; nums($0); mw = V[1] + 0; mh = V[2] + 0; next }
+/quadra_cfa\.qcfa_dimension \(/ { getline; nums($0); qw = V[1] + 0; qh = V[2] + 0; next }
+/android\.logicalMultiCamera\.physicalIds \(/ { logical = 1; next }
+END {
+	flush()
+	# основная — задняя с самым большим сенсором
+	best = ""; for (i = 1; i <= n; i++) { k = order[i]; if (FAC[k] == "BACK" && (best == "" || area[k] > area[best])) best = k }
+	nf = 0
+	for (i = 1; i <= n; i++) {
+		k = order[i]; z = ""
+		if (FAC[k] == "FRONT") role = (++nf > 1) ? "Фронтальная " nf : "Фронтальная"
+		else if (FAC[k] != "BACK") role = "Внешняя"
+		else if (k == best) role = "Основная"
+		else if (EQ[k] < EQ[best] * 0.75) role = "Широкий угол"
+		else if (EQ[k] > EQ[best] * 1.5 && MF[k] >= 20) role = "Макро"
+		else if (EQ[k] > EQ[best] * 1.5) { role = "Телефото"; z = sprintf("%.1f", int(EQ[k] + 0.5) / int(EQ[best] + 0.5)) }
+		else role = "Камера"
+		r = (role == "Основная") ? 1 : (role == "Широкий угол") ? 2 : (role == "Телефото") ? 3 : (role == "Макро") ? 4 : (role == "Камера") ? 5 : 6
+		m = MP[k] / 1e6; if (m >= 20) m = int(m); else m = int(m * 10) / 10
+		printf "%d\t%s\t%s\t%.3g\t%d\t%d\t%s\n", r, role, m, F[k], EQ[k] + 0.5, OIS[k], z
+	}
+}
+'
+
+check_cameras() {
+	local rows
+	rows=$(dumpsys media.camera 2>/dev/null | awk "$CAM_AWK" 2>/dev/null | sort -n -k1,1)
+	[ -n "$rows" ] || return 0
+	section "КАМЕРЫ"
+	local r role mp f eq ois z line
+	while IFS=$'\t' read -r r role mp f eq ois z; do
+		[ -n "$role" ] || continue
+		line="$mp Мп · f/$f · $eq мм${z:+ ${DIM}(×$z)${NC}}"
+		[ "$ois" = "1" ] && line="$line · OIS"
+		kv "$role" "$line"
+	done <<< "$rows"
 	return 0
 }
 
@@ -3229,6 +3312,9 @@ run_monitor() {
 	check_cpu
 	check_thermal
 	check_gpu
+	if [ "$EXTENDED" -eq 1 ]; then
+		check_cameras
+	fi
 	check_battery
 	check_wakelocks
 	check_network
