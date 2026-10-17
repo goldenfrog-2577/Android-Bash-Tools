@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.15.5 — мониторинг состояния rooted Android
+# monitor.sh v3.16 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -30,7 +30,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
 		/data/user/0/bin.mt.plus/files/term/bin/bash \
 		/data/data/bin.mt.plus/files/term/bin/bash \
 		/data/data/com.termux/files/usr/bin/bash \
-		/system/xbin/bash /system/bin/bash /usr/bin/bash /bin/bash; do
+		/system_ext/bin/bash /system/xbin/bash /system/bin/bash /usr/bin/bash /bin/bash; do
 		[ -n "$_b" ] && [ -x "$_b" ] && exec "$_b" "$_self" "$@"
 	done
 	echo "[!] Нужен bash (MT Manager / Termux)." >&2
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.15.5"
+readonly VERSION="3.16"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -342,6 +342,112 @@ load_props() {
 }
 prop() { REPLY="${PROP[$1]:-}"; }
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  [3.16] ФОНОВЫЕ ЗАДАЧИ И КЭШИ ПРОХОДА
+# ═════════════════════════════════════════════════════════════════════════════
+# Медленные внешние команды (dumpsys, settings, df, ping, CLI LSPosed) запускаются
+# заранее в фоне (prefetch), а секции забирают готовый вывод через jget — в том же
+# порядке, что и раньше, поэтому отчёт не меняется. Без фоновой задачи (например,
+# с -d или если временную папку не создать) jget просто выполняет команду сам.
+#
+#   job  ИМЯ команда…  — запустить в фоне (повторный вызов с тем же именем — ничего)
+#   jget ИМЯ команда…  — REPLY = вывод (как $(…), без хвостовых переводов строки),
+#                        код возврата — код команды
+#
+# Вывод идёт в файл через «| cat»: settings и cmd пишут ответом system_server
+# в наш дескриптор, а ему запрещено писать в файлы root (проба 3.16 на /sdcard).
+# jget вызывается только в основном процессе — не внутри $(…), иначе wait не
+# дождётся задачи.
+JOB_DIR=""
+declare -A JOB_PID=()
+jobs_init() {
+	jobs_done
+	local d j
+	for d in /dev /data/local/tmp "${TMPDIR:-}" /tmp; do
+		[ -n "$d" ] && [ -d "$d" ] || continue
+		j="$d/.goldenfrog_monitor.$$.jobs"
+		rm -rf "$j" 2>/dev/null
+		mkdir -m 700 "$j" 2>/dev/null && { JOB_DIR="$j"; return 0; }
+	done
+	return 1
+}
+jobs_done() {   # конец прохода: недождавшиеся задачи останавливаем, папку удаляем
+	local n p
+	for n in "${!JOB_PID[@]}"; do
+		p="${JOB_PID[$n]}"
+		[ "$p" = done ] || { kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; }
+	done
+	JOB_PID=()
+	[ -n "$JOB_DIR" ] && rm -rf "$JOB_DIR" 2>/dev/null
+	JOB_DIR=""
+}
+job() {
+	local n="$1"; shift
+	[ -n "$JOB_DIR" ] && [ -z "${JOB_PID[$n]:-}" ] || return 0
+	# готовый вывод появляется под именем ИМЯ только целиком (mv), код — в ИМЯ.rc
+	{ "$@" 2>/dev/null < /dev/null | cat > "$JOB_DIR/$n.part"; echo "${PIPESTATUS[0]}" > "$JOB_DIR/$n.rc"
+	  mv -f "$JOB_DIR/$n.part" "$JOB_DIR/$n"; } 2>/dev/null &
+	JOB_PID[$n]=$!
+}
+jget() {
+	local n="$1" rc=0 i=0; shift
+	if [ -n "${JOB_PID[$n]:-}" ]; then
+		[ "${JOB_PID[$n]}" = done ] || { wait "${JOB_PID[$n]}" 2>/dev/null; JOB_PID[$n]=done; }
+		# из подоболочки wait чужую задачу не ждёт — тогда ждём сам файл (до 60 с)
+		while [ ! -f "$JOB_DIR/$n" ] && [ -d "$JOB_DIR" ] && [ "$i" -lt 1200 ]; do sleep 0.05; i=$((i + 1)); done
+		# нулевые байты (бывают в дампах) bash отбрасывает — без предупреждения в stderr
+		REPLY=""; [ -f "$JOB_DIR/$n" ] && { REPLY=$(< "$JOB_DIR/$n"); } 2>/dev/null
+		IFS= read -r rc 2>/dev/null < "$JOB_DIR/$n.rc"
+		is_int "${rc:-x}" || rc=1
+		return "$rc"
+	fi
+	{ REPLY=$("$@" 2>/dev/null); } 2>/dev/null
+}
+jout() { [ -z "$REPLY" ] || printf '%s\n' "$REPLY"; }   # вывод jget — как из самой команды
+jobs_wait_all() {   # перед замером top: чтобы фоновые команды не попали в замер
+	local n
+	for n in "${!JOB_PID[@]}"; do
+		[ "${JOB_PID[$n]}" = done ] || { wait "${JOB_PID[$n]}" 2>/dev/null; JOB_PID[$n]=done; }
+	done
+}
+
+# Настройки Android: «settings list» на пространство имён — один раз за проход
+# вместо отдельного «settings get» на каждый ключ (каждый вызов ~0.1 с).
+# sget ПРОСТРАНСТВО КЛЮЧ → REPLY, «null» для отсутствующего ключа — как settings get.
+# Многострочное значение собирается из строк-продолжений. Большие JSON-значения
+# подмены (spoof_pif_config, pi_pixel_device_cache) по-прежнему читаются через get.
+declare -A SG_LOADED=() SG=()
+# keybox подмены (spoof_trickystore_keybox) заменяется на «1» прямо в конвейере
+# (вместе со строками-продолжениями, если значение многострочное): его содержимое
+# не попадает ни во временный файл, ни в память скрипта.
+settings_list_raw() {
+	if [ "$1" = secure ]; then settings list secure 2>/dev/null | awk '/^[A-Za-z0-9_.:-]+=/ { s = 0 }
+		/^spoof_trickystore_keybox=./ { print "spoof_trickystore_keybox=1"; s = 1; next } !s'
+	else settings list "$1" 2>/dev/null; fi
+}
+settings_list() {   # settings_list ПРОСТРАНСТВО → REPLY = вывод «settings list»
+	jget "sg_$1" settings_list_raw "$1"
+}
+sget_load() {
+	local ns="$1" line k="" re='^([A-Za-z0-9_.:-]+)=(.*)$'
+	SG_LOADED[$ns]=1
+	settings_list "$ns"
+	[ -n "$REPLY" ] || { SG_LOADED[$ns]=get; return 1; }   # list не ответил — по ключу
+	while IFS= read -r line; do
+		if [[ "$line" =~ $re ]]; then
+			k="${BASH_REMATCH[1]}"; SG[$ns/$k]="${BASH_REMATCH[2]}"
+		elif [ -n "$k" ]; then
+			SG[$ns/$k]+=$'\n'"$line"
+		fi
+	done <<< "$REPLY"
+}
+sget() {
+	[ -n "${SG_LOADED[$1]:-}" ] || sget_load "$1"
+	if [ "${SG_LOADED[$1]}" = get ]; then REPLY=$(settings get "$1" "$2" 2>/dev/null); return 0; fi
+	REPLY="${SG[$1/$2]-null}"
+}
+sg_reset() { SG_LOADED=(); SG=(); }
+
 # Термозоны: тип → температура (м°C). Отбрасываем заведомо мусорные значения.
 # [3.8] Массив был назван TZ и затирал одноимённую переменную окружения часового
 # пояса: время в шапке и даты выводились по UTC, если пояс задан через TZ.
@@ -397,9 +503,27 @@ fmt_dur() {
 	else h=$((m / 60)); m=$((m % 60)); REPLY="~$h ч${m:+ $m мин}"; [ "$m" -eq 0 ] && REPLY="~$h ч"; fi
 }
 
-hsize_kb() {   # КБ → «12.3 ГБ»
-	awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.1f ГБ", k/1048576;
-		else if (k >= 1024) printf "%.0f МБ", k/1024; else printf "%d КБ", k }'
+# [3.16] КБ → «12.3 ГБ» арифметикой bash (раньше — отдельный awk на каждый вызов,
+# ~50 мс на Pixel). Округление как у printf %.1f / %.0f: точная половина — к чётному.
+hsize_kb() {
+	local k="$1" q r
+	if ! [[ "$k" =~ ^[0-9]+$ ]] || [ "${#k}" -gt 15 ]; then
+		awk -v k="$k" 'BEGIN { if (k >= 1048576) printf "%.1f ГБ", k/1048576;
+			else if (k >= 1024) printf "%.0f МБ", k/1024; else printf "%d КБ", k }'
+		return
+	fi
+	k=$((10#$k))
+	if [ "$k" -ge 1048576 ]; then
+		q=$(( k * 10 / 1048576 )); r=$(( k * 10 % 1048576 ))
+		{ [ "$r" -gt 524288 ] || { [ "$r" -eq 524288 ] && [ $((q % 2)) -eq 1 ]; }; } && q=$((q + 1))
+		printf '%s.%s ГБ' "$((q / 10))" "$((q % 10))"
+	elif [ "$k" -ge 1024 ]; then
+		q=$(( k / 1024 )); r=$(( k % 1024 ))
+		{ [ "$r" -gt 512 ] || { [ "$r" -eq 512 ] && [ $((q % 2)) -eq 1 ]; }; } && q=$((q + 1))
+		printf '%s МБ' "$q"
+	else
+		printf '%s КБ' "$k"
+	fi
 }
 
 # Верификация загрузки: правда из ядра (cmdline/bootconfig) против свойств
@@ -1023,9 +1147,9 @@ check_gpu() {
 
 	# Экран: разрешение и текущая частота обновления (период vsync из SurfaceFlinger)
 	local res period hz="" wsz
-	wsz=$(wm size 2>/dev/null)
+	jget wm_size wm size; wsz="$REPLY"
 	res=$(printf '%s\n' "$wsz" | awk -F': ' '/Override/ {o=$2} /Physical/ {p=$2} END {print (o ? o " (физ. " p ")" : p)}')
-	period=$(dumpsys SurfaceFlinger --latency 2>/dev/null | head -n 1)
+	jget sf_latency dumpsys SurfaceFlinger --latency; period=$(jout | head -n 1)
 	is_int "${period:-x}" && [ "$period" -gt 0 ] && hz=$(( (1000000000 + period / 2) / period ))
 	detect_ltpo
 	kv "Экран" "${res:-?}${hz:+ · $hz Гц}${REPLY:+ · $REPLY}"
@@ -1036,7 +1160,7 @@ check_gpu() {
 	# округлением, как в системе (Pixel 8 Pro: 1344 × 160 / 480 = 448 dp).
 	# Если плотность или размер изменены (wm density / wm size), берём изменённые.
 	local dens a b
-	dens=$(wm density 2>/dev/null | awk -F': ' '/Override/ {o=$2} /Physical/ {p=$2} END {print p " " o}')
+	jget wm_density wm density; dens=$(jout | awk -F': ' '/Override/ {o=$2} /Physical/ {p=$2} END {print p " " o}')
 	read -r a b <<< "$dens"
 	if is_int "${a:-x}" && [ "$a" -gt 0 ]; then
 		local d="${b:-$a}" sz w h sw=""
@@ -1052,7 +1176,8 @@ check_gpu() {
 	# [3.15.1] HDR-форматы экрана: HdrCapabilities из dumpsys display
 	# (Display.HdrCapabilities: 1 Dolby Vision · 2 HDR10 · 3 HLG · 4 HDR10+)
 	local hdr="" ht
-	for ht in $(dumpsys display 2>/dev/null | sed -n 's/.*mSupportedHdrTypes=\[\([0-9, ]*\)\].*/\1/p' | head -n 1 | tr ',' ' '); do
+	jget display dumpsys display
+	for ht in $(jout | sed -n 's/.*mSupportedHdrTypes=\[\([0-9, ]*\)\].*/\1/p' | head -n 1 | tr ',' ' '); do
 		case "$ht" in 1) ht="Dolby Vision" ;; 2) ht="HDR10" ;; 3) ht="HLG" ;; 4) ht="HDR10+" ;; *) continue ;; esac
 		hdr="${hdr:+$hdr · }$ht"
 	done
@@ -1109,7 +1234,9 @@ detect_ltpo() {
 		break
 	done
 	# Диапазон частот из DisplayManager (один раз, первая строка списка)
-	rates=$(dumpsys display 2>/dev/null | sed -n 's/.*mSupportedRefreshRates=\[\([^]]*\)\].*/\1/p' | head -n 1)
+	local kind="$REPLY"   # jget перезапишет REPLY
+	jget display dumpsys display; rates=$(jout | sed -n 's/.*mSupportedRefreshRates=\[\([^]]*\)\].*/\1/p' | head -n 1)
+	REPLY="$kind"
 	read -r lo hi <<< "$(printf '%s' "$rates" | awk -F', *' '{ lo = 1e9; hi = 0
 		for (i = 1; i <= NF; i++) { v = $i + 0; if (v <= 0) continue; if (v < lo) lo = v; if (v > hi) hi = v }
 		if (hi > 0) printf "%.0f %.0f", lo, hi }')"
@@ -1193,7 +1320,7 @@ END {
 
 check_cameras() {
 	local rows
-	rows=$(dumpsys media.camera 2>/dev/null | awk "$CAM_AWK" 2>/dev/null | sort -n -k1,1)
+	jget camera dumpsys media.camera; rows=$(jout | awk "$CAM_AWK" 2>/dev/null | sort -n -k1,1)
 	[ -n "$rows" ] || return 0
 	section "КАМЕРЫ"
 	# [3.15.5] Модели сенсоров — только где прошивка их называет: Xiaomi пишет
@@ -1231,63 +1358,71 @@ check_cameras() {
 
 # ── Батарея ──────────────────────────────────────────────────────────────────
 
-# [3.7] Батарея: нет данных — «н/д», а не 0 °C / 0% (раньше пустое чтение
-# выглядело как реальный ноль). Температура с десятыми, ёмкость больше паспортной
-# показывается как есть (у новой батареи это норма, паспорт — гарантированный
-# минимум). Добавлены технология, даты производства и первого применения (Pixel),
-# модель и подлинность батареи (Qualcomm bms / Maxim), в -e — сопротивление.
-check_battery() {
-	section "БАТАРЕЯ"
-	local b="$R/sys/class/power_supply/battery" bms="$R/sys/class/power_supply/bms"
-	if [ ! -d "$b" ]; then kv "Батарея" "нет данных"; return; fi
+# [3.16] Секция разделена на сбор и вывод: bat_read читает узлы в BAT_*, каждая
+# строка отчёта собирается своей функцией (значение — в REPLY, пусто — строки нет),
+# а check_battery только печатает их по порядку. Логика строк — прежняя.
+BAT=""; BMS=""
+BAT_CAP=""; BAT_STATUS=""; BAT_TEMP=""; BAT_TDEG=""; BAT_VOLT=""; BAT_CUR=""
+BAT_HEALTH=""; BAT_CYCLES=""; BAT_FULL=""; BAT_DESIGN=""; BAT_TECH=""
+BAT_DBAT=""; BAT_USB_IN=0; BAT_SRC=""; BAT_SHARE=""
 
-	local cap="" status temp="" tdeg="" volt="" cur_ua="" health cycles full design tech
-	rd "$b/capacity" && is_int "$REPLY" && cap="$REPLY"
-	rd "$b/status"; status="$REPLY"
-	if rd "$b/temp" && is_int "$REPLY"; then
-		temp=$((REPLY / 10))                     # целые °C — для порога
-		tdeg=$(awk -v t="$REPLY" 'BEGIN { printf "%.1f", t / 10 }')
+bat_read() {   # узлы батареи → BAT_*; нет батареи — код 1
+	BAT="$R/sys/class/power_supply/battery"; BMS="$R/sys/class/power_supply/bms"
+	BAT_CAP=""; BAT_STATUS=""; BAT_TEMP=""; BAT_TDEG=""; BAT_VOLT=""; BAT_CUR=""
+	BAT_HEALTH=""; BAT_CYCLES=""; BAT_FULL=""; BAT_DESIGN=""; BAT_TECH=""
+	[ -d "$BAT" ] || return 1
+	rd "$BAT/capacity" && is_int "$REPLY" && BAT_CAP="$REPLY"
+	rd "$BAT/status"; BAT_STATUS="$REPLY"
+	if rd "$BAT/temp" && is_int "$REPLY"; then
+		BAT_TEMP=$((REPLY / 10))                     # целые °C — для порога
+		BAT_TDEG=$(awk -v t="$REPLY" 'BEGIN { printf "%.1f", t / 10 }')
 	fi
-	rd "$b/voltage_now" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && volt=$((REPLY / 1000))
-	rd "$b/current_now" && is_int "$REPLY" && cur_ua="$REPLY"
-	rd "$b/health"; health="$REPLY"
-	rd "$b/cycle_count"; cycles="$REPLY"
-	rd "$b/charge_full"; full="$REPLY"
-	rd "$b/charge_full_design"; design="$REPLY"
-	rd "$b/technology"; tech="$REPLY"
+	rd "$BAT/voltage_now" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && BAT_VOLT=$((REPLY / 1000))
+	rd "$BAT/current_now" && is_int "$REPLY" && BAT_CUR="$REPLY"
+	rd "$BAT/health"; BAT_HEALTH="$REPLY"
+	rd "$BAT/cycle_count"; BAT_CYCLES="$REPLY"
+	rd "$BAT/charge_full"; BAT_FULL="$REPLY"
+	rd "$BAT/charge_full_design"; BAT_DESIGN="$REPLY"
+	rd "$BAT/technology"; BAT_TECH="$REPLY"
 
 	# Знак тока у вендоров разный (Pixel: разряд < 0, Qualcomm: разряд > 0) — приводим к
 	# «минус = разряд» по статусу
-	if [ -n "$cur_ua" ]; then
-		case "$status" in
-			Discharging) [ "$cur_ua" -gt 0 ] && cur_ua=$(( -cur_ua )) ;;
-			Charging) [ "$cur_ua" -lt 0 ] && cur_ua=$(( -cur_ua )) ;;
+	if [ -n "$BAT_CUR" ]; then
+		case "$BAT_STATUS" in
+			Discharging) [ "$BAT_CUR" -gt 0 ] && BAT_CUR=$(( -BAT_CUR )) ;;
+			Charging) [ "$BAT_CUR" -lt 0 ] && BAT_CUR=$(( -BAT_CUR )) ;;
 		esac
 	fi
+	return 0
+}
 
+bat_level() {   # «Уровень»
 	local st_ru
-	case "$status" in
+	case "$BAT_STATUS" in
 		Charging) st_ru="${GREEN}заряжается${NC}" ;;
 		Discharging) st_ru="разряжается" ;;
 		Full) st_ru="${GREEN}заряжена${NC}" ;;
 		"Not charging") st_ru="${YELLOW}не заряжается${NC}" ;;
-		*) st_ru="${status:-?}" ;;
+		*) st_ru="${BAT_STATUS:-?}" ;;
 	esac
 	local cap_c=""
-	[ -n "$cap" ] && [ "$status" = "Discharging" ] && [ "$cap" -lt 20 ] && cap_c="$RED"
+	[ -n "$BAT_CAP" ] && [ "$BAT_STATUS" = "Discharging" ] && [ "$BAT_CAP" -lt 20 ] && cap_c="$RED"
 	local cap_s="н/д"
-	[ -n "$cap" ] && cap_s="${cap_c}${cap}%${cap_c:+$NC}"
-	kv "Уровень" "$cap_s · $st_ru"
+	[ -n "$BAT_CAP" ] && cap_s="${cap_c}${BAT_CAP}%${cap_c:+$NC}"
+	REPLY="$cap_s · $st_ru"
+}
 
-	# [3.15] Прогноз Device Health Services (как в настройках «Батарея»): DHS пишет
-	# в settings global время расчёта (battery_estimates_last_update_time, мс) и
-	# сколько осталось на тот момент (time_remaining_estimate_millis). Конец =
-	# расчёт + остаток. Только при разрядке и если прогноз ещё не прошёл.
-	# Как SettingsLib (PowerUtil): время окончания округляется до ближайших
-	# 15 минут — иначе строка расходится со шторкой на пару минут.
-	if [ "$status" = "Discharging" ]; then
+# [3.15] Прогноз Device Health Services (как в настройках «Батарея»): DHS пишет
+# в settings global время расчёта (battery_estimates_last_update_time, мс) и
+# сколько осталось на тот момент (time_remaining_estimate_millis). Конец =
+# расчёт + остаток. Только при разрядке и если прогноз ещё не прошёл.
+# Как SettingsLib (PowerUtil): время окончания округляется до ближайших
+# 15 минут — иначе строка расходится со шторкой на пару минут.
+bat_estimate() {   # «Хватит до»
+	local out=""
+	if [ "$BAT_STATUS" = "Discharging" ]; then
 		local est upd use end now day wd
-		est=$(settings list global 2>/dev/null | grep -E '^(battery_estimates_last_update_time|time_remaining_estimate_millis|time_remaining_estimate_based_on_usage)=')
+		settings_list global; est=$(printf '%s\n' "$REPLY" | grep -E '^(battery_estimates_last_update_time|time_remaining_estimate_millis|time_remaining_estimate_based_on_usage)=')
 		upd=$(printf '%s\n' "$est" | sed -n 's/^battery_estimates_last_update_time=//p')
 		end=$(printf '%s\n' "$est" | sed -n 's/^time_remaining_estimate_millis=//p')
 		use=$(printf '%s\n' "$est" | sed -n 's/^time_remaining_estimate_based_on_usage=//p')
@@ -1303,24 +1438,28 @@ check_battery() {
 					case "$wd" in 1) wd="пн" ;; 2) wd="вт" ;; 3) wd="ср" ;; 4) wd="чт" ;; 5) wd="пт" ;; 6) wd="сб" ;; 7) wd="вс" ;; esac
 					printf -v wd '%s %(%H:%M)T' "$wd" "$end"
 				fi
-				kv "Хватит до" "$wd${use:+ ${DIM}($([ "$use" = 1 ] && echo "по использованию" || echo "по среднему расходу"))${NC}}"
+				out="$wd${use:+ ${DIM}($([ "$use" = 1 ] && echo "по использованию" || echo "по среднему расходу"))${NC}}"
 			fi
 		fi
 	fi
+	REPLY="$out"
+}
 
-	# Источник питания
-	# [3.8.1] Формат «USB PD, быстрая · 8.3 В · до 20 Вт»: единицы прямо в тексте
-	# (раньше «(8 В)» читалось двусмысленно), напряжение с десятыми.
-	local src="" ps tp on pmax="" dbat usb_in=0 usb_hv=0
+# Источник питания → BAT_SRC («Питание»), BAT_SHARE («Battery Share»), BAT_USB_IN.
+# [3.8.1] Формат «USB PD, быстрая · 8.3 В · до 20 Вт»: единицы прямо в тексте
+# (раньше «(8 В)» читалось двусмысленно), напряжение с десятыми.
+bat_source() {
+	local src="" ps tp pmax="" usb_hv=0
+	BAT_USB_IN=0; BAT_SRC=""; BAT_SHARE=""
 	# [3.15.5] dumpsys battery — один раз: предел мощности и режим зарядки
-	dbat=$(dumpsys battery 2>/dev/null)
+	jget battery dumpsys battery; BAT_DBAT="$REPLY"
 	for ps in "$R"/sys/class/power_supply/*; do
 		rd "$ps/online" && [ "$REPLY" = "1" ] || continue
 		rd "$ps/type"; tp="$REPLY"
 		case "${ps##*/}:$tp" in
 			wireless:*|*:Wireless) src="беспроводная" ;;
 			usb:*|*:USB*)
-				usb_in=1
+				BAT_USB_IN=1
 				local uv=0 proto="USB"
 				rd "$ps/voltage_now" && is_int "$REPLY" && uv=$((REPLY / 1000))
 				case "$tp" in USB_PD*) proto="USB PD" ;; esac   # [3.7] протокол, если драйвер сообщает
@@ -1336,7 +1475,7 @@ check_battery() {
 	# [3.8.1] Иначе — договорённость телефона с зарядником из BatteryService
 	# (Max charging current × voltage, Pixel): это предел, а не текущая мощность.
 	if [ -n "$src" ] && [ -z "$pmax" ] && [ "$src" != "беспроводная" ]; then
-		pmax=$(printf '%s\n' "$dbat" | awk -F': ' '
+		pmax=$(printf '%s\n' "$BAT_DBAT" | awk -F': ' '
 			/Max charging current:/ { i = $2 + 0 } /Max charging voltage:/ { v = $2 + 0 }
 			END { if (i > 0 && v > 0) { w = i * v / 1e12; if (w >= 1 && w < 500) printf "%.0f", w } }')
 	fi
@@ -1345,9 +1484,9 @@ check_battery() {
 	# меньше 5 Вт — медленная, больше 7,5 Вт — быстрая, между — обычная
 	# (config_chargingSlowlyThreshold / config_chargingFastThreshold). Нет данных
 	# сервиса — по пределу драйвера (power_max), иначе по напряжению > 6 В, как раньше.
-	if [ "$usb_in" -eq 1 ] && [ -n "$src" ]; then
+	if [ "$BAT_USB_IN" -eq 1 ] && [ -n "$src" ]; then
 		local mw spd=""
-		mw=$(printf '%s\n' "$dbat" | awk -F': ' '
+		mw=$(printf '%s\n' "$BAT_DBAT" | awk -F': ' '
 			/Max charging current:/ { i = $2 + 0 } /Max charging voltage:/ { v = $2 + 0 }
 			END { if (v <= 0) v = 5000000; if (i > 0) printf "%d", (i / 1000) * (v / 1000) }')
 		if is_int "${mw:-x}" && [ "$mw" -gt 0 ]; then
@@ -1359,10 +1498,6 @@ check_battery() {
 		[ -n "$spd" ] && src="${src%% · *}, $spd${src#"${src%% · *}"}"
 	fi
 	[ -n "$pmax" ] && src="$src · до $pmax Вт"
-	# Battery Share (обратная беспроводная) — Pixel.
-	# [3.15.1] Настоящие узлы — у беспроводного чипа: wireless/device/rtx_status
-	# (available → active при включении) и rtx (0 → 1); проверено на Pixel 8 Pro.
-	# Прежние reverse_chg_mode / wireless_out на Pixel не существуют.
 	# Battery Share (обратная беспроводная) — Pixel: отдельной строкой.
 	# [3.15.1] Узлы беспроводного чипа: wireless/device/rtx_status (available →
 	# active) и rtx (0 → 1). [3.15.5] Пробы 3155/3155b на Pixel 8 Pro: «active» и
@@ -1370,11 +1505,12 @@ check_battery() {
 	# сам ненадолго включает его при подключении кабеля («Включать автоматически»,
 	# settings global settings_key_reverse_charging_auto_turn_on=1). Отдельной
 	# настройки основного переключателя и порога остановки в settings нет.
+	# Прежние reverse_chg_mode / wireless_out остаются запасным путём для других устройств.
 	local rn bs="" wd="$R/sys/class/power_supply/wireless/device" bsauto
 	if [ -e "$wd/rtx_status" ] || [ -e "$wd/rtx" ]; then
-		bsauto=$(settings get global settings_key_reverse_charging_auto_turn_on 2>/dev/null)
+		sget global settings_key_reverse_charging_auto_turn_on; bsauto="$REPLY"
 		if { rd "$wd/rtx_status" && [ "$REPLY" = "active" ]; } || { rd "$wd/rtx" && [ "$REPLY" = "1" ]; }; then
-			if [ "$usb_in" -eq 1 ] && [ "$bsauto" = "1" ]; then
+			if [ "$BAT_USB_IN" -eq 1 ] && [ "$bsauto" = "1" ]; then
 				bs="${MAGENTA}вкл.${NC} ${DIM}(ненадолго, автовключение при подключении кабеля)${NC}"
 			else
 				bs="${MAGENTA}вкл.${NC} ${DIM}(беспроводная раздача заряда)${NC}"
@@ -1389,33 +1525,35 @@ check_battery() {
 			rd "$rn" && [ "$REPLY" = "1" ] && { src="${MAGENTA}раздаёт заряд (Battery Share)${NC}"; break; }
 		done
 	fi
-	[ -n "$src" ] && kv "Питание" "$src"
-	[ -n "$bs" ] && kv "Battery Share" "$bs"
+	BAT_SRC="$src"; BAT_SHARE="$bs"
+}
 
-	# [3.8] Режимы зарядки и время до заряда. Переключатели живут в Settings
-	# Intelligence / SystemUI, но применяются через Health HAL — читаем результат
-	# в ядре, стандартные узлы healthd (AOSP, Android 14+):
-	#   charging_policy: 1 обычная · 2 LONG_LIFE («Максимум 80%») · 3 ADAPTIVE
-	#   charging_state:  1 обычная · 2 холодно · 3 жарко · 4 LONG_LIFE · 5 ADAPTIVE
-	# Где узлов нет (F3: HAL отвечает INVALID), режимы не выдумываем.
+# [3.8] Режимы зарядки и время до заряда («Режим»). Переключатели живут в Settings
+# Intelligence / SystemUI, но применяются через Health HAL — читаем результат
+# в ядре, стандартные узлы healthd (AOSP, Android 14+):
+#   charging_policy: 1 обычная · 2 LONG_LIFE («Максимум 80%») · 3 ADAPTIVE
+#   charging_state:  1 обычная · 2 холодно · 3 жарко · 4 LONG_LIFE · 5 ADAPTIVE
+# Где узлов нет (F3: HAL отвечает INVALID), режимы не выдумываем.
+bat_modes() {
+	local b="$BAT" status="$BAT_STATUS" cap="$BAT_CAP"
 	local pol="" cst="" modes="" eta="" bd v
 	rd "$b/charging_policy" && is_int "$REPLY" && pol="$REPLY"
 	rd "$b/charging_state" && is_int "$REPLY" && cst="$REPLY"
 	# [3.15.5] Pixel 8 Pro (Android 17) пишет в charging_policy свой код 4 при
 	# «Максимум 80%», а BatteryService отдаёт уже стандартный (AIDL
 	# BatteryChargingPolicy: 1 обычная · 2 LONG_LIFE · 3 ADAPTIVE) — берём его.
-	v=$(printf '%s\n' "$dbat" | sed -n 's/^ *Charging policy: *//p' | head -n 1)
+	v=$(printf '%s\n' "$BAT_DBAT" | sed -n 's/^ *Charging policy: *//p' | head -n 1)
 	# Особые режимы (2, 3) из BatteryService главнее; «1» не перекрывает узел ядра,
 	# чтобы не потерять адаптивную зарядку, если сервис её не отражает.
 	is_int "${v:-x}" && { [ "$v" = "2" ] || [ "$v" = "3" ]; } && pol="$v"
-	v=$(printf '%s\n' "$dbat" | sed -n 's/^ *Charging state: *//p' | head -n 1)
+	v=$(printf '%s\n' "$BAT_DBAT" | sed -n 's/^ *Charging state: *//p' | head -n 1)
 	is_int "${v:-x}" && [ "$v" -ge 2 ] && [ "$v" -le 5 ] && cst="$v"
 	# [3.15.5] Выбранный режим виден и без кабеля: «Максимум 80%» BatteryService
 	# отдаёт всегда (2), а адаптивная до начала зарядки не видна в политике —
 	# берём настройку secure adaptive_charging_enabled (проба 3155b; «Максимум 80%»
 	# там же — charge_optimization_mode=1, оба 0 — оптимизация выключена).
 	# Во время зарядки не подставляем: там важно, работает ли режим сейчас.
-	if [ "$status" = "Discharging" ] && [ "$pol" != "2" ] && [ "$pol" != "3" ] && [ "$(settings get secure adaptive_charging_enabled 2>/dev/null)" = "1" ]; then
+	if [ "$status" = "Discharging" ] && [ "$pol" != "2" ] && [ "$pol" != "3" ] && { sget secure adaptive_charging_enabled; [ "$REPLY" = "1" ]; }; then
 		pol=3
 	fi
 	case "$pol" in 2) modes="максимум 80%" ;; 3) modes="адаптивная зарядка" ;; esac
@@ -1430,13 +1568,13 @@ check_battery() {
 	# [3.15.5] Энергосбережение — в конце строки, после подсказки режима зарядки,
 	# иначе «… · энергосбережение · включится при зарядке» читалось как про него.
 	local saver=""
-	[ "$(settings get global low_power 2>/dev/null)" = "1" ] && saver="энергосбережение"
+	sget global low_power; [ "$REPLY" = "1" ] && saver="энергосбережение"
 
 	if [ "$status" = "Charging" ] && [ -n "$cap" ] && [ "$cap" -lt 100 ]; then
-		local ttf="" dl="" ua=0 now tgt=100 rate_eta=""
+		local ttf="" dl="" ua=0 now tgt=100 rate_eta="" full="$BAT_FULL"
 		rd "$b/time_to_full_now" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && ttf="$REPLY"
 		rd "$b/charge_deadline" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && dl="$REPLY"
-		[ -n "$cur_ua" ] && ua=${cur_ua#-}
+		[ -n "$BAT_CUR" ] && ua=${BAT_CUR#-}
 		[ "$pol" = "2" ] && tgt=80
 		# Своя оценка по току: недостающие проценты × ёмкость / ток. Оптимистична —
 		# к концу заряда ток падает, поэтому со знаком «≈» и только при токе ≥ 50 мА.
@@ -1485,24 +1623,26 @@ check_battery() {
 	fi
 	modes="$modes${eta:+${modes:+ · }$eta}"
 	[ -n "$saver" ] && modes="${modes:+$modes · }$saver"
-	[ -n "$modes" ] && kv "Режим" "$modes"   # [3.14.1] было «Режимы»
+	REPLY="$modes"   # [3.14.1] строка «Режим» (было «Режимы»)
+}
 
-	# Здоровье: ёмкость по датчику к паспортной
-	local hp="" h_ru
-	case "$health" in
+bat_health() {   # «Здоровье»: ёмкость по датчику к паспортной
+	local hp="" h_ru full="$BAT_FULL" design="$BAT_DESIGN"
+	case "$BAT_HEALTH" in
 		Good) h_ru="хорошее" ;; Overheat) h_ru="${RED}перегрев${NC}" ;; Dead) h_ru="${RED}неисправна${NC}" ;;
-		Cold) h_ru="холодная" ;; "Over voltage") h_ru="${RED}перенапряжение${NC}" ;; *) h_ru="${health:-н/д}" ;;
+		Cold) h_ru="холодная" ;; "Over voltage") h_ru="${RED}перенапряжение${NC}" ;; *) h_ru="${BAT_HEALTH:-н/д}" ;;
 	esac
 	if is_int "${full:-x}" && is_int "${design:-x}" && [ "$design" -gt 0 ] && [ "$full" -gt 0 ]; then
 		local pct=$(( full * 100 / design ))
 		if [ "$pct" -lt 80 ]; then hp="${YELLOW}$pct%${NC} ${DIM}($((full / 1000)) из $((design / 1000)) мА·ч)${NC}"
 		else hp="$pct% ${DIM}($((full / 1000)) из $((design / 1000)) мА·ч)${NC}"; fi
 	fi
-	kv "Здоровье" "$h_ru${hp:+ · ёмкость $hp}"
-	is_int "${cycles:-x}" && kv "Циклы" "$cycles"
+	REPLY="$h_ru${hp:+ · ёмкость $hp}"
+}
 
-	# [3.7] Паспорт батареи: технология, модель, подлинность, даты (что есть)
-	local info="" btype="" auth="" mdate="" fdate=""
+# [3.7] Паспорт батареи («Батарея»): технология, модель, подлинность, даты (что есть)
+bat_passport() {
+	local b="$BAT" bms="$BMS" info="" btype="" auth="" mdate="" fdate=""
 	if rd "$bms/battery_type" && [ -n "$REPLY" ] && [ "$REPLY" != "Unknown" ]; then btype="$REPLY"; fi
 	if rd "$bms/authentic" && is_int "$REPLY"; then auth="$REPLY"
 	elif rd "$R/sys/class/power_supply/batt_verify/authen_result" && is_int "$REPLY"; then auth="$REPLY"; fi
@@ -1512,7 +1652,7 @@ check_battery() {
 	if rd "$b/first_usage_date" && is_int "$REPLY" && [ "$REPLY" -gt 946684800 ]; then
 		printf -v fdate '%(%d.%m.%Y)T' "$REPLY"
 	fi
-	[ -n "$tech" ] && info="$tech"
+	[ -n "$BAT_TECH" ] && info="$BAT_TECH"
 	[ -n "$btype" ] && info="${info:+$info · }$btype"
 	case "$auth" in
 		1) info="${info:+$info · }${GREEN}подлинная${NC}" ;;
@@ -1520,22 +1660,26 @@ check_battery() {
 	esac
 	[ -n "$mdate" ] && info="${info:+$info · }произведена $mdate"
 	[ -n "$fdate" ] && info="${info:+$info · }в работе с $fdate"
-	[ -n "$info" ] && kv "Батарея" "$info"
+	REPLY="$info"
+}
 
-	if [ -n "$tdeg" ]; then
+bat_temp() {   # «Температура»
+	if [ -n "$BAT_TDEG" ]; then
 		local tc=""
-		[ "$temp" -ge "$BATT_TEMP_WARN" ] && tc="$RED"
-		kv "Температура" "${tc}${tdeg}°C${tc:+$NC}"
+		[ "$BAT_TEMP" -ge "$BATT_TEMP_WARN" ] && tc="$RED"
+		REPLY="${tc}${BAT_TDEG}°C${tc:+$NC}"
 	else
-		kv "Температура" "н/д"
+		REPLY="н/д"
 	fi
+}
 
-	# [3.8] Контроллер заряда: температура и ограничение зарядки из-за нагрева.
-	# Pixel: зоны charge_therm / usb_pwr_therm, охлаждение chg_mdis, dc_icl;
-	# Qualcomm: зона charger_therm0 (или battery/charger_temp), охлаждение battery.
-	local ct="" usbt="" lim="" cd ctype ccur cmax
+# [3.8] Контроллер заряда («Контроллер»): температура и ограничение зарядки из-за
+# нагрева. Pixel: зоны charge_therm / usb_pwr_therm, охлаждение chg_mdis, dc_icl;
+# Qualcomm: зона charger_therm0 (или battery/charger_temp), охлаждение battery.
+bat_controller() {
+	local ct="" usbt="" lim="" cd ctype ccur cmax out=""
 	if zone_max 'charge_therm' || zone_max 'charger_therm*'; then mdeg "$REPLY"; color_temp "$REPLY"; ct="$REPLY"
-	elif rd "$b/charger_temp" && is_int "$REPLY" && [ "$REPLY" -gt 0 ]; then
+	elif rd "$BAT/charger_temp" && is_int "$REPLY" && [ "$REPLY" -gt 0 ]; then
 		fdeg "$(awk -v t="$REPLY" 'BEGIN { print t / 10 }')"; color_temp "$REPLY"; ct="$REPLY"
 	fi
 	zone_max 'usb_pwr_therm' && { mdeg "$REPLY"; color_temp "$REPLY"; usbt="$REPLY"; }
@@ -1550,37 +1694,69 @@ check_battery() {
 	if [ -n "$ct" ] || [ -n "$usbt" ]; then
 		local cl="${ct:-н/д}"
 		[ -n "$usbt" ] && cl="$cl · USB-порт $usbt"
-		kv "Контроллер" "$cl${lim:+ · $lim}"
+		out="$cl${lim:+ · $lim}"
 	fi
-	if [ -n "$cur_ua" ] && [ -n "$volt" ]; then
-		local ma=$((cur_ua / 1000)) w dir=""
-		w=$(awk -v v="$volt" -v i="$ma" 'BEGIN { printf "%.2f", v * i / 1000000 }')
+	REPLY="$out"
+}
+
+bat_current() {   # «Ток» (или «Напряжение», если тока нет): REPLY_K — подпись
+	REPLY=""; REPLY_K=""
+	if [ -n "$BAT_CUR" ] && [ -n "$BAT_VOLT" ]; then
+		local ma=$((BAT_CUR / 1000)) w dir=""
+		w=$(awk -v v="$BAT_VOLT" -v i="$ma" 'BEGIN { printf "%.2f", v * i / 1000000 }')
 		# [3.11.1] Знак приводится только при «заряжается»/«разряжается». При «заряжена»,
 		# «не заряжается» и неизвестном статусе направление по драйверу не определить
 		# (у Qualcomm и Pixel знак противоположный) — показываем модуль без знака.
-		case "$status" in
+		case "$BAT_STATUS" in
 			Charging|Discharging) ;;
 			*) ma=${ma#-}; dir=" ${DIM}(направление не определено)${NC}" ;;
 		esac
-		kv "Ток" "$ma мА$dir · ${w#-} Вт · $volt мВ"
-	elif [ -n "$volt" ]; then
-		kv "Напряжение" "$volt мВ"
+		REPLY_K="Ток"; REPLY="$ma мА$dir · ${w#-} Вт · $BAT_VOLT мВ"
+	elif [ -n "$BAT_VOLT" ]; then
+		REPLY_K="Напряжение"; REPLY="$BAT_VOLT мВ"
 	fi
-	[ -n "$cur_ua" ] && note "Ток: минус — разряд, плюс — заряд."
+}
 
-	# [3.7] Внутреннее сопротивление (-e): растёт с износом. Драйверы отдают его в мкОм
-	# без документации единиц, поэтому только в расширенном режиме и с пометкой.
+# [3.7] Внутреннее сопротивление (-e): растёт с износом. Драйверы отдают его в мкОм
+# без документации единиц, поэтому только в расширенном режиме и с пометкой.
+bat_resistance() {
+	local res="" rn
+	for rn in "$BAT/resistance" "$BMS/resistance"; do
+		rd "$rn" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && { res="$REPLY"; break; }
+	done
+	REPLY=""
+	[ -n "$res" ] && REPLY="$(( (res + 500) / 1000 )) мОм ${DIM}(внутреннее, по датчику)${NC}"
+}
+
+# [3.7] Батарея: нет данных — «н/д», а не 0 °C / 0% (раньше пустое чтение
+# выглядело как реальный ноль). Температура с десятыми, ёмкость больше паспортной
+# показывается как есть (у новой батареи это норма, паспорт — гарантированный
+# минимум). Добавлены технология, даты производства и первого применения (Pixel),
+# модель и подлинность батареи (Qualcomm bms / Maxim), в -e — сопротивление.
+check_battery() {
+	section "БАТАРЕЯ"
+	if ! bat_read; then kv "Батарея" "нет данных"; return; fi
+
+	bat_level;      kv "Уровень" "$REPLY"
+	bat_estimate;   [ -n "$REPLY" ] && kv "Хватит до" "$REPLY"
+	bat_source
+	[ -n "$BAT_SRC" ] && kv "Питание" "$BAT_SRC"
+	[ -n "$BAT_SHARE" ] && kv "Battery Share" "$BAT_SHARE"
+	bat_modes;      [ -n "$REPLY" ] && kv "Режим" "$REPLY"
+	bat_health;     kv "Здоровье" "$REPLY"
+	is_int "${BAT_CYCLES:-x}" && kv "Циклы" "$BAT_CYCLES"
+	bat_passport;   [ -n "$REPLY" ] && kv "Батарея" "$REPLY"
+	bat_temp;       kv "Температура" "$REPLY"
+	bat_controller; [ -n "$REPLY" ] && kv "Контроллер" "$REPLY"
+	bat_current;    [ -n "$REPLY" ] && kv "$REPLY_K" "$REPLY"
+	[ -n "$BAT_CUR" ] && note "Ток: минус — разряд, плюс — заряд."
 	if [ "$EXTENDED" -eq 1 ]; then
-		local res=""
-		for rn in "$b/resistance" "$bms/resistance"; do
-			rd "$rn" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && { res="$REPLY"; break; }
-		done
-		[ -n "$res" ] && kv "Сопротивление" "$(( (res + 500) / 1000 )) мОм ${DIM}(внутреннее, по датчику)${NC}"
+		bat_resistance; [ -n "$REPLY" ] && kv "Сопротивление" "$REPLY"
 	fi
 
-	if [ -n "$temp" ] && [ "$temp" -ge "$BATT_TEMP_WARN" ]; then
-		verdict 1 "батарея перегрета: ${tdeg}°C"
-	elif [ -z "$cap" ] && [ -z "$temp" ]; then
+	if [ -n "$BAT_TEMP" ] && [ "$BAT_TEMP" -ge "$BATT_TEMP_WARN" ]; then
+		verdict 1 "батарея перегрета: ${BAT_TDEG}°C"
+	elif [ -z "$BAT_CAP" ] && [ -z "$BAT_TEMP" ]; then
 		verdict 1 "данные батареи недоступны"
 	else
 		verdict 0 ""
@@ -1592,7 +1768,7 @@ check_battery() {
 check_wakelocks() {
 	section "WAKELOCK" "(удержание пробуждения)"
 	local raw
-	raw=$(dumpsys power 2>/dev/null | sed -n '/Wake Locks: size=/,/^[[:space:]]*$/p' | grep 'PARTIAL_WAKE_LOCK')
+	jget power dumpsys power; raw=$(jout | sed -n '/Wake Locks: size=/,/^[[:space:]]*$/p' | grep 'PARTIAL_WAKE_LOCK')
 	if [ -z "$raw" ]; then
 		kv "Активные" "${GREEN}нет${NC}"
 		return
@@ -1622,7 +1798,7 @@ NET_TRANSPORT=""; NET_IFACE=""; NET_DNS=""; NET_WIFI=""; NET_VPN_UNDER=""; NET_H
 load_connectivity() {
 	NET_TRANSPORT=""; NET_IFACE=""; NET_DNS=""; NET_WIFI=""; NET_VPN_UNDER=""; NET_HAS_VPN=0
 	local recs
-	recs=$(dumpsys connectivity 2>/dev/null | awk '
+	jget connectivity dumpsys connectivity; recs=$(jout | awk '
 		/NetworkAgentInfo\{/ && /Transports: / {
 			id = ""; if (match($0, /network\{[0-9]+\}/)) id = substr($0, RSTART + 8, RLENGTH - 9)
 			tr = $0; sub(/.*Transports: /, "", tr); sub(/ .*/, "", tr); gsub(/\|/, "+", tr)
@@ -1790,15 +1966,20 @@ modem_name() {
 	esac
 }
 
-check_network() {
-	section "СЕТЬ"
-	local route dev src
-	route=$( (timeout 2 ip route get 8.8.8.8 || ip route get 8.8.8.8) 2>/dev/null | head -n 1)
-	dev=$(printf '%s' "$route" | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); exit } }')
-	src=$(printf '%s' "$route" | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i+1); exit } }')
-	load_connectivity
+# [3.16] Секция «Сеть» разделена так же, как «Батарея»: каждая строка (или группа
+# строк) собирается своей функцией, check_network печатает их по порядку.
+# Маршрут, siminfo и пинги приходят из предзагрузки (jget), логика строк прежняя.
+net_route_raw() { (timeout 2 ip route get 8.8.8.8 || ip route get 8.8.8.8) 2>/dev/null | head -n 1; }
+NET_DEV=""; NET_SRC=""
+net_route() {   # маршрут в интернет → NET_DEV, NET_SRC
+	local route
+	jget route net_route_raw; route="$REPLY"
+	NET_DEV=$(printf '%s' "$route" | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); exit } }')
+	NET_SRC=$(printf '%s' "$route" | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i+1); exit } }')
+}
 
-	local kind=""
+net_connection() {   # «Подключение»
+	local dev="$NET_DEV" kind=""
 	case "$dev" in
 		wlan*)        kind="Wi-Fi" ;;
 		rmnet*|ccmni*|seth*) kind="мобильная сеть" ;;
@@ -1808,47 +1989,52 @@ check_network() {
 		*)            kind="$dev" ;;
 	esac
 	if [ -z "$kind" ]; then
-		kv "Подключение" "${RED}нет маршрута в интернет${NC}"
-	else
-		local via=""
-		if [ "$kind" = "VPN" ] && [ -n "$NET_VPN_UNDER" ]; then
-			case "$NET_VPN_UNDER" in
-				WIFI) via=" поверх Wi-Fi" ;; CELLULAR) via=" поверх мобильной сети" ;;
-				ETHERNET) via=" поверх Ethernet" ;; *) via=" поверх $NET_VPN_UNDER" ;;
-			esac
-		elif [ "$kind" != "VPN" ] && [ "$NET_HAS_VPN" -eq 1 ]; then
-			# VPN поднят, но root-трафик идёт мимо него (VPN только для приложений)
-			via=" ${DIM}· VPN активен для приложений${NC}"
-		fi
-		kv "Подключение" "${GREEN}$kind${NC}$via ${DIM}($dev)${NC}"
+		REPLY="${RED}нет маршрута в интернет${NC}"
+		return
 	fi
-	[ -n "$src" ] && kv "Локальный IP" "$src"
-	# [3.15] Защита и стандарт подключения — из «cmd wifi status» (WifiInfo:
-	# «Security type: 2, … Wi-Fi standard: 11ac»). Номера — WifiInfo.SECURITY_TYPE_*.
-	if [ -n "$NET_WIFI" ]; then
-		local wi wsec wstd
-		wi=$(cmd wifi status 2>/dev/null | sed -n 's/^WifiInfo: //p' | head -n 1)
-		wsec=$(printf '%s' "$wi" | sed -n 's/.*Security type: \([0-9]*\).*/\1/p')
-		wstd=$(printf '%s' "$wi" | sed -n 's/.*Wi-Fi standard: \([0-9a-z]*\).*/\1/p')
-		case "$wsec" in
-			0) wsec="${YELLOW}открытая сеть${NC}" ;; 1) wsec="${YELLOW}WEP${NC}" ;; 2) wsec="WPA2" ;;
-			3) wsec="WPA2-Enterprise" ;; 4) wsec="WPA3" ;; 5|9) wsec="WPA3-Enterprise" ;; 6) wsec="OWE" ;;
-			7|8) wsec="WAPI" ;; 11|12) wsec="Passpoint" ;; 13) wsec="DPP" ;; *) wsec="" ;;
+	local via=""
+	if [ "$kind" = "VPN" ] && [ -n "$NET_VPN_UNDER" ]; then
+		case "$NET_VPN_UNDER" in
+			WIFI) via=" поверх Wi-Fi" ;; CELLULAR) via=" поверх мобильной сети" ;;
+			ETHERNET) via=" поверх Ethernet" ;; *) via=" поверх $NET_VPN_UNDER" ;;
 		esac
-		case "$wstd" in
-			11n) wstd="Wi-Fi 4" ;; 11ac) wstd="Wi-Fi 5" ;; 11ax) wstd="Wi-Fi 6" ;; 11be) wstd="Wi-Fi 7" ;;
-			11ad) wstd="WiGig" ;; legacy|11a|11b|11g) wstd="Wi-Fi 1–3" ;; *) wstd="" ;;
-		esac
-		kv "Wi-Fi" "$NET_WIFI${wsec:+ · $wsec}${wstd:+ · $wstd}"
+	elif [ "$kind" != "VPN" ] && [ "$NET_HAS_VPN" -eq 1 ]; then
+		# VPN поднят, но root-трафик идёт мимо него (VPN только для приложений)
+		via=" ${DIM}· VPN активен для приложений${NC}"
 	fi
-	mobile_info && kv "Сотовая" "$REPLY"
-	# [3.14] Диапазон обслуживающей соты; несколько несущих — агрегация (CA)
-	local bl ph typ bands bw bws rat ovr nc tot b
-	bl=$(dumpsys telephony.registry 2>/dev/null | awk "$BAND_AWK" 2>/dev/null)
+	REPLY="${GREEN}$kind${NC}$via ${DIM}($dev)${NC}"
+}
+
+# [3.15] Защита и стандарт подключения — из «cmd wifi status» (WifiInfo:
+# «Security type: 2, … Wi-Fi standard: 11ac»). Номера — WifiInfo.SECURITY_TYPE_*.
+net_wifi() {   # «Wi-Fi»
+	REPLY=""
+	[ -n "$NET_WIFI" ] || return 0
+	local wi wsec wstd
+	jget wifi_status cmd wifi status; wi=$(jout | sed -n 's/^WifiInfo: //p' | head -n 1)
+	wsec=$(printf '%s' "$wi" | sed -n 's/.*Security type: \([0-9]*\).*/\1/p')
+	wstd=$(printf '%s' "$wi" | sed -n 's/.*Wi-Fi standard: \([0-9a-z]*\).*/\1/p')
+	case "$wsec" in
+		0) wsec="${YELLOW}открытая сеть${NC}" ;; 1) wsec="${YELLOW}WEP${NC}" ;; 2) wsec="WPA2" ;;
+		3) wsec="WPA2-Enterprise" ;; 4) wsec="WPA3" ;; 5|9) wsec="WPA3-Enterprise" ;; 6) wsec="OWE" ;;
+		7|8) wsec="WAPI" ;; 11|12) wsec="Passpoint" ;; 13) wsec="DPP" ;; *) wsec="" ;;
+	esac
+	case "$wstd" in
+		11n) wstd="Wi-Fi 4" ;; 11ac) wstd="Wi-Fi 5" ;; 11ax) wstd="Wi-Fi 6" ;; 11be) wstd="Wi-Fi 7" ;;
+		11ad) wstd="WiGig" ;; legacy|11a|11b|11g) wstd="Wi-Fi 1–3" ;; *) wstd="" ;;
+	esac
+	REPLY="$NET_WIFI${wsec:+ · $wsec}${wstd:+ · $wstd}"
+}
+
+# [3.14] Диапазон обслуживающей соты; несколько несущих — агрегация (CA).
+net_bands() {   # строки «Диапазон» → REPLY_A
+	REPLY_A=()
+	local bl ph typ bands bw bws rat ovr nc tot b line pre
+	jget telephony dumpsys telephony.registry; bl=$(jout | awk "$BAND_AWK" 2>/dev/null)
 	while IFS=$'\t' read -r ph typ bands bw bws rat ovr; do
 		[ -n "$typ" ] || continue
 		bands="${bands#[}"; bands="${bands%]}"; bws="${bws#[}"; bws="${bws%]}"
-		local line="" pre=""
+		line=""; pre=""
 		case "$typ" in
 			Lte) pre="B"; line="LTE" ;;
 			Nr)  pre="n"; line="5G" ;;
@@ -1866,55 +2052,64 @@ check_network() {
 			line="$line · $((bw / 1000)) МГц"
 		fi
 		case "$ovr" in NR_NSA|NR_NSA_MMWAVE|NR_ADVANCED) line="$line ${GREEN}+ 5G NSA${NC}" ;; esac
-		kv "Диапазон" "$line ${DIM}(SIM$((ph + 1)))${NC}"
+		REPLY_A+=("$line ${DIM}(SIM$((ph + 1)))${NC}")
 	done <<< "$bl"
-	# [3.15.1] Звонки через IMS: переключатели VoLTE и Wi-Fi Calling активной SIM
-	# (siminfo; -1 = «как в общих настройках» → settings global). Регистрацию IMS
-	# Android наружу не отдаёт (cmd phone ims только переключает), поэтому пишем,
-	# что включено, а не что работает. «принудительно» — доступность включена в
-	# обход оператора (persist.dbg.volte_avail_ovr / wfc_avail_ovr).
-	local si sv_vo sv_wf sv_wm call=""
-	si=$(content query --uri content://telephony/siminfo --projection sim_id:volte_vt_enabled:wfc_ims_enabled:wfc_ims_mode 2>/dev/null \
-		| grep -E 'sim_id=[0-9]' | head -n 1)
-	if [ -n "$si" ]; then
-		sv_vo=$(printf '%s' "$si" | sed -n 's/.*volte_vt_enabled=\(-\{0,1\}[0-9]*\).*/\1/p')
-		sv_wf=$(printf '%s' "$si" | sed -n 's/.*wfc_ims_enabled=\(-\{0,1\}[0-9]*\).*/\1/p')
-		sv_wm=$(printf '%s' "$si" | sed -n 's/.*wfc_ims_mode=\(-\{0,1\}[0-9]*\).*/\1/p')
-		case "$sv_vo" in 0|1) ;; *) sv_vo=$(settings get global enhanced_4g_mode_enabled 2>/dev/null) ;; esac
-		case "$sv_wf" in 0|1) ;; *) sv_wf=$(settings get global wfc_ims_enabled 2>/dev/null) ;; esac
-		case "$sv_wm" in 0|1|2) ;; *) sv_wm=$(settings get global wfc_ims_mode 2>/dev/null) ;; esac
-		case "$sv_vo" in 1) call="VoLTE ${GREEN}вкл.${NC}" ;; 0) call="VoLTE выкл." ;; esac
-		case "$sv_wf" in
-			1) call="${call:+$call · }Wi-Fi Calling ${GREEN}вкл.${NC}"
-			   case "$sv_wm" in
-				0) call="$call ${DIM}(только Wi-Fi)${NC}" ;;
-				1) call="$call ${DIM}(предпочт. моб. сеть)${NC}" ;;
-				2) call="$call ${DIM}(предпочт. Wi-Fi)${NC}" ;;
-			   esac ;;
-			0) call="${call:+$call · }Wi-Fi Calling выкл." ;;
-		esac
-		local ovr1 ovr2
-		prop persist.dbg.volte_avail_ovr; ovr1="$REPLY"; prop persist.dbg.wfc_avail_ovr; ovr2="$REPLY"
-		[ -n "$call" ] && { [ "$ovr1" = "1" ] || [ "$ovr2" = "1" ]; } && call="$call · принудительно"
-		[ -n "$call" ] && kv "Звонки" "$call"
-	fi
-	[ -n "$NET_DNS" ] && kv "DNS" "$NET_DNS"
-	# [3.14.1] Частный DNS (DNS-over-TLS): off / opportunistic («авто», он же
-	# значение по умолчанию, если настройки нет) / hostname + адрес сервера
-	local pdm pds
-	pdm=$(settings get global private_dns_mode 2>/dev/null)
-	case "$pdm" in
-		off)      kv "Частный DNS" "выкл." ;;
-		hostname) pds=$(settings get global private_dns_specifier 2>/dev/null)
-		          kv "Частный DNS" "${GREEN}${pds:-?}${NC}" ;;
-		*)        kv "Частный DNS" "авто ${DIM}(если сеть поддерживает)${NC}" ;;
-	esac
+}
 
-		# [3.9] Модем: температура и ограничение сети из-за нагрева.
-	# Pixel (модем Exynos): зоны cp_on_chip_*, ограничение — статус датчика
-	# усилителя cellular-emergency в Thermal HAL (отдельных устройств охлаждения нет).
-	# Qualcomm: зоны modem-N-usr, ограничение — устройства охлаждения modem_*.
-	local mt="" mlim="" cd ctype ccur cmax
+# [3.15.1] Звонки через IMS: переключатели VoLTE и Wi-Fi Calling активной SIM
+# (siminfo; -1 = «как в общих настройках» → settings global). Регистрацию IMS
+# Android наружу не отдаёт (cmd phone ims только переключает), поэтому пишем,
+# что включено, а не что работает. «принудительно» — доступность включена в
+# обход оператора (persist.dbg.volte_avail_ovr / wfc_avail_ovr).
+net_siminfo_raw() {
+	content query --uri content://telephony/siminfo --projection sim_id:volte_vt_enabled:wfc_ims_enabled:wfc_ims_mode 2>/dev/null \
+		| grep -E 'sim_id=[0-9]' | head -n 1
+}
+net_calls() {   # «Звонки»
+	local si sv_vo sv_wf sv_wm call=""
+	REPLY=""
+	jget siminfo net_siminfo_raw; si="$REPLY"
+	[ -n "$si" ] || { REPLY=""; return 0; }
+	sv_vo=$(printf '%s' "$si" | sed -n 's/.*volte_vt_enabled=\(-\{0,1\}[0-9]*\).*/\1/p')
+	sv_wf=$(printf '%s' "$si" | sed -n 's/.*wfc_ims_enabled=\(-\{0,1\}[0-9]*\).*/\1/p')
+	sv_wm=$(printf '%s' "$si" | sed -n 's/.*wfc_ims_mode=\(-\{0,1\}[0-9]*\).*/\1/p')
+	case "$sv_vo" in 0|1) ;; *) sget global enhanced_4g_mode_enabled; sv_vo="$REPLY" ;; esac
+	case "$sv_wf" in 0|1) ;; *) sget global wfc_ims_enabled; sv_wf="$REPLY" ;; esac
+	case "$sv_wm" in 0|1|2) ;; *) sget global wfc_ims_mode; sv_wm="$REPLY" ;; esac
+	case "$sv_vo" in 1) call="VoLTE ${GREEN}вкл.${NC}" ;; 0) call="VoLTE выкл." ;; esac
+	case "$sv_wf" in
+		1) call="${call:+$call · }Wi-Fi Calling ${GREEN}вкл.${NC}"
+		   case "$sv_wm" in
+			0) call="$call ${DIM}(только Wi-Fi)${NC}" ;;
+			1) call="$call ${DIM}(предпочт. моб. сеть)${NC}" ;;
+			2) call="$call ${DIM}(предпочт. Wi-Fi)${NC}" ;;
+		   esac ;;
+		0) call="${call:+$call · }Wi-Fi Calling выкл." ;;
+	esac
+	local ovr1 ovr2
+	prop persist.dbg.volte_avail_ovr; ovr1="$REPLY"; prop persist.dbg.wfc_avail_ovr; ovr2="$REPLY"
+	[ -n "$call" ] && { [ "$ovr1" = "1" ] || [ "$ovr2" = "1" ]; } && call="$call · принудительно"
+	REPLY="$call"
+}
+
+# [3.14.1] Частный DNS (DNS-over-TLS): off / opportunistic («авто», он же
+# значение по умолчанию, если настройки нет) / hostname + адрес сервера
+net_private_dns() {   # «Частный DNS»
+	local pdm
+	sget global private_dns_mode; pdm="$REPLY"
+	case "$pdm" in
+		off)      REPLY="выкл." ;;
+		hostname) sget global private_dns_specifier; REPLY="${GREEN}${REPLY:-?}${NC}" ;;
+		*)        REPLY="авто ${DIM}(если сеть поддерживает)${NC}" ;;
+	esac
+}
+
+# [3.9] Модем («Модем»): температура и ограничение сети из-за нагрева.
+# Pixel (модем Exynos): зоны cp_on_chip_*, ограничение — статус датчика
+# усилителя cellular-emergency в Thermal HAL (отдельных устройств охлаждения нет).
+# Qualcomm: зоны modem-N-usr, ограничение — устройства охлаждения modem_*.
+net_modem() {
+	local mt="" mlim="" cd ctype ccur cmax why
 	if zone_max 'cp_on_chip_*' || zone_max 'modem-[0-9]-usr'; then
 		mdeg "$REPLY"; color_temp "$REPLY"; mt="$REPLY"
 		for cd in "$R"/sys/class/thermal/cooling_device*; do
@@ -1923,7 +2118,6 @@ check_network() {
 			IFS= read -r ccur 2>/dev/null < "$cd/cur_state" || continue
 			is_int "$ccur" && [ "$ccur" -gt 0 ] || continue
 			IFS= read -r cmax 2>/dev/null < "$cd/max_state"
-			local why
 			case "$ctype" in
 				modem_pa*) why="усилитель" ;; modem_tj) why="чип" ;; modem_*skin*) why="корпус" ;;
 				modem_current|modem_bcl) why="питание" ;; modem_charge_state) why="зарядка" ;;
@@ -1934,24 +2128,59 @@ check_network() {
 		if [ -z "$mlim" ] && is_int "${HAL_STAT[cellular-emergency]:-x}" && [ "${HAL_STAT[cellular-emergency]}" -gt 0 ]; then
 			mlim="${YELLOW}ограничен${NC} ${DIM}(перегрев усилителя)${NC}"
 		fi
-		modem_name; kv "Модем" "$mt${REPLY:+ · $REPLY}${mlim:+ · $mlim}"
+		modem_name; REPLY="$mt${REPLY:+ · $REPLY}${mlim:+ · $mlim}"
+		return 0
 	fi
+	REPLY=""
+}
 
-	# Доступность: 3 пинга на хост; среднее и разброс (mdev) из той же серии
-	local host out ok=0 avg mdev loss
+# Доступность: 3 пинга на хост; среднее и разброс (mdev) из той же серии.
+# [3.16] Проверка 1 пакетом и сама серия идут в предзагрузке по всем трём хостам
+# сразу; хост выбирается в прежнем порядке — первый ответивший из списка.
+net_ping_raw() {   # net_ping_raw ХОСТ: 1 пакет, затем серия из 3; код — успех серии
+	ping -c 1 -W 1 "$1" >/dev/null 2>&1 || return 1
+	ping -c 3 -i 0.3 -W 1 "$1" 2>/dev/null || ping -c 3 -W 1 "$1" 2>/dev/null
+}
+NET_PING_HOST=""; NET_PING_LAT=""
+net_ping() {   # → NET_PING_HOST (пусто — ни один не ответил), NET_PING_LAT («Задержка»)
+	local host out avg mdev loss
+	NET_PING_HOST=""; NET_PING_LAT=""
 	for host in 1.1.1.1 8.8.8.8 google.com; do
-		ping -c 1 -W 1 "$host" >/dev/null 2>&1 || continue
-		out=$(ping -c 3 -i 0.3 -W 1 "$host" 2>/dev/null || ping -c 3 -W 1 "$host" 2>/dev/null) || continue
-		ok=1
+		jget "ping_$host" net_ping_raw "$host" || continue
+		out="$REPLY"
+		NET_PING_HOST="$host"
 		# iputils: «rtt min/avg/max/mdev = a/b/c/d ms», toybox: «round-trip min/avg/max = a/b/c ms»
 		read -r avg mdev <<< "$(printf '%s\n' "$out" | awk '/^rtt|^round-trip/ {
 			v = $0; sub(/.*= */, "", v); sub(/ *ms.*/, "", v); n = split(v, a, "/")
 			print a[2], (n >= 4 ? a[4] : "?"); exit }')"
 		loss=$(printf '%s\n' "$out" | grep -oE '[0-9]+% packet loss' | cut -d'%' -f1)
-		kv "Интернет" "${GREEN}есть${NC} ${DIM}(ping $host)${NC}"
-		[ -n "$avg" ] && kv "Задержка" "${avg%.*} мс · разброс ${mdev%.*} мс${loss:+ · потери $loss%}"
-		break
+		[ -n "$avg" ] && NET_PING_LAT="${avg%.*} мс · разброс ${mdev%.*} мс${loss:+ · потери $loss%}"
+		return 0
 	done
+	return 1
+}
+
+check_network() {
+	section "СЕТЬ"
+	net_route
+	load_connectivity
+	net_connection;  kv "Подключение" "$REPLY"
+	[ -n "$NET_SRC" ] && kv "Локальный IP" "$NET_SRC"
+	net_wifi;        [ -n "$REPLY" ] && kv "Wi-Fi" "$REPLY"
+	mobile_info && kv "Сотовая" "$REPLY"
+	local l
+	net_bands;       for l in "${REPLY_A[@]}"; do kv "Диапазон" "$l"; done
+	net_calls;       [ -n "$REPLY" ] && kv "Звонки" "$REPLY"
+	[ -n "$NET_DNS" ] && kv "DNS" "$NET_DNS"
+	net_private_dns; kv "Частный DNS" "$REPLY"
+	net_modem;       [ -n "$REPLY" ] && kv "Модем" "$REPLY"
+
+	local ok=0
+	if net_ping; then
+		ok=1
+		kv "Интернет" "${GREEN}есть${NC} ${DIM}(ping $NET_PING_HOST)${NC}"
+		[ -n "$NET_PING_LAT" ] && kv "Задержка" "$NET_PING_LAT"
+	fi
 	if [ "$ok" -eq 0 ] && command -v curl >/dev/null 2>&1; then
 		if curl -s -o /dev/null -m 4 -w '%{http_code}' http://clients3.google.com/generate_204 2>/dev/null | grep -q 204; then
 			ok=1
@@ -2035,6 +2264,7 @@ check_iperf3_speed() {
 
 # ── Logcat ───────────────────────────────────────────────────────────────────
 
+logcat_errors() { logcat -b main,system,crash -d '*:E' 2>/dev/null | grep -v '^--------- beginning of' | tail -n 2000; }
 check_logcat() {
 	section "ОШИБКИ LOGCAT" "(main, system, crash)"
 	if [ "$NO_LOGCAT" -eq 1 ]; then
@@ -2042,7 +2272,7 @@ check_logcat() {
 		return
 	fi
 	local errors c
-	errors=$(logcat -b main,system,crash -d '*:E' 2>/dev/null | grep -v '^--------- beginning of' | tail -n 2000)
+	jget logcat logcat_errors; errors="$REPLY"
 	if [ -z "$errors" ]; then
 		kv "Ошибки" "${GREEN}нет${NC}"
 		return
@@ -2100,6 +2330,8 @@ mid_trunc() {   # mid_trunc "строка" ширина → REPLY
 print_top() {
 	local raw tasks="" rows=5 sub="(замер за 1 с)"
 	[ "$EXTENDED" -eq 1 ] && rows=10
+	# [3.16] Сначала дожидаемся фоновых команд, чтобы они не попали в замер
+	jobs_wait_all
 	raw=$(top -b -n 2 -d 1 -m 1000 2>/dev/null)
 	# Записи «pid|cpu|res_kb|имя» из второго кадра
 	local data
@@ -2224,17 +2456,18 @@ check_io_schedulers() {
 
 # ── Разделы ──────────────────────────────────────────────────────────────────
 
-check_partitions() {
-	section "РАЗДЕЛЫ"
-	# Один проход по mountinfo: точка → тип ФС, опции, источник
-	declare -A MFS MOPT MSRC
-	local mp fs opt src
+# [3.16] Разделы и их точки монтирования — один проход по mountinfo за проход;
+# нужен и секции «Разделы», и предзагрузке (один df на все разделы сразу).
+declare -A MFS=() MOPT=() MSRC=()
+PART_LIST=()   # «раздел точка» в порядке вывода
+PART_LOADED=0
+load_partitions() {
+	MFS=(); MOPT=(); MSRC=(); PART_LIST=(); PART_LOADED=1
+	local mp fs opt src part target
 	while IFS='|' read -r mp fs opt src; do
 		[ -n "${MFS[$mp]:-}" ] && continue
 		MFS[$mp]="$fs"; MOPT[$mp]="$opt"; MSRC[$mp]="$src"
 	done < <(awk '{ for (i = 1; i <= NF; i++) if ($i == "-") { print $5 "|" $(i+1) "|" $6 "|" $(i+2); break } }' "$R/proc/self/mountinfo")
-
-	local part target acc size used avail line
 	for part in system system_ext product vendor odm cache data metadata persist; do
 		target=""
 		case "$part" in
@@ -2242,9 +2475,35 @@ check_partitions() {
 			persist) for mp in /persist /mnt/vendor/persist; do [ -n "${MFS[$mp]:-}" ] && { target="$mp"; break; }; done ;;
 			*)       [ -n "${MFS[/$part]:-}" ] && target="/$part" ;;
 		esac
-		[ -z "$target" ] && continue
+		[ -n "$target" ] && PART_LIST+=("$part $target")
+	done
+}
+part_targets() {   # REPLY_A — точки монтирования для df
+	local pt; REPLY_A=()
+	for pt in "${PART_LIST[@]}"; do REPLY_A+=("${pt#* }"); done
+}
+
+check_partitions() {
+	section "РАЗДЕЛЫ"
+	[ "$PART_LOADED" -eq 1 ] || load_partitions
+	# Один df на все разделы; строки сопоставляем по устройству (первая колонка
+	# совпадает с источником в mountinfo). Не нашлось строки — df по разделу, как раньше.
+	local -A DFL=()
+	local dev a b c
+	part_targets
+	if [ "${#REPLY_A[@]}" -gt 0 ]; then
+		jget df_parts df -k "${REPLY_A[@]}"
+		while read -r dev a b c _; do
+			[[ "$a" =~ ^[0-9]+$ ]] && [ -z "${DFL[$dev]:-}" ] && DFL[$dev]="$a $b $c"
+		done <<< "$REPLY"
+	fi
+
+	local part target acc size used avail line pt
+	for pt in "${PART_LIST[@]}"; do
+		part="${pt%% *}"; target="${pt#* }"
 		case ",${MOPT[$target]}," in *,ro,*) acc="ro" ;; *,rw,*) acc="rw" ;; *) acc="??" ;; esac
-		line=$(df -k "$target" 2>/dev/null | awk 'NR > 1 && $2 ~ /^[0-9]+$/ { print $2, $3, $4; exit }')
+		line="${DFL[${MSRC[$target]}]:-}"
+		[ -n "$line" ] || line=$(df -k "$target" 2>/dev/null | awk 'NR > 1 && $2 ~ /^[0-9]+$/ { print $2, $3, $4; exit }')
 		read -r size used avail <<< "$line"
 		local sz=""
 		is_int "${size:-x}" && sz=" · $(hsize_kb "$size"), свободно $(hsize_kb "$avail")"
@@ -2326,11 +2585,11 @@ bt_type() {
 check_connections() {
 	section "ДРУГИЕ ПОДКЛЮЧЕНИЯ"
 	local tether
-	tether=$(dumpsys tethering 2>/dev/null | awk '/^  Tether state:/ { f = 1; next } f && /^  [A-Za-z]/ { exit } f && / - TetheredState/ { printf "%s ", $1 }')
+	jget tethering dumpsys tethering; tether=$(jout | awk '/^  Tether state:/ { f = 1; next } f && /^  [A-Za-z]/ { exit } f && / - TetheredState/ { printf "%s ", $1 }')
 
 	# ── Bluetooth
 	local bt line typ mac c tr cod name k v
-	bt=$(dumpsys bluetooth_manager 2>/dev/null | LC_ALL=C awk "$BT_AWK" 2>/dev/null)
+	jget bluetooth dumpsys bluetooth_manager; bt=$(jout | LC_ALL=C awk "$BT_AWK" 2>/dev/null)
 	if [ -n "$bt" ]; then
 		local state="" n_on=0
 		local -a macs=() conn=()
@@ -2401,7 +2660,7 @@ check_connections() {
 	# роль кошелька («Current wallet payment service»), а не настройка
 	# nfc_payment_default_component; на старых — «Preferred payment service».
 	local nfc
-	nfc=$(dumpsys nfc 2>/dev/null)
+	jget nfc dumpsys nfc; nfc="$REPLY"
 	if [[ "$nfc" == *mState=* ]]; then
 		local ns chip="" sec="" pay pkg desc
 		ns=$(printf '%s\n' "$nfc" | sed -n 's/^mState=//p' | head -n 1)
@@ -2517,7 +2776,7 @@ check_connections() {
 	fi
 
 	# [3.14.1] Геолокация: settings secure location_mode (0 — выключена)
-	local lm; lm=$(settings get secure location_mode 2>/dev/null)
+	local lm; sget secure location_mode; lm="$REPLY"
 	case "$lm" in
 		0) kv "Геолокация" "выкл." ;;
 		[1-3]) kv "Геолокация" "${GREEN}вкл.${NC}" ;;
@@ -2563,7 +2822,7 @@ check_connections() {
 
 	# ── UWB (перенесено из «Google Pixel»): служба и переключатель в настройках
 	local uwb
-	uwb=$(dumpsys uwb 2>/dev/null | awk '/settings_toggle=/ { t = ($0 ~ /settings_toggle=true/) ? "on" : "off" } /^Device state =/ { s = $4 } END { if (s != "") print t " " s }')
+	jget uwb dumpsys uwb; uwb=$(jout | awk '/settings_toggle=/ { t = ($0 ~ /settings_toggle=true/) ? "on" : "off" } /^Device state =/ { s = $4 } END { if (s != "") print t " " s }')
 	if [ -n "$uwb" ]; then
 		case "$uwb" in
 			"on READY"*) kv "UWB" "${GREEN}включён${NC}" ;;
@@ -2626,7 +2885,7 @@ check_pixel_security() {
 	# включается в «Для разработчиков» → «Настройки DRM для медиаконтента»
 	# (свойство persist.drm.forcel3.enabled).
 	local wv wsoc wtee wcdm force
-	wv=$(dumpsys android.hardware.drm.IDrmFactory/widevine 2>/dev/null)
+	jget widevine dumpsys android.hardware.drm.IDrmFactory/widevine; wv="$REPLY"
 	if [[ "$wv" == *oemcrypto_build_info* ]]; then
 		wsoc=$(printf '%s\n' "$wv" | sed -n 's/.*"soc_model": *"\([^"]*\)".*/\1/p' | head -n 1)
 		wtee=$(printf '%s\n' "$wv" | sed -n 's/.*"tee_os": *"\([^"]*\)".*/\1/p' | head -n 1)
@@ -2644,7 +2903,7 @@ check_pixel_security() {
 	# [3.12] Термометр: только наличие датчика. Название — первое слово имени
 	# сенсора типа fir_temperature («MLX90632 FIR Temperature | Melexis …»).
 	local fir
-	fir=$(dumpsys sensorservice 2>/dev/null | awk -F'|' '/fir_temperature\(/ { n = $1; sub(/^[^)]*\) */, "", n); split(n, a, " "); print a[1]; exit }')
+	jget sensors dumpsys sensorservice; fir=$(jout | awk -F'|' '/fir_temperature\(/ { n = $1; sub(/^[^)]*\) */, "", n); split(n, a, " "); print a[1]; exit }')
 	if [ -n "$fir" ]; then
 		kv "Термометр" "${GREEN}есть${NC} · датчик $fir"   # [3.14.1] цвет, как у AOC
 	else
@@ -2655,7 +2914,7 @@ check_pixel_security() {
 	# («0.release.prod_aicore_20260917.00_RC01» → 17.09.2026). Есть ли скачанная
 	# модель, по файлам не видно — поэтому про модель не пишем.
 	local ai
-	ai=$(dumpsys package com.google.android.aicore 2>/dev/null | sed -n 's/^ *versionName=//p' | head -n 1)
+	jget pkg_aicore dumpsys package com.google.android.aicore; ai=$(jout | sed -n 's/^ *versionName=//p' | head -n 1)
 	if [ -n "$ai" ]; then
 		if [[ "$ai" =~ _(20[0-9]{2})([01][0-9])([0-3][0-9]) ]]; then
 			ai="сборка ${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
@@ -2800,8 +3059,9 @@ print_system() {
 	local day sec home st_t st_u
 	printf -v day '%(%Y-%m-%d)T' -1; printf -v sec '%(%H:%M:%S)T' -1
 	sec=$(( 10#${sec:0:2} * 3600 + 10#${sec:3:2} * 60 + 10#${sec:6:2} ))
-	home=$(cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null | tail -n 1)
-	read -r st_t st_u < <(dumpsys usagestats 2>/dev/null | awk -v day="$day" -v now="$sec" -v home="${home%%/*}" \
+	jget home cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME; home=$(jout | tail -n 1)
+	jget usagestats dumpsys usagestats
+	read -r st_t st_u < <(jout | awk -v day="$day" -v now="$sec" -v home="${home%%/*}" \
 		-v excl='^(android|com\.android\.systemui|com\.google\.android\.gms|com\.google\.android\.permissioncontroller|com\.android\.permissioncontroller)$|launcher' \
 		"$SCR_AWK" 2>/dev/null)
 	if is_int "${st_t:-x}"; then
@@ -2814,14 +3074,14 @@ print_system() {
 	prop persist.sys.timezone; tz="$REPLY"
 	off=$(date +%z 2>/dev/null)
 	[[ "$off" =~ ^[+-][0-9]{4}$ ]] && off="UTC${off:0:3}:${off:3:2}" || off=""
-	[ "$(settings get global auto_time_zone 2>/dev/null)" = "1" ] && auto=" ${DIM}· авто${NC}"
+	sget global auto_time_zone; [ "$REPLY" = "1" ] && auto=" ${DIM}· авто${NC}"
 	[ -n "$tz$off" ] && kv "Часовой пояс" "${tz:-?}${off:+ ($off)}$auto"
 	# [3.12.1] Формат часов: settings system time_12_24 = 12 / 24. Пусто — включено
 	# «Использовать формат языка»: тогда формат задаёт первый язык системы.
 	# 12-часовой по умолчанию (CLDR) — у США, Канады, Австралии, Новой Зеландии,
 	# Индии, Филиппин, Пакистана, Египта, Саудовской Аравии, Кореи и Тайваня.
 	local f12 lc
-	f12=$(settings get system time_12_24 2>/dev/null)
+	sget system time_12_24; f12="$REPLY"
 	case "$f12" in
 		12|24) kv "Формат часов" "$f12-часовой" ;;
 		*)
@@ -2852,7 +3112,7 @@ print_system() {
 	local sp vp mm upl="" nb=$'\xc2\xa0'
 	prop ro.build.version.security_patch; sp="$REPLY"
 	prop ro.vendor.build.security_patch; vp="$REPLY"
-	mm=$(dumpsys package com.google.android.modulemetadata 2>/dev/null | sed -n 's/^ *versionName=\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]\).*/\1/p' | head -n 1)
+	jget pkg_mainline dumpsys package com.google.android.modulemetadata; mm=$(jout | sed -n 's/^ *versionName=\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]\).*/\1/p' | head -n 1)
 	if [[ "$sp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
 		upl="патч безопасности от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
 		if [[ "$vp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] && [ "$vp" != "$sp" ]; then
@@ -2920,9 +3180,9 @@ check_spoofing() {
 	section "ПОДМЕНА" "(Evolution X${ver:+ ${ver%%-*}})"
 
 	local sysl secl kb
-	sysl=$(settings list system 2>/dev/null | grep -E '^spoof_(trickystore|pif)_enabled=')
-	# keybox заменяем на «1» прямо в конвейере: его содержимое не попадает в память скрипта
-	secl=$(settings list secure 2>/dev/null | sed -E 's/^(spoof_trickystore_keybox)=.+$/\1=1/' | grep -E '^(spoof_trickystore_(keybox|keybox_source|patch|last_revocation_status|last_revocation_reason|last_revocation_check)|pi_pp_spoof|pi_pp_model|pi_pp_targets|pi_tensor_spoof|tensor_targets|pi_photos_spoof|pi_snapchat_spoof)=')
+	settings_list system; sysl=$(printf '%s\n' "$REPLY" | grep -E '^spoof_(trickystore|pif)_enabled=')
+	# keybox уже заменён на «1» в settings_list_raw: его содержимого в памяти нет
+	settings_list secure; secl=$(printf '%s\n' "$REPLY" | grep -E '^(spoof_trickystore_(keybox|keybox_source|patch|last_revocation_status|last_revocation_reason|last_revocation_check)|pi_pp_spoof|pi_pp_model|pi_pp_targets|pi_tensor_spoof|tensor_targets|pi_photos_spoof|pi_snapchat_spoof)=')
 	sv() {   # sv СПИСОК КЛЮЧ ПО_УМОЛЧАНИЮ → REPLY
 		REPLY=$(printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1)
 		[ -z "$REPLY" ] || [ "$REPLY" = "null" ] && REPLY="$3"
@@ -3006,10 +3266,14 @@ check_spoofing() {
 # разделитель, описание строкой ниже. Флаги — штатные файлы Magisk/KernelSU/APatch:
 #   disable → выкл., remove → удалится, update или modules_update/<id> → обновлён.
 # Новые модули, которые появятся только после перезагрузки, тоже показываем.
-mod_prop() {   # mod_prop ФАЙЛ КЛЮЧ → REPLY (без управляющих символов)
+# [3.16] Чтение — циклом bash, без sed и head (было ~70 мс на вызов на Pixel)
+mod_prop() {   # mod_prop ФАЙЛ КЛЮЧ → REPLY (первое значение, без управляющих символов)
 	REPLY=""
 	can_read "$1" || return 1
-	REPLY=$(sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1)
+	local line
+	while IFS= read -r line || [ -n "$line" ]; do
+		[[ "$line" == "$2="* ]] && { REPLY="${line#"$2="}"; break; }
+	done < "$1" 2>/dev/null
 	REPLY="${REPLY//[[:cntrl:]]/}"
 	[ -n "$REPLY" ]
 }
@@ -3174,28 +3438,52 @@ NF == 10 && $4 == "1" && (!($1 in vc) || $2 + 0 > vc[$1]) { vc[$1] = $2 + 0; rec
 END { for (p in rec) print p "\t" rec[p] }
 '
 
-print_lsposed() {
-	local m id fwdir="" desc0
+# [3.16] Фреймворк и его CLI ищутся отдельно: CLI (два запуска Java, ~2.5 с)
+# стартует в предзагрузке, а секция забирает готовый ответ.
+LSP_FW=""; LSP_CLI=""
+lsp_locate() {
+	LSP_FW=""; LSP_CLI=""
+	local m id
 	for m in "$R"/data/adb/modules/*/; do
 		m="${m%/}"; id="${m##*/}"
 		case "${id,,}" in *lsposed*|*vector*) ;; *) continue ;; esac
-		mod_prop "$m/module.prop" description; desc0="$REPLY"
-		case "${id,,}:${desc0,,}" in *lsposed*|*xposed*) fwdir="$m"; break ;; esac
+		mod_prop "$m/module.prop" description
+		case "${id,,}:${REPLY,,}" in *lsposed*|*xposed*) LSP_FW="$m"; break ;; esac
 	done
-	[ -n "$fwdir" ] || return 0
+	[ -n "$LSP_FW" ] || return 1
+	for m in "$R/data/adb/lspd/cli" "$LSP_FW/cli"; do [ -f "$m" ] && { LSP_CLI="$m"; break; }; done
+	return 0
+}
+lsp_cli() {   # ответы CLI на status и modules ls подряд, через строку-разделитель
+	local to=""
+	command -v timeout >/dev/null 2>&1 && to="timeout 20"
+	$to sh "$LSP_CLI" --json status 2>/dev/null
+	echo "@@modules@@"
+	$to sh "$LSP_CLI" --json modules ls 2>/dev/null
+}
+lsp_prefetch() {
+	lsp_locate || return 0
+	[ -n "$LSP_CLI" ] && [ ! -e "$LSP_FW/disable" ] && job lsp_cli lsp_cli
+}
 
-	local fork fwver api="" cli="" to="" sub
+print_lsposed() {
+	local m fwdir
+	lsp_locate || return 0
+	fwdir="$LSP_FW"
+
+	local fork fwver api="" cli="$LSP_CLI" sub
 	mod_prop "$fwdir/module.prop" name; fork="${REPLY:-${fwdir##*/}}"
 	fork="${fork#Zygisk - }"; fork="${fork#Riru - }"
 	mod_prop "$fwdir/module.prop" version; fwver="${REPLY%% (*}"
-	for m in "$R/data/adb/lspd/cli" "$fwdir/cli"; do [ -f "$m" ] && { cli="$m"; break; }; done
-	command -v timeout >/dev/null 2>&1 && to="timeout 20"
 
 	# Список модулей: пакет<TAB>enabled|disabled
-	local list="" cli_ok=0
+	local list="" cli_ok=0 c_st c_ls
 	if [ -n "$cli" ] && [ ! -e "$fwdir/disable" ]; then
-		api=$($to sh "$cli" --json status 2>/dev/null | awk -F': *' '/"API Version"/ { gsub(/[^0-9]/, "", $2); print $2; exit }')
-		list=$($to sh "$cli" --json modules ls 2>/dev/null | awk '
+		jget lsp_cli lsp_cli
+		c_st="${REPLY%%@@modules@@*}"; c_ls="${REPLY#*@@modules@@}"
+		[[ "$REPLY" == *@@modules@@* ]] || c_ls=""
+		api=$(printf '%s\n' "$c_st" | awk -F': *' '/"API Version"/ { gsub(/[^0-9]/, "", $2); print $2; exit }')
+		list=$(printf '%s\n' "$c_ls" | awk '
 			/"success": *true/ { ok = 1 }
 			/"PACKAGE"/ { p = $0; sub(/^[^:]*: *"/, "", p); sub(/".*/, "", p) }
 			/"STATUS"/  { s = $0; sub(/^[^:]*: *"/, "", s); sub(/".*/, "", s); if (p != "") print p "\t" s; p = "" }
@@ -3241,6 +3529,10 @@ print_lsposed() {
 
 	local st tag stc sp out ver cp apk name apis desc dref nocache=0
 	local p_desc p_min p_tgt m_dsc m_min k a b c
+	# [3.16] dumpsys package по всем модулям — параллельно (на Pixel 4.9 → 1.5 с)
+	while IFS=$'\t' read -r pkg st; do
+		[ -n "$pkg" ] && job "pkg_$pkg" dumpsys package "$pkg"
+	done <<< "$list"
 	while IFS=$'\t' read -r pkg st; do
 		[ -n "$pkg" ] || continue
 		case "$st" in
@@ -3251,14 +3543,16 @@ print_lsposed() {
 		char_len "$st"; printf -v sp '%*s' $((8 - REPLY)) ""
 		tag="${stc}${st}${NC}${sp}"
 
-		out=$(dumpsys package "$pkg" 2>/dev/null)
+		jget "pkg_$pkg" dumpsys package "$pkg"; out="$REPLY"
 		ver=$(printf '%s\n' "$out" | sed -n 's/^ *versionName=//p' | head -n 1)
 		cp=$(printf '%s\n' "$out" | sed -n 's/^ *codePath=//p' | head -n 1)
 
 		# Метаданные из APK: module.prop нового API и манифест (двоичный AXML)
 		p_desc=""; p_min=""; p_tgt=""; m_dsc=""; m_min=""; dref=0
 		apk="$R$cp/base.apk"
-		if [ -n "$cp" ] && [ -f "$apk" ] && command -v unzip >/dev/null 2>&1; then
+		# [3.16] Есть запись в кэше менеджера — APK не разбираем: и API, и описание
+		# берутся из кэша раньше всего остального (разбор манифеста — до 2.6 с)
+		if [ -z "${C_LEG[$pkg]+x}" ] && [ -n "$cp" ] && [ -f "$apk" ] && command -v unzip >/dev/null 2>&1; then
 			out=$(unzip -p "$apk" META-INF/xposed/module.prop 2>/dev/null | tr -d '\r')
 			if [ -n "$out" ]; then
 				p_desc=$(printf '%s\n' "$out" | sed -n 's/^description=//p' | head -n 1)
@@ -3562,16 +3856,61 @@ run_dry() {
 	return "$SYSTEM_STATUS"
 }
 
+# [3.16] Предзагрузка: всё медленное и независимое запускается в фоне сразу
+# после замера загрузки процессора (чтобы фоновые команды не попали в этот замер).
+# Секции забирают результаты через jget в прежнем порядке.
+prefetch() {
+	[ -n "$JOB_DIR" ] || return 0
+	local h
+	job wm_size wm size
+	job wm_density wm density
+	job sf_latency dumpsys SurfaceFlinger --latency
+	job display dumpsys display
+	[ "$EXTENDED" -eq 1 ] && job camera dumpsys media.camera
+	job battery dumpsys battery
+	job sg_global settings_list_raw global
+	job sg_secure settings_list_raw secure
+	job sg_system settings_list_raw system
+	job power dumpsys power
+	job connectivity dumpsys connectivity
+	job wifi_status cmd wifi status
+	job telephony dumpsys telephony.registry
+	job route net_route_raw
+	job siminfo net_siminfo_raw
+	for h in 1.1.1.1 8.8.8.8 google.com; do job "ping_$h" net_ping_raw "$h"; done
+	job tethering dumpsys tethering
+	job bluetooth dumpsys bluetooth_manager
+	job nfc dumpsys nfc
+	job uwb dumpsys uwb
+	[ "$NO_LOGCAT" -eq 0 ] && job logcat logcat_errors
+	load_partitions; part_targets
+	[ "${#REPLY_A[@]}" -gt 0 ] && job df_parts df -k "${REPLY_A[@]}"
+	prop ro.product.manufacturer
+	if [[ "${REPLY,,}" == *google* ]]; then
+		job widevine dumpsys android.hardware.drm.IDrmFactory/widevine
+		job sensors dumpsys sensorservice
+		job pkg_aicore dumpsys package com.google.android.aicore
+	fi
+	job home cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME
+	job usagestats dumpsys usagestats
+	job pkg_mainline dumpsys package com.google.android.modulemetadata
+	[ "$EXTENDED" -eq 1 ] && lsp_prefetch
+}
+
 run_monitor() {
 	check_dependencies || return $?
 	SYSTEM_STATUS=$EXIT_OK
 	open_log
 	load_props
 	load_verified_boot
+	# [3.16] Кэши прохода: в режиме --loop каждый проход читает всё заново
+	sg_reset; PART_LOADED=0
+	jobs_init
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		run_dry
 		local rc=$?
+		jobs_done
 		close_log
 		return $rc
 	fi
@@ -3583,6 +3922,7 @@ run_monitor() {
 	check_storage
 	check_memory
 	check_cpu
+	prefetch
 	check_thermal
 	check_gpu
 	if [ "$EXTENDED" -eq 1 ]; then
@@ -3615,6 +3955,7 @@ run_monitor() {
 		emit " ${DIM}Лог: $LOG${NC}"
 	fi
 	emit "${BOLD}════════════════════════════════════════${NC}"
+	jobs_done
 	close_log
 	return "$SYSTEM_STATUS"
 }
@@ -3766,7 +4107,7 @@ clear_screen() { [ "$QUIET" -eq 0 ] && [ -t 1 ] && clear; }
 
 if [ "$LOOP_INTERVAL" -gt 0 ]; then
 	acquire_lock || exit $?
-	trap 'release_lock' EXIT
+	trap 'release_lock; jobs_done' EXIT
 	trap 'printf "\n"; release_lock; exit 0' INT TERM
 	while true; do
 		start=$(date +%s)
@@ -3784,6 +4125,7 @@ if [ "$LOOP_INTERVAL" -gt 0 ]; then
 		fi
 	done
 else
+	trap 'jobs_done' EXIT
 	clear_screen
 	run_monitor
 	exit $?
