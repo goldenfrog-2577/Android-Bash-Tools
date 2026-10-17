@@ -1438,7 +1438,22 @@ check_battery() {
 	elif [ "$status" = "Discharging" ] && [ "$pol" = "2" ]; then
 		eta="${DIM}включится при зарядке${NC}"
 	elif [ "$status" = "Discharging" ] && [ "$pol" = "3" ]; then
-		eta="${DIM}включится при долгой зарядке, обычно ночью${NC}"
+		# [3.15.5] Ближайший будильник — из AlarmManager («Next alarm clock
+		# information: user:0 … time:<мс>»), работает с любым приложением часов.
+		# Как подсказка: Pixel может подстраиваться и по привычкам, без будильника.
+		local al alh="" ald now_d
+		al=$(dumpsys alarm 2>/dev/null | sed -n '/Next alarm clock information/{n;s/.*user:0 .*time:\([0-9][0-9]*\).*/\1/p;q}')
+		if is_int "${al:-x}" && [ "$al" -gt 0 ]; then
+			al=$((al / 1000))
+			printf -v ald '%(%Y%m%d)T' "$al"; printf -v now_d '%(%Y%m%d)T' -1
+			printf -v alh '%(%H:%M)T' "$al"
+			if [ "$ald" != "$now_d" ]; then
+				printf -v ald '%(%u)T' "$al"
+				case "$ald" in 1) ald="пн" ;; 2) ald="вт" ;; 3) ald="ср" ;; 4) ald="чт" ;; 5) ald="пт" ;; 6) ald="сб" ;; 7) ald="вс" ;; esac
+				alh="$ald $alh"
+			fi
+		fi
+		eta="${DIM}включится при долгой зарядке, обычно ночью${alh:+ · будильник $alh}${NC}"
 	elif [ "$pol" = "2" ] && [ "$status" = "Not charging" ]; then
 		# [3.15.5] Упёрлись в лимит: драйвер Google держит заряд между
 		# charge_start_level и charge_stop_level (Pixel 8 Pro: 77 и 80)
