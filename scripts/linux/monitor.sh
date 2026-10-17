@@ -1408,7 +1408,10 @@ check_battery() {
 	# зарядке в тепле. DISCONNECTED/CONNECTED — штатные состояния «не активен».
 	prop vendor.battery.defender.state; bd="$REPLY"
 	case "$bd" in ""|DISCONNECTED|CONNECTED) ;; *) modes="${modes:+$modes · }${YELLOW}защита батареи${NC} ${DIM}($bd)${NC}" ;; esac
-	[ "$(settings get global low_power 2>/dev/null)" = "1" ] && modes="${modes:+$modes · }энергосбережение"
+	# [3.15.5] Энергосбережение — в конце строки, после подсказки режима зарядки,
+	# иначе «… · энергосбережение · включится при зарядке» читалось как про него.
+	local saver=""
+	[ "$(settings get global low_power 2>/dev/null)" = "1" ] && saver="энергосбережение"
 
 	if [ "$status" = "Charging" ] && [ -n "$cap" ] && [ "$cap" -lt 100 ]; then
 		local ttf="" dl="" ua=0 now tgt=100 rate_eta=""
@@ -1461,7 +1464,9 @@ check_battery() {
 		rd "$R/sys/devices/platform/google,charger/charge_start_level" && is_int "$REPLY" && gstart="$REPLY"
 		eta="зарядка остановлена${gstart:+ ${DIM}(возобновится ниже $gstart%)${NC}}"
 	fi
-	[ -n "$modes" ] && kv "Режим" "$modes${eta:+ · $eta}"   # [3.14.1] было «Режимы»
+	modes="$modes${eta:+${modes:+ · }$eta}"
+	[ -n "$saver" ] && modes="${modes:+$modes · }$saver"
+	[ -n "$modes" ] && kv "Режим" "$modes"   # [3.14.1] было «Режимы»
 
 	# Здоровье: ёмкость по датчику к паспортной
 	local hp="" h_ru
