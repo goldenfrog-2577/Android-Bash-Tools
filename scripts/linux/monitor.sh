@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.16.1 — мониторинг состояния rooted Android
+# monitor.sh v3.17 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.16.1"
+readonly VERSION="3.17"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -631,6 +631,43 @@ life_label() {
 	esac
 }
 
+# [3.17] f2fs на /data: сколько свободного места лежит в полностью чистых
+# сегментах (free_segments × 2 МБ — сегмент f2fs всегда 512 блоков по 4 КБ).
+# Остальное свободное место раздроблено по частично занятым сегментам (dirty_segments)
+# и требует сборки мусора перед записью. gc_urgent ≠ 0 — прошивка включила срочную
+# сборку. Проба 3170: Pixel 8 Pro — 68%, POCO F3 — 24% и GC_URGENT_MID.
+# Это не «фрагментация файлов» и не fstrim — только состояние сегментов f2fs.
+storage_f2fs() {   # storage_f2fs СВОБОДНО_КБ
+	[ "$PART_LOADED" -eq 1 ] || load_partitions
+	[ "${MFS[/data]:-}" = f2fs ] || return 0
+	local dev="${MSRC[/data]##*/}" d fs="" gu="" free_kb pct
+	d="$R/sys/fs/f2fs/$dev"
+	rd "$d/free_segments" && is_int "$REPLY" && fs="$REPLY"
+	[ -n "$fs" ] && is_int "${1:-x}" && [ "$1" -gt 0 ] || return 0
+	free_kb=$(( fs * 2048 ))
+	[ "$free_kb" -gt "$1" ] && free_kb="$1"
+	pct=$(( free_kb * 100 / $1 ))
+	rd "$d/gc_urgent" && gu="$REPLY"
+	case "$gu" in ""|0|GC_NORMAL) gu="" ;; *) gu=" · ${YELLOW}срочная сборка${NC} ${DIM}($gu)${NC}" ;; esac
+	kv "Сборка мусора" "чистые сегменты — $pct% свободного места ${DIM}($(hsize_kb "$free_kb") из $(hsize_kb "$1"))${NC}$gu"
+}
+
+# [3.17] Последнее обслуживание Android (StorageManager: fstrim и сборка мусора
+# f2fs ночью на зарядке) — «Last maintenance: 2026-10-14 20:41:41» в dumpsys mount.
+storage_maint() {
+	local re='Last maintenance: ([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2}:[0-9]{2})' ago="" t now
+	jget mount dumpsys mount
+	[[ "$REPLY" =~ $re ]] || return 0
+	local y="${BASH_REMATCH[1]}" m="${BASH_REMATCH[2]}" dd="${BASH_REMATCH[3]}" hm="${BASH_REMATCH[4]}"
+	t=$(date -d "$y-$m-$dd $hm" +%s 2>/dev/null)
+	printf -v now '%(%s)T' -1
+	if is_int "${t:-x}" && [ "$now" -ge "$t" ]; then
+		t=$(( (now - t) / 86400 ))
+		case "$t" in 0) ago="сегодня" ;; 1) ago="вчера" ;; *) ago="$t дн. назад" ;; esac
+	fi
+	kv "Обслуживание" "$dd.$m.$y $hm${ago:+ ${DIM}($ago)${NC}}"
+}
+
 check_storage() {
 	section "ХРАНИЛИЩЕ" "(/data)"
 	find_ufs_path
@@ -681,6 +718,8 @@ check_storage() {
 	read -r size used avail pct <<< "$line"
 	pct="${pct%\%}"
 	kv "Объём" "$(hsize_kb "$size") · занято $(hsize_kb "$used") · свободно $(hsize_kb "$avail")"
+	storage_f2fs "$avail"
+	storage_maint
 	if ! is_int "$pct"; then verdict 3 "непонятный ответ df"; return; fi
 	level_by "$pct" "$DISK_WARN" "$DISK_CRIT"
 	verdict "$REPLY" "занято $pct%"
@@ -2943,22 +2982,7 @@ check_pixel_security() {
 		kv "AICore" "$ai ${DIM}(среда Gemini Nano)${NC}"
 	fi
 
-	# [3.11] Сканер отпечатков: производитель — по службе vendor.fingerprint-<имя>,
-	# «под экраном» — по свойствам persist.vendor.udfps.*
-	local k fpv="" udfps=0
-	for k in "${!PROP[@]}"; do
-		case "$k" in
-			init.svc.vendor.fingerprint-*) fpv="${k#init.svc.vendor.fingerprint-}" ;;
-			persist.vendor.udfps.*) udfps=1 ;;
-		esac
-	done
-	if [ -n "$fpv" ] || [ "$udfps" -eq 1 ]; then
-		case "$fpv" in goodix) fpv="Goodix" ;; fpc) fpv="FPC" ;; qcom|qti) fpv="Qualcomm" ;; esac
-		local fpl=""
-		[ "$udfps" -eq 1 ] && fpl="под экраном"
-		[ -n "$fpv" ] && fpl="${fpl:+$fpl · }$fpv"
-		kv "Отпечаток" "$fpl"
-	fi
+	# [3.17] Сканер отпечатков переехал в «Систему» (строки «Отпечаток» и «Лицо»)
 
 	# [3.13] UWB перенесён в «Другие подключения»
 	# [3.7.1] Модем сверяем с тем, что ожидает прошивка (ro.build.expect.baseband):
@@ -3072,6 +3096,83 @@ END {
 }
 '
 
+# [3.17] Биометрия — для любого телефона, в «Системе». Пробы 3170 / fp:
+#   dumpsys biometric «Sensors:» — ID(n), updatedStrength S, modality M:
+#     M 2 — отпечаток, 8 — лицо; S 15 — сильная (Class 3), 255 — слабая (Class 2),
+#     4095 — удобство (Class 1);
+#   dumpsys fingerprint / face — JSON {"prints":[{"count":N}]}: сколько настроено
+#     (у текущего пользователя); «Type: 2» планировщика отпечатка — под экраном
+#     (UDFPS, BiometricScheduler.SENSOR_TYPE_UDFPS), 3 — любой другой;
+#   где «другой» — по вендору: persist.vendor.fingerprint.type=side или настройка
+#     sfps_performant_auth_enabled* (есть только у сенсора в кнопке питания).
+#   Лицо от SenseProvider (LineageOS / Evolution X) — программное, по камере.
+bio_strength() {   # bio_strength S → REPLY
+	case "$1" in
+		15) REPLY="сильная (Class 3)" ;; 255) REPLY="слабая (Class 2)" ;;
+		4095) REPLY="удобство (Class 1)" ;; *) REPLY="" ;;
+	esac
+}
+bio_count() {   # из дампа службы: первое «"count":N»
+	local re='"count":([0-9]+)'
+	[[ "$1" =~ $re ]] && REPLY="${BASH_REMATCH[1]}" || REPLY=""
+}
+bio_lines() {   # → BIO_FP, BIO_FACE (пусто — строки нет)
+	BIO_FP=""; BIO_FACE=""
+	local line fps="" faces="" re=' ID\(([0-9]+)\), oemStrength: [0-9]+, updatedStrength: ([0-9]+), modality ([0-9]+)'
+	jget biometric dumpsys biometric
+	while IFS= read -r line; do
+		[[ "$line" =~ $re ]] || continue
+		case "${BASH_REMATCH[3]}" in
+			2) [ -z "$fps" ] && fps="${BASH_REMATCH[2]}" ;;
+			8) [ -z "$faces" ] && faces="${BASH_REMATCH[2]}" ;;
+		esac
+	done <<< "$REPLY"
+
+	local out cnt str
+	if [ -n "$fps" ]; then
+		local where="" vend="" k typ=""
+		jget fingerprint dumpsys fingerprint; out="$REPLY"
+		[[ "$out" =~ Type:\ ([0-9]+) ]] && typ="${BASH_REMATCH[1]}"
+		bio_count "$out"; cnt="$REPLY"
+		for k in "${!PROP[@]}"; do
+			case "$k" in init.svc.vendor.fingerprint-*) vend="${k#init.svc.vendor.fingerprint-}" ;; esac
+		done
+		[ "$vend" = default ] && vend=""
+		[ -z "$vend" ] && { prop persist.vendor.sys.fp.vendor; vend="$REPLY"; }
+		case "$vend" in goodix) vend="Goodix" ;; fpc) vend="FPC" ;; qcom|qti) vend="Qualcomm" ;; egis*) vend="Egis" ;; silead) vend="Silead" ;; esac
+		if [ "$typ" = 2 ]; then where="под экраном"
+		elif [ "$typ" = 3 ]; then
+			local sec; settings_list secure; sec=$'\n'"$REPLY"
+			prop persist.vendor.fingerprint.type
+			if [[ "$sec" == *$'\n'sfps_performant_auth_enabled* ]]; then where="в кнопке питания"
+			elif [ "$REPLY" = side ]; then where="сбоку"
+			fi
+		fi
+		bio_strength "$fps"; str="$REPLY"
+		BIO_FP="$where"
+		[ -n "$vend" ] && BIO_FP="${BIO_FP:+$BIO_FP · }$vend"
+		[ -n "$str" ] && BIO_FP="${BIO_FP:+$BIO_FP · }$str"
+		case "$cnt" in
+			"") ;; 0) BIO_FP="${BIO_FP:+$BIO_FP · }${YELLOW}не настроен${NC}" ;;
+			*) BIO_FP="${BIO_FP:+$BIO_FP · }отпечатков: $cnt" ;;
+		esac
+		[ -n "$BIO_FP" ] || BIO_FP="есть"
+	fi
+	if [ -n "$faces" ]; then
+		jget face dumpsys face; out="$REPLY"
+		bio_count "$out"; cnt="$REPLY"
+		bio_strength "$faces"; str="$REPLY"
+		BIO_FACE=""
+		[[ "$out" == *SenseProvider* ]] && BIO_FACE="программное (Sense)"
+		[ -n "$str" ] && BIO_FACE="${BIO_FACE:+$BIO_FACE · }$str"
+		case "$cnt" in
+			"") ;; 0) BIO_FACE="${BIO_FACE:+$BIO_FACE · }не настроено" ;;
+			*) BIO_FACE="${BIO_FACE:+$BIO_FACE · }настроено" ;;
+		esac
+		[ -n "$BIO_FACE" ] || BIO_FACE="есть"
+	fi
+}
+
 print_system() {
 	section "СИСТЕМА"
 	uptime_str; kv "Время работы" "$REPLY"
@@ -3114,36 +3215,6 @@ print_system() {
 			esac
 			kv "Формат часов" "$f12-часовой ${DIM}(по языку${lc:+ $lc})${NC}" ;;
 	esac
-	detect_root
-	kv "Root" "${GREEN}есть${NC} · $ROOT_INFO"
-	[ -n "$ZYGISK_INFO" ] && kv "Zygisk" "$ZYGISK_INFO"
-	local se; se=$(getenforce 2>/dev/null)
-	case "$se" in
-		Enforcing)  kv "SELinux" "${GREEN}Enforcing${NC}" ;;
-		Permissive) kv "SELinux" "${YELLOW}Permissive${NC}" ;;
-		*)          kv "SELinux" "${se:-?}" ;;
-	esac
-	# [3.15] Обновления: патч безопасности системы и вендора (если отличается) и
-	# дата обновления системы Google Play — versionName пакета modulemetadata
-	# («2026-09-01S+»); у прошивок без mainline Google его нет.
-	# Отставание вендора не подсвечивается: на кастомных прошивках для старых
-	# устройств (POCO F3) свежего vendor уже не будет, предупреждать не о чем.
-	# Неразрывный пробел (U+00A0) держит дату вместе с подписью при переносе.
-	local sp vp mm upl="" nb=$'\xc2\xa0'
-	prop ro.build.version.security_patch; sp="$REPLY"
-	prop ro.vendor.build.security_patch; vp="$REPLY"
-	jget pkg_mainline dumpsys package com.google.android.modulemetadata; mm=$(jout | sed -n 's/^ *versionName=\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]\).*/\1/p' | head -n 1)
-	if [[ "$sp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
-		upl="патч безопасности от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
-		if [[ "$vp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] && [ "$vp" != "$sp" ]; then
-			upl="$upl · исправления производителя${nb}от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
-		fi
-	fi
-	[ -n "$mm" ] && upl="${upl:+$upl · }системное обновление Google${nb}Play${nb}от${nb}${mm:8:2}.${mm:5:2}.${mm:0:4}"
-	[ -n "$upl" ] && kv "Обновления" "$upl"
-	kv "Статус AVB" "$VB_LABEL"
-	note "ядро: ${VB_REAL:-${VB_DEVSTATE:-—}} · свойства: ${VB_PROP:-—}/flash.locked=${VB_LOCKPROP:-—}"
-	note "Вердикт Play Integrity выносят серверы Google — локально его не проверить."
 	prop ro.product.cpu.abi; kv "ABI" "$REPLY"
 
 	[ "$EXTENDED" -eq 1 ] || return 0
@@ -3180,6 +3251,49 @@ print_system() {
 	fi
 	[ -n "$rev" ] && kv "Ревизия" "$rev"
 	kv "Драйверы" "Vulkan: ${vk:-по умолчанию} · EGL: ${egl:-по умолчанию}"
+}
+
+# [3.17] Безопасность — отдельной секцией после «Системы»: обновления, Verified
+# Boot, SELinux, root, биометрия; с -e — защита ядра и уязвимости процессора.
+check_security() {
+	section "БЕЗОПАСНОСТЬ"
+	# [3.15] Обновления: патч безопасности системы и вендора (если отличается) и
+	# дата обновления системы Google Play — versionName пакета modulemetadata
+	# («2026-09-01S+»); у прошивок без mainline Google его нет.
+	# Отставание вендора не подсвечивается: на кастомных прошивках для старых
+	# устройств (POCO F3) свежего vendor уже не будет, предупреждать не о чем.
+	# Неразрывный пробел (U+00A0) держит дату вместе с подписью при переносе.
+	local sp vp mm upl="" nb=$'\xc2\xa0'
+	prop ro.build.version.security_patch; sp="$REPLY"
+	prop ro.vendor.build.security_patch; vp="$REPLY"
+	jget pkg_mainline dumpsys package com.google.android.modulemetadata; mm=$(jout | sed -n 's/^ *versionName=\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]\).*/\1/p' | head -n 1)
+	if [[ "$sp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
+		upl="патч безопасности от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
+		if [[ "$vp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] && [ "$vp" != "$sp" ]; then
+			upl="$upl · исправления производителя${nb}от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
+		fi
+	fi
+	[ -n "$mm" ] && upl="${upl:+$upl · }системное обновление Google${nb}Play${nb}от${nb}${mm:8:2}.${mm:5:2}.${mm:0:4}"
+	[ -n "$upl" ] && kv "Обновления" "$upl"
+	kv "Статус AVB" "$VB_LABEL"
+	note "ядро: ${VB_REAL:-${VB_DEVSTATE:-—}} · свойства: ${VB_PROP:-—}/flash.locked=${VB_LOCKPROP:-—}"
+	note "Вердикт Play Integrity выносят серверы Google — локально его не проверить."
+	local se; se=$(getenforce 2>/dev/null)
+	case "$se" in
+		Enforcing)  kv "SELinux" "${GREEN}Enforcing${NC}" ;;
+		Permissive) kv "SELinux" "${YELLOW}Permissive${NC}" ;;
+		*)          kv "SELinux" "${se:-?}" ;;
+	esac
+	detect_root
+	kv "Root" "${GREEN}есть${NC} · $ROOT_INFO"
+	[ -n "$ZYGISK_INFO" ] && kv "Zygisk" "$ZYGISK_INFO"
+	bio_lines
+	[ -n "$BIO_FP" ] && kv "Отпечаток" "$BIO_FP"
+	[ -n "$BIO_FACE" ] && kv "Лицо" "$BIO_FACE"
+	if [ "$EXTENDED" -eq 1 ]; then
+		kernel_config; kernel_hardening "$REPLY"
+		kernel_vulns
+	fi
 }
 
 # ── Подмена (Evolution X) ────────────────────────────────────────────────────
@@ -3628,6 +3742,73 @@ print_lsposed() {
 	[ "$nocache" -eq 1 ] && note "Описания хранятся в ресурсах APK: откройте список модулей в менеджере $fork — он сохранит их в кэш, и скрипт их покажет."
 }
 
+# [3.17] Защита ядра (с -e, в «Безопасности»): что собрано в ядре (config.gz) и что умеет процессор
+# (Features в /proc/cpuinfo). Проба 3170: Pixel 8 Pro — CFI, SCS, KASLR, PAC, BTI
+# (только для приложений: ARM64_BTI_KERNEL не включён), MTE собран, но выключен
+# (arm64.nomte; включается в «Для разработчиков» — свойство arm64.memtag.bootctl);
+# POCO F3 (Cortex-A77, ARMv8.2) — CFI, SCS, KASLR, а PAC/BTI/MTE у процессора нет.
+# [3.17] Нужные строки /proc/config.gz — распаковываются один раз за проход
+# (частота тика в «Ядре», защита в «Безопасности»). REPLY — строки CONFIG_…=…
+KCFG=""; KCFG_LOADED=0
+kernel_config() {
+	if [ "$KCFG_LOADED" -eq 0 ]; then
+		KCFG_LOADED=1; KCFG=""
+		can_read "$R/proc/config.gz" && KCFG=$( (zcat "$R/proc/config.gz" || gzip -dc "$R/proc/config.gz") 2>/dev/null \
+			| grep -E '^CONFIG_(HZ|CFI_CLANG|SHADOW_CALL_STACK|RANDOMIZE_BASE|ARM64_PTR_AUTH|ARM64_BTI|ARM64_BTI_KERNEL|ARM64_MTE)=')
+	fi
+	REPLY="$KCFG"
+}
+kernel_hardening() {   # kernel_hardening ТЕКСТ_CONFIG
+	local c="$1" out="" feat="" cmd="" y
+	[ -n "$c" ] || return 0
+	y() { [[ $'\n'"$c"$'\n' == *$'\n'"CONFIG_$1=y"$'\n'* ]]; }
+	IFS= read -r feat < <(grep -m1 '^Features' "$R/proc/cpuinfo" 2>/dev/null)
+	feat=" ${feat#*:} "
+	rd "$R/proc/cmdline"; cmd=" $REPLY "
+	y CFI_CLANG && out="CFI"
+	y SHADOW_CALL_STACK && out="${out:+$out · }Shadow Call Stack"
+	y RANDOMIZE_BASE && [[ "$cmd" != *" nokaslr "* ]] && out="${out:+$out · }KASLR"
+	local hw=0
+	if [[ "$feat" == *" paca "* ]]; then hw=1; y ARM64_PTR_AUTH && out="${out:+$out · }PAC"; fi
+	if [[ "$feat" == *" bti "* ]]; then
+		hw=1
+		if y ARM64_BTI_KERNEL; then out="${out:+$out · }BTI"
+		elif y ARM64_BTI; then out="${out:+$out · }BTI ${DIM}(приложения)${NC}"; fi
+	fi
+	if y ARM64_MTE; then
+		if [[ "$feat" == *" mte "* ]]; then hw=1; out="${out:+$out · }MTE ${GREEN}вкл.${NC}"
+		else
+			prop ro.arm64.memtag.bootctl_supported
+			[ "$REPLY" = 1 ] && { hw=1; out="${out:+$out · }MTE выкл. ${DIM}(включается в «Для разработчиков»)${NC}"; }
+		fi
+	fi
+	[ "$hw" -eq 0 ] && out="${out:+$out }${DIM}(PAC, BTI и MTE процессор не поддерживает)${NC}"
+	unset -f y
+	[ -n "$out" ] && kv "Защита" "$out"
+}
+
+# [3.17] Уязвимости процессора по данным ядра (/sys/devices/system/cpu/vulnerabilities):
+# «Not affected» и «Mitigation: …» — норма; «Vulnerable…» — жёлтым с причиной.
+kernel_vulns() {
+	local f n v bad=""
+	for f in "$R"/sys/devices/system/cpu/vulnerabilities/*; do
+		rd "$f" || continue
+		v="$REPLY"
+		[[ "$v" == Vulnerable* ]] || continue
+		n="${f##*/}"
+		case "$n" in
+			spectre_v1) n="Spectre v1" ;; spectre_v2) n="Spectre v2" ;; spec_store_bypass) n="Spectre v4" ;;
+			meltdown) n="Meltdown" ;; retbleed) n="Retbleed" ;; *) n="${n//_/ }" ;;
+		esac
+		v="${v#Vulnerable}"; v="${v#: }"; v="${v#; }"
+		case "$v" in "Unprivileged eBPF enabled") v="разрешён непривилегированный eBPF" ;; esac
+		bad="${bad:+$bad · }${YELLOW}$n — уязвим${NC}${v:+ ${DIM}($v)${NC}}"
+	done
+	if [ -n "$bad" ]; then kv "Уязвимости" "$bad"
+	elif [ -d "$R/sys/devices/system/cpu/vulnerabilities" ]; then kv "Уязвимости" "${GREEN}нет${NC} ${DIM}(закрыты или не затрагивают — по данным ядра)${NC}"
+	fi
+}
+
 # [3.1] Ядро: полный разбор /proc/version — версия, сборщик, компилятор и линкер,
 # флаги сборки и дата, архитектура, размер страницы, модули ядра.
 print_kernel_extended() {
@@ -3692,7 +3873,8 @@ print_kernel_extended() {
 	if rd "$R/sys/module/wireguard/version"; then kv "WireGuard" "v$REPLY"; fi
 
 	local hz=""
-	can_read "$R/proc/config.gz" && hz=$( (zcat "$R/proc/config.gz" || gzip -dc "$R/proc/config.gz") 2>/dev/null | sed -n 's/^CONFIG_HZ=//p' | head -n 1)
+	kernel_config
+	[[ "$REPLY" =~ (^|$'\n')CONFIG_HZ=([0-9]+) ]] && hz="${BASH_REMATCH[2]}"
 	if [ -n "$hz" ]; then kv "Частота тика" "$hz Гц"; else kv "Частота тика" "неизвестно (нет /proc/config.gz)"; fi
 
 	# [3.5] Новый генератор случайных чисел (BLAKE2s, 5.18) в 2022 году перенесли
@@ -3903,8 +4085,12 @@ prefetch() {
 	job nfc dumpsys nfc
 	job uwb dumpsys uwb
 	[ "$NO_LOGCAT" -eq 0 ] && job logcat logcat_errors
-	load_partitions; part_targets
+	[ "$PART_LOADED" -eq 1 ] || load_partitions
+	part_targets
 	[ "${#REPLY_A[@]}" -gt 0 ] && job df_parts df -k "${REPLY_A[@]}"
+	job biometric dumpsys biometric
+	job fingerprint dumpsys fingerprint
+	job face dumpsys face
 	prop ro.product.manufacturer
 	if [[ "${REPLY,,}" == *google* ]]; then
 		job widevine dumpsys android.hardware.drm.IDrmFactory/widevine
@@ -3924,7 +4110,7 @@ run_monitor() {
 	load_props
 	load_verified_boot
 	# [3.16] Кэши прохода: в режиме --loop каждый проход читает всё заново
-	sg_reset; PART_LOADED=0
+	sg_reset; PART_LOADED=0; KCFG_LOADED=0
 	jobs_init
 
 	if [ "$DRY_RUN" -eq 1 ]; then
@@ -3960,6 +4146,7 @@ run_monitor() {
 	check_partitions
 	check_pixel_security
 	print_system
+	check_security
 	if [ "$EXTENDED" -eq 1 ]; then
 		check_spoofing
 		print_modules
