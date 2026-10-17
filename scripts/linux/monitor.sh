@@ -1311,7 +1311,7 @@ check_battery() {
 	# Источник питания
 	# [3.8.1] Формат «USB PD, быстрая · 8.3 В · до 20 Вт»: единицы прямо в тексте
 	# (раньше «(8 В)» читалось двусмысленно), напряжение с десятыми.
-	local src="" ps tp on pmax="" dbat usb_in=0
+	local src="" ps tp on pmax="" dbat usb_in=0 usb_hv=0
 	# [3.15.5] dumpsys battery — один раз: предел мощности и режим зарядки
 	dbat=$(dumpsys battery 2>/dev/null)
 	for ps in "$R"/sys/class/power_supply/*; do
@@ -1324,8 +1324,9 @@ check_battery() {
 				local uv=0 proto="USB"
 				rd "$ps/voltage_now" && is_int "$REPLY" && uv=$((REPLY / 1000))
 				case "$tp" in USB_PD*) proto="USB PD" ;; esac   # [3.7] протокол, если драйвер сообщает
+				# [3.15.5] Слово скорости ставим ниже, по мощности, как Android
 				if [ "$uv" -gt 6000 ]; then
-					src="$proto, быстрая · $(awk -v v="$uv" 'BEGIN { printf "%.1f", v / 1000 }') В"
+					src="$proto · $(awk -v v="$uv" 'BEGIN { printf "%.1f", v / 1000 }') В"; usb_hv=1
 				elif [ -z "$src" ]; then src="$proto"; fi
 				# Предел мощности от драйвера (Qualcomm power_max)
 				rd "$ps/power_max" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && [ "$REPLY" -lt 500 ] && pmax="$REPLY" ;;
@@ -1338,6 +1339,24 @@ check_battery() {
 		pmax=$(printf '%s\n' "$dbat" | awk -F': ' '
 			/Max charging current:/ { i = $2 + 0 } /Max charging voltage:/ { v = $2 + 0 }
 			END { if (i > 0 && v > 0) { w = i * v / 1e12; if (w >= 1 && w < 500) printf "%.0f", w } }')
+	fi
+	# [3.15.5] Скорость зарядки — как в SettingsLib BatteryStatus.getChargingSpeed():
+	# мощность = Max charging current × Max charging voltage (напряжение 0 → 5 В),
+	# меньше 5 Вт — медленная, больше 7,5 Вт — быстрая, между — обычная
+	# (config_chargingSlowlyThreshold / config_chargingFastThreshold). Нет данных
+	# сервиса — по пределу драйвера (power_max), иначе по напряжению > 6 В, как раньше.
+	if [ "$usb_in" -eq 1 ] && [ -n "$src" ]; then
+		local mw spd=""
+		mw=$(printf '%s\n' "$dbat" | awk -F': ' '
+			/Max charging current:/ { i = $2 + 0 } /Max charging voltage:/ { v = $2 + 0 }
+			END { if (v <= 0) v = 5000000; if (i > 0) printf "%d", (i / 1000) * (v / 1000) }')
+		if is_int "${mw:-x}" && [ "$mw" -gt 0 ]; then
+			if [ "$mw" -lt 5000000 ]; then spd="медленная"; elif [ "$mw" -gt 7500000 ]; then spd="быстрая"; else spd="обычная"; fi
+		elif is_int "${pmax:-x}"; then
+			if [ "$pmax" -lt 5 ]; then spd="медленная"; elif [ "$pmax" -gt 7 ]; then spd="быстрая"; else spd="обычная"; fi
+		elif [ "$usb_hv" -eq 1 ]; then spd="быстрая"
+		fi
+		[ -n "$spd" ] && src="${src%% · *}, $spd${src#"${src%% · *}"}"
 	fi
 	[ -n "$pmax" ] && src="$src · до $pmax Вт"
 	# Battery Share (обратная беспроводная) — Pixel.
