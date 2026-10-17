@@ -1344,20 +1344,26 @@ check_battery() {
 	# [3.15.1] Настоящие узлы — у беспроводного чипа: wireless/device/rtx_status
 	# (available → active при включении) и rtx (0 → 1); проверено на Pixel 8 Pro.
 	# Прежние reverse_chg_mode / wireless_out на Pixel не существуют.
-	# [3.15.5] Pixel сам ненадолго включает Battery Share при подключении кабеля
-	# («Включать автоматически», settings global settings_key_reverse_charging_
-	# auto_turn_on=1; проба 3155: rtx=1 сразу после подключения, через минуты 0).
-	# Тогда зарядку по USB не прячем, а дописываем Battery Share к ней.
-	local rn wd="$R/sys/class/power_supply/wireless/device"
-	if { rd "$wd/rtx_status" && [ "$REPLY" = "active" ]; } || { rd "$wd/rtx" && [ "$REPLY" = "1" ]; }; then
-		if [ "$usb_in" -eq 1 ] && [ -n "$src" ]; then
-			if [ "$(settings get global settings_key_reverse_charging_auto_turn_on 2>/dev/null)" = "1" ]; then
-				src="$src · ${MAGENTA}Battery Share${NC} ${DIM}(автовключение при зарядке)${NC}"
+	# Battery Share (обратная беспроводная) — Pixel: отдельной строкой.
+	# [3.15.1] Узлы беспроводного чипа: wireless/device/rtx_status (available →
+	# active) и rtx (0 → 1). [3.15.5] Пробы 3155/3155b на Pixel 8 Pro: «active» и
+	# когда Battery Share включён и ждёт устройство на задней панели, и когда Pixel
+	# сам ненадолго включает его при подключении кабеля («Включать автоматически»,
+	# settings global settings_key_reverse_charging_auto_turn_on=1). Отдельной
+	# настройки основного переключателя и порога остановки в settings нет.
+	local rn bs="" wd="$R/sys/class/power_supply/wireless/device" bsauto
+	if [ -e "$wd/rtx_status" ] || [ -e "$wd/rtx" ]; then
+		bsauto=$(settings get global settings_key_reverse_charging_auto_turn_on 2>/dev/null)
+		if { rd "$wd/rtx_status" && [ "$REPLY" = "active" ]; } || { rd "$wd/rtx" && [ "$REPLY" = "1" ]; }; then
+			if [ "$usb_in" -eq 1 ] && [ "$bsauto" = "1" ]; then
+				bs="${MAGENTA}вкл.${NC} ${DIM}(ненадолго, автовключение при подключении кабеля)${NC}"
 			else
-				src="$src · ${MAGENTA}раздаёт заряд (Battery Share)${NC}"
+				bs="${MAGENTA}вкл.${NC} ${DIM}(беспроводная раздача заряда)${NC}"
 			fi
+		elif [ "$bsauto" = "1" ]; then
+			bs="выкл. ${DIM}· включится ненадолго при подключении кабеля${NC}"
 		else
-			src="${MAGENTA}раздаёт заряд (Battery Share)${NC}"
+			bs="выкл."
 		fi
 	else
 		for rn in "$R/sys/class/power_supply/wireless/reverse_chg_mode" "$R/sys/class/power_supply/wireless/wireless_out"; do
@@ -1365,6 +1371,7 @@ check_battery() {
 		done
 	fi
 	[ -n "$src" ] && kv "Питание" "$src"
+	[ -n "$bs" ] && kv "Battery Share" "$bs"
 
 	# [3.8] Режимы зарядки и время до заряда. Переключатели живут в Settings
 	# Intelligence / SystemUI, но применяются через Health HAL — читаем результат
@@ -1384,6 +1391,14 @@ check_battery() {
 	is_int "${v:-x}" && { [ "$v" = "2" ] || [ "$v" = "3" ]; } && pol="$v"
 	v=$(printf '%s\n' "$dbat" | sed -n 's/^ *Charging state: *//p' | head -n 1)
 	is_int "${v:-x}" && [ "$v" -ge 2 ] && [ "$v" -le 5 ] && cst="$v"
+	# [3.15.5] Выбранный режим виден и без кабеля: «Максимум 80%» BatteryService
+	# отдаёт всегда (2), а адаптивная до начала зарядки не видна в политике —
+	# берём настройку secure adaptive_charging_enabled (проба 3155b; «Максимум 80%»
+	# там же — charge_optimization_mode=1, оба 0 — оптимизация выключена).
+	# Во время зарядки не подставляем: там важно, работает ли режим сейчас.
+	if [ "$status" = "Discharging" ] && [ "$pol" != "2" ] && [ "$pol" != "3" ] && [ "$(settings get secure adaptive_charging_enabled 2>/dev/null)" = "1" ]; then
+		pol=3
+	fi
 	case "$pol" in 2) modes="максимум 80%" ;; 3) modes="адаптивная зарядка" ;; esac
 	case "$cst" in
 		2) modes="${modes:+$modes · }${YELLOW}ограничена: холодно${NC}" ;;
@@ -1420,6 +1435,10 @@ check_battery() {
 				elif [ -n "$rate_eta" ]; then eta="полный заряд через $rate_eta"; fi ;;
 		esac
 		[ -z "$modes" ] && modes="обычная зарядка"
+	elif [ "$status" = "Discharging" ] && [ "$pol" = "2" ]; then
+		eta="${DIM}включится при зарядке${NC}"
+	elif [ "$status" = "Discharging" ] && [ "$pol" = "3" ]; then
+		eta="${DIM}включится при долгой зарядке, обычно ночью${NC}"
 	elif [ "$pol" = "2" ] && [ "$status" = "Not charging" ]; then
 		# [3.15.5] Упёрлись в лимит: драйвер Google держит заряд между
 		# charge_start_level и charge_stop_level (Pixel 8 Pro: 77 и 80)
