@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.16 — мониторинг состояния rooted Android
+# monitor.sh v3.16.1 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.16"
+readonly VERSION="3.16.1"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -404,11 +404,19 @@ jget() {
 	{ REPLY=$("$@" 2>/dev/null); } 2>/dev/null
 }
 jout() { [ -z "$REPLY" ] || printf '%s\n' "$REPLY"; }   # вывод jget — как из самой команды
-jobs_wait_all() {   # перед замером top: чтобы фоновые команды не попали в замер
-	local n
+# Перед замером top: чтобы фоновые команды не попали в замер. [3.16.1] Если
+# какая-то ещё работала (её результата не было), ждём ещё 1 с: проба 3161 на
+# Pixel 8 Pro — system_server после пачки dumpsys занят ~1,3 с (90 → 34%), потом
+# возвращается к фону. Если всё давно готово — без паузы.
+jobs_wait_all() {
+	local n busy=0
 	for n in "${!JOB_PID[@]}"; do
-		[ "${JOB_PID[$n]}" = done ] || { wait "${JOB_PID[$n]}" 2>/dev/null; JOB_PID[$n]=done; }
+		[ "${JOB_PID[$n]}" = done ] && continue
+		[ -f "$JOB_DIR/$n" ] || busy=1
+		wait "${JOB_PID[$n]}" 2>/dev/null; JOB_PID[$n]=done
 	done
+	[ "$busy" -eq 1 ] && sleep 1
+	return 0
 }
 
 # Настройки Android: «settings list» на пространство имён — один раз за проход
@@ -2186,6 +2194,18 @@ check_network() {
 			ok=1
 			kv "Интернет" "${GREEN}есть${NC} ${DIM}(HTTP; ICMP закрыт)${NC}"
 		fi
+	# [3.16.1] curl нет (на Pixel он только у MT Manager: запуск не из MT под VPN
+	# писал «интернета нет») — TCP-соединение средствами bash: /dev/tcp, таймаут
+	# toybox. Проба 3161: работает на обоих телефонах, имена тоже разрешаются.
+	elif [ "$ok" -eq 0 ] && command -v timeout >/dev/null 2>&1; then
+		local th
+		for th in 1.1.1.1 8.8.8.8; do
+			if timeout 3 "${BASH:-bash}" -c "exec 3<>/dev/tcp/$th/443" 2>/dev/null; then
+				ok=1
+				kv "Интернет" "${GREEN}есть${NC} ${DIM}(TCP $th:443; ICMP закрыт)${NC}"
+				break
+			fi
+		done
 	fi
 	if [ "$ok" -eq 0 ]; then
 		verdict 1 "интернета нет"
