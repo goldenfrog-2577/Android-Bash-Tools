@@ -1,0 +1,9 @@
+# Сценарии для regress.sh: имя|каталог-заглушек|корень|переменные|флаги
+# Каталог заглушек — поддельные getprop, dumpsys, settings, cmd, df, ping… (в начале PATH),
+# корень — поддельные /sys, /proc, /data (MONITOR_SYSROOT). Переменные — через пробел,
+# без кавычек (списки — через запятую), их читают заглушки.
+px_e|/путь/к/моки/pixel/bin|/путь/к/моки/pixel/root||-e
+px_80|/путь/к/моки/pixel/bin|/путь/к/моки/pixel/root|CPOL=2 CST=2|-e
+px_narrow|/путь/к/моки/pixel/bin|/путь/к/моки/pixel/root|MONITOR_COLS=52|-e
+f3_e|/путь/к/моки/f3/bin|/путь/к/моки/f3/root||-e
+f3_evo|/путь/к/моки/f3/bin|/путь/к/моки/f3/root|EVO=1|-e -d all
