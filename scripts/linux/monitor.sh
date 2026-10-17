@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.15.4 — мониторинг состояния rooted Android
+# monitor.sh v3.15.5 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.15.4"
+readonly VERSION="3.15.5"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -383,7 +383,8 @@ load_thermal_hal() {
 }
 
 # м°C → «47.2»
-mdeg() { REPLY="$(( $1 / 1000 )).$(( ( ${1#-} % 1000 ) / 100 ))"; }
+# [3.15.5] Знак отдельно: раньше −500 м°C выходило «0.5» (целая часть −0 = 0)
+mdeg() { local a=${1#-} sg=""; [ "$1" != "$a" ] && sg="-"; REPLY="$sg$(( a / 1000 )).$(( ( a % 1000 ) / 100 ))"; }
 # дробные °C из HAL → «47.2»
 fdeg() { printf -v REPLY '%.1f' "$1" 2>/dev/null || REPLY="$1"; }
 
@@ -622,6 +623,9 @@ check_memory() {
 		# [3.15.4] Явные подписи: слева — данные в zram (несжатые), справа — сколько
 		# они занимают в RAM; объём самих устройств — в строке «Подкачка»
 		kv "ZRAM" "$(hsize_kb $((o_sum / 1024))) данных → $(hsize_kb $((u_sum / 1024))) в памяти ${DIM}(сжатие ×$ratio)${NC}${algos:+ · ${algos// //}}$devs"
+	elif [ "$nz" -gt 0 ]; then
+		# [3.15.5] По аудиту: включённый, но пустой zram не должен выглядеть как отсутствующий
+		kv "ZRAM" "пусто${algos:+ · ${algos// //}}$([ "$nz" -gt 1 ] && printf ' %s(%s устройства)%s' "$DIM" "$nz" "$NC")"
 	fi
 	if [ "$swt" -gt 0 ]; then
 		local wb=""
@@ -953,7 +957,7 @@ check_thermal() {
 	if [ -n "$list" ]; then
 		kv "Троттлинг" "${YELLOW}активен${NC}: ${list#, }"
 	else
-		kv "Троттлинг" "${GREEN}нет${NC}"
+		kv "Троттлинг" "${GREEN}нет${NC} ${DIM}(по данным ядра)${NC}"   # [3.15.5] по аудиту: не абсолютная гарантия
 	fi
 }
 
@@ -1192,11 +1196,34 @@ check_cameras() {
 	rows=$(dumpsys media.camera 2>/dev/null | awk "$CAM_AWK" 2>/dev/null | sort -n -k1,1)
 	[ -n "$rows" ] || return 0
 	section "КАМЕРЫ"
+	# [3.15.5] Модели сенсоров — только где прошивка их называет: Xiaomi пишет
+	# persist.vendor.camera.mi.module.info(ext) = «back_main=imx582;back_ultra=imx355_i;…».
+	# Pixel отдаёт лишь внутренние кодовые имена Google (lwis-sensor-dokkaebi…) —
+	# их не расшифровываем.
+	local -A SNS=()
+	local mi kvp key val; local -a _mi
+	prop persist.vendor.camera.mi.module.info; mi="$REPLY"
+	prop persist.vendor.camera.mi.module.infoext; mi="$mi;$REPLY"
+	IFS=';' read -r -a _mi <<< "$mi"
+	for kvp in "${_mi[@]}"; do
+		key="${kvp%%=*}"; val="${kvp#*=}"; [ "$key" != "$kvp" ] && [ -n "$val" ] || continue
+		val="${val%%_*}"; val="${val^^}"
+		case "$val" in
+			IMX*) val="Sony $val" ;; S5K*) val="Samsung $val" ;; OV*) val="OmniVision $val" ;;
+			HI*) val="Hynix Hi${val#HI}" ;; GC*) val="GalaxyCore $val" ;; JN*|HM*|GN*|HP*) val="Samsung ISOCELL $val" ;;
+		esac
+		case "$key" in
+			back_main) SNS[Основная]="$val" ;; back_ultra|back_wide) SNS["Широкий угол"]="$val" ;;
+			back_tele*) SNS[Телефото]="$val" ;; back_macro*) SNS[Макро]="$val" ;;
+			front_main) SNS[Фронтальная]="$val" ;;
+		esac
+	done
 	local r role mp f eq ois z line
 	while IFS=$'\t' read -r r role mp f eq ois z; do
 		[ -n "$role" ] || continue
 		line="$mp Мп · f/$f · $eq мм${z:+ ${DIM}(×$z)${NC}}"
 		[ "$ois" = "1" ] && line="$line · OIS"
+		[ -n "${SNS[$role]:-}" ] && line="$line · ${SNS[$role]}"
 		kv "$role" "$line"
 	done <<< "$rows"
 	return 0
@@ -1284,13 +1311,16 @@ check_battery() {
 	# Источник питания
 	# [3.8.1] Формат «USB PD, быстрая · 8.3 В · до 20 Вт»: единицы прямо в тексте
 	# (раньше «(8 В)» читалось двусмысленно), напряжение с десятыми.
-	local src="" ps tp on pmax=""
+	local src="" ps tp on pmax="" dbat usb_in=0
+	# [3.15.5] dumpsys battery — один раз: предел мощности и режим зарядки
+	dbat=$(dumpsys battery 2>/dev/null)
 	for ps in "$R"/sys/class/power_supply/*; do
 		rd "$ps/online" && [ "$REPLY" = "1" ] || continue
 		rd "$ps/type"; tp="$REPLY"
 		case "${ps##*/}:$tp" in
 			wireless:*|*:Wireless) src="беспроводная" ;;
 			usb:*|*:USB*)
+				usb_in=1
 				local uv=0 proto="USB"
 				rd "$ps/voltage_now" && is_int "$REPLY" && uv=$((REPLY / 1000))
 				case "$tp" in USB_PD*) proto="USB PD" ;; esac   # [3.7] протокол, если драйвер сообщает
@@ -1305,7 +1335,7 @@ check_battery() {
 	# [3.8.1] Иначе — договорённость телефона с зарядником из BatteryService
 	# (Max charging current × voltage, Pixel): это предел, а не текущая мощность.
 	if [ -n "$src" ] && [ -z "$pmax" ] && [ "$src" != "беспроводная" ]; then
-		pmax=$(dumpsys battery 2>/dev/null | awk -F': ' '
+		pmax=$(printf '%s\n' "$dbat" | awk -F': ' '
 			/Max charging current:/ { i = $2 + 0 } /Max charging voltage:/ { v = $2 + 0 }
 			END { if (i > 0 && v > 0) { w = i * v / 1e12; if (w >= 1 && w < 500) printf "%.0f", w } }')
 	fi
@@ -1314,9 +1344,21 @@ check_battery() {
 	# [3.15.1] Настоящие узлы — у беспроводного чипа: wireless/device/rtx_status
 	# (available → active при включении) и rtx (0 → 1); проверено на Pixel 8 Pro.
 	# Прежние reverse_chg_mode / wireless_out на Pixel не существуют.
+	# [3.15.5] Pixel сам ненадолго включает Battery Share при подключении кабеля
+	# («Включать автоматически», settings global settings_key_reverse_charging_
+	# auto_turn_on=1; проба 3155: rtx=1 сразу после подключения, через минуты 0).
+	# Тогда зарядку по USB не прячем, а дописываем Battery Share к ней.
 	local rn wd="$R/sys/class/power_supply/wireless/device"
 	if { rd "$wd/rtx_status" && [ "$REPLY" = "active" ]; } || { rd "$wd/rtx" && [ "$REPLY" = "1" ]; }; then
-		src="${MAGENTA}раздаёт заряд (Battery Share)${NC}"
+		if [ "$usb_in" -eq 1 ] && [ -n "$src" ]; then
+			if [ "$(settings get global settings_key_reverse_charging_auto_turn_on 2>/dev/null)" = "1" ]; then
+				src="$src · ${MAGENTA}Battery Share${NC} ${DIM}(автовключение при зарядке)${NC}"
+			else
+				src="$src · ${MAGENTA}раздаёт заряд (Battery Share)${NC}"
+			fi
+		else
+			src="${MAGENTA}раздаёт заряд (Battery Share)${NC}"
+		fi
 	else
 		for rn in "$R/sys/class/power_supply/wireless/reverse_chg_mode" "$R/sys/class/power_supply/wireless/wireless_out"; do
 			rd "$rn" && [ "$REPLY" = "1" ] && { src="${MAGENTA}раздаёт заряд (Battery Share)${NC}"; break; }
@@ -1330,9 +1372,18 @@ check_battery() {
 	#   charging_policy: 1 обычная · 2 LONG_LIFE («Максимум 80%») · 3 ADAPTIVE
 	#   charging_state:  1 обычная · 2 холодно · 3 жарко · 4 LONG_LIFE · 5 ADAPTIVE
 	# Где узлов нет (F3: HAL отвечает INVALID), режимы не выдумываем.
-	local pol="" cst="" modes="" eta="" bd
+	local pol="" cst="" modes="" eta="" bd v
 	rd "$b/charging_policy" && is_int "$REPLY" && pol="$REPLY"
 	rd "$b/charging_state" && is_int "$REPLY" && cst="$REPLY"
+	# [3.15.5] Pixel 8 Pro (Android 17) пишет в charging_policy свой код 4 при
+	# «Максимум 80%», а BatteryService отдаёт уже стандартный (AIDL
+	# BatteryChargingPolicy: 1 обычная · 2 LONG_LIFE · 3 ADAPTIVE) — берём его.
+	v=$(printf '%s\n' "$dbat" | sed -n 's/^ *Charging policy: *//p' | head -n 1)
+	# Особые режимы (2, 3) из BatteryService главнее; «1» не перекрывает узел ядра,
+	# чтобы не потерять адаптивную зарядку, если сервис её не отражает.
+	is_int "${v:-x}" && { [ "$v" = "2" ] || [ "$v" = "3" ]; } && pol="$v"
+	v=$(printf '%s\n' "$dbat" | sed -n 's/^ *Charging state: *//p' | head -n 1)
+	is_int "${v:-x}" && [ "$v" -ge 2 ] && [ "$v" -le 5 ] && cst="$v"
 	case "$pol" in 2) modes="максимум 80%" ;; 3) modes="адаптивная зарядка" ;; esac
 	case "$cst" in
 		2) modes="${modes:+$modes · }${YELLOW}ограничена: холодно${NC}" ;;
@@ -1369,6 +1420,12 @@ check_battery() {
 				elif [ -n "$rate_eta" ]; then eta="полный заряд через $rate_eta"; fi ;;
 		esac
 		[ -z "$modes" ] && modes="обычная зарядка"
+	elif [ "$pol" = "2" ] && [ "$status" = "Not charging" ]; then
+		# [3.15.5] Упёрлись в лимит: драйвер Google держит заряд между
+		# charge_start_level и charge_stop_level (Pixel 8 Pro: 77 и 80)
+		local gstart=""
+		rd "$R/sys/devices/platform/google,charger/charge_start_level" && is_int "$REPLY" && gstart="$REPLY"
+		eta="зарядка остановлена${gstart:+ ${DIM}(возобновится ниже $gstart%)${NC}}"
 	fi
 	[ -n "$modes" ] && kv "Режим" "$modes${eta:+ · $eta}"   # [3.14.1] было «Режимы»
 
@@ -1659,6 +1716,22 @@ mobile_info() {
 	return 1
 }
 
+# [3.15.5] Название модема → REPLY. Pixel: версия baseband «g5300i-…» — модем
+# Exynos 5300 (g5123 → 5123, g5400 → 5400). Qualcomm со встроенным модемом — по
+# модели SoC (ro.soc.model), только для известных чипов; иначе пусто.
+modem_name() {
+	local bb soc
+	prop gsm.version.baseband; bb="${REPLY%%,*}"
+	REPLY=""
+	if [[ "$bb" =~ ^g([0-9]{4})[a-z]?- ]]; then REPLY="Exynos ${BASH_REMATCH[1]}"; return; fi
+	prop ro.soc.model; soc="$REPLY"; REPLY=""
+	case "$soc" in
+		SM8250*) REPLY="Snapdragon X55" ;; SM8350*) REPLY="Snapdragon X60" ;;
+		SM8450*|SM8475*) REPLY="Snapdragon X65" ;; SM8550*) REPLY="Snapdragon X70" ;;
+		SM8650*) REPLY="Snapdragon X75" ;; SM8750*) REPLY="Snapdragon X80" ;;
+	esac
+}
+
 check_network() {
 	section "СЕТЬ"
 	local route dev src
@@ -1779,7 +1852,7 @@ check_network() {
 		*)        kv "Частный DNS" "авто ${DIM}(если сеть поддерживает)${NC}" ;;
 	esac
 
-	# [3.9] Модем: температура и ограничение сети из-за нагрева.
+		# [3.9] Модем: температура и ограничение сети из-за нагрева.
 	# Pixel (модем Exynos): зоны cp_on_chip_*, ограничение — статус датчика
 	# усилителя cellular-emergency в Thermal HAL (отдельных устройств охлаждения нет).
 	# Qualcomm: зоны modem-N-usr, ограничение — устройства охлаждения modem_*.
@@ -1803,7 +1876,7 @@ check_network() {
 		if [ -z "$mlim" ] && is_int "${HAL_STAT[cellular-emergency]:-x}" && [ "${HAL_STAT[cellular-emergency]}" -gt 0 ]; then
 			mlim="${YELLOW}ограничен${NC} ${DIM}(перегрев усилителя)${NC}"
 		fi
-		kv "Модем" "$mt${mlim:+ · $mlim}"
+		modem_name; kv "Модем" "$mt${REPLY:+ · $REPLY}${mlim:+ · $mlim}"
 	fi
 
 	# Доступность: 3 пинга на хост; среднее и разброс (mdev) из той же серии
@@ -1855,19 +1928,36 @@ check_iperf3_speed() {
 	# 5201: ping.online.net слушает 5200–5209, bouygues.iperf.fr переехал на
 	# *.iperf.bytel.fr (9200–9240), serverius — speedtest1.serverius.net:5002.
 	# Каждый сервер принимает один тест за раз: «busy» — пробуем другой порт.
-	note "Идёт тест, до 15 секунд на сервер…"
-	local server down up hp host lo hi port try out
+	# [3.15.5] По аудиту: без timeout каждый недоступный сервер вис бы надолго,
+	# а итог выглядел как «серверы недоступны» — говорим прямо.
+	if ! command -v timeout >/dev/null 2>&1; then
+		kv "iperf3" "${YELLOW}нет команды timeout${NC} ${DIM}(нужна для ограничения теста)${NC}"
+		return
+	fi
+	# [3.15.5] Общий предел — 60 с на поиск сервера; при неудаче — сводка причин
+	note "Идёт тест, обычно 15–20 секунд, не больше минуты…"
+	local server down up hp host lo hi port try out rc t0=$SECONDS
+	local n_busy=0 n_to=0 n_ref=0 n_dns=0 n_oth=0
 	for hp in ping.online.net:5200-5209 speedtest1.serverius.net:5002-5002 paris.bbr.iperf.bytel.fr:9200-9240 \
 		speedtest.milkywan.fr:9200-9240 iperf3.moji.fr:5200-5240 speedtest.kamel.network:5201-5205 iperf.he.net:5201-5201; do
+		[ $((SECONDS - t0)) -ge 60 ] && break
 		host="${hp%%:*}"; lo="${hp#*:}"; hi="${lo#*-}"; lo="${lo%-*}"
 		for try in 1 2 3; do
 			port=$((lo + RANDOM % (hi - lo + 1)))
-			out=$(timeout 8 iperf3 -c "$host" -p "$port" -R -t 5 2>&1)
+			out=$(timeout 8 iperf3 -c "$host" -p "$port" -R -t 5 2>&1); rc=$?
 			down=$(printf '%s\n' "$out" | awk "$IPERF_RATE_AWK")
 			[ -n "$down" ] && break
 			[[ "$out" == *busy* ]] || break      # не «занят» — сервер недоступен, дальше
 		done
-		[ -n "$down" ] || continue
+		if [ -z "$down" ]; then
+			case "$out" in
+				*busy*) n_busy=$((n_busy + 1)) ;;
+				*resolve*|*"Name or service"*|*"No address"*) n_dns=$((n_dns + 1)) ;;
+				*refused*|*unreachable*) n_ref=$((n_ref + 1)) ;;
+				*) if [ "$rc" -eq 124 ]; then n_to=$((n_to + 1)); else n_oth=$((n_oth + 1)); fi ;;
+			esac
+			continue
+		fi
 		server="$host:$port"
 		kv "Сервер" "$server"
 		kv "Загрузка" "$down"
@@ -1875,7 +1965,14 @@ check_iperf3_speed() {
 		kv "Отдача" "${up:-не удалось}"
 		return
 	done
-	kv "iperf3" "${YELLOW}серверы недоступны${NC}"
+	local why=""
+	[ "$n_busy" -gt 0 ] && why="${why:+$why, }заняты: $n_busy"
+	[ "$n_to" -gt 0 ] && why="${why:+$why, }не отвечают: $n_to"
+	[ "$n_ref" -gt 0 ] && why="${why:+$why, }отказ в подключении: $n_ref"
+	[ "$n_dns" -gt 0 ] && why="${why:+$why, }имя не найдено: $n_dns"
+	[ "$n_oth" -gt 0 ] && why="${why:+$why, }другая ошибка: $n_oth"
+	[ $((SECONDS - t0)) -ge 60 ] && why="${why:+$why, }прервано через минуту"
+	kv "iperf3" "${YELLOW}серверы недоступны${NC}${why:+ ${DIM}($why)${NC}}"
 }
 
 # ── Logcat ───────────────────────────────────────────────────────────────────
@@ -3527,7 +3624,7 @@ validate_percent_pair() {   # имя, warn, crit
 acquire_lock() {
 	local pid
 	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-		pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+		pid=$(cat "$LOCK_DIR/pid" 2>/dev/null); local opid="$pid"
 		# [3.11.1] PID мог достаться другому процессу после падения прежнего монитора:
 		# живым считаем только процесс, в командной строке которого есть имя скрипта.
 		# Если cmdline не прочитать — осторожно считаем его живым.
@@ -3542,8 +3639,20 @@ acquire_lock() {
 			printf '[!] Мониторинг уже запущен (PID %s). Если это не так: rm -r %s\n' "$pid" "$LOCK_DIR" >&2
 			return $EXIT_INTERNAL
 		fi
-		rm -rf "$LOCK_DIR"
-		mkdir "$LOCK_DIR" 2>/dev/null || { printf '[!] Не удалось создать %s\n' "$LOCK_DIR" >&2; return $EXIT_INTERNAL; }
+		# [3.15.5] По аудиту: два монитора могли одновременно счесть блокировку
+		# мёртвой, и второй удалял уже свежую блокировку первого. Теперь мёртвую
+		# блокировку атомарно переименовываем и проверяем, что унесли именно её
+		# (тот же PID); если нет — возвращаем на место и выходим.
+		local stale_pid gone="$LOCK_DIR.stale.$$"
+		stale_pid="$opid"
+		if mv "$LOCK_DIR" "$gone" 2>/dev/null; then
+			if [ "$(cat "$gone/pid" 2>/dev/null)" != "$stale_pid" ]; then
+				mv "$gone" "$LOCK_DIR" 2>/dev/null
+				printf '[!] Мониторинг уже запущен другим процессом\n' >&2; return $EXIT_INTERNAL
+			fi
+			rm -rf "$gone"
+		fi
+		mkdir "$LOCK_DIR" 2>/dev/null || { printf '[!] Мониторинг уже запущен другим процессом\n' >&2; return $EXIT_INTERNAL; }
 	fi
 	echo $$ > "$LOCK_DIR/pid"
 	LOCK_HELD=1
