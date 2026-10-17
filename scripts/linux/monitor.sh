@@ -3215,39 +3215,6 @@ print_system() {
 			esac
 			kv "Формат часов" "$f12-часовой ${DIM}(по языку${lc:+ $lc})${NC}" ;;
 	esac
-	detect_root
-	kv "Root" "${GREEN}есть${NC} · $ROOT_INFO"
-	[ -n "$ZYGISK_INFO" ] && kv "Zygisk" "$ZYGISK_INFO"
-	local se; se=$(getenforce 2>/dev/null)
-	case "$se" in
-		Enforcing)  kv "SELinux" "${GREEN}Enforcing${NC}" ;;
-		Permissive) kv "SELinux" "${YELLOW}Permissive${NC}" ;;
-		*)          kv "SELinux" "${se:-?}" ;;
-	esac
-	bio_lines
-	[ -n "$BIO_FP" ] && kv "Отпечаток" "$BIO_FP"
-	[ -n "$BIO_FACE" ] && kv "Лицо" "$BIO_FACE"
-	# [3.15] Обновления: патч безопасности системы и вендора (если отличается) и
-	# дата обновления системы Google Play — versionName пакета modulemetadata
-	# («2026-09-01S+»); у прошивок без mainline Google его нет.
-	# Отставание вендора не подсвечивается: на кастомных прошивках для старых
-	# устройств (POCO F3) свежего vendor уже не будет, предупреждать не о чем.
-	# Неразрывный пробел (U+00A0) держит дату вместе с подписью при переносе.
-	local sp vp mm upl="" nb=$'\xc2\xa0'
-	prop ro.build.version.security_patch; sp="$REPLY"
-	prop ro.vendor.build.security_patch; vp="$REPLY"
-	jget pkg_mainline dumpsys package com.google.android.modulemetadata; mm=$(jout | sed -n 's/^ *versionName=\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]\).*/\1/p' | head -n 1)
-	if [[ "$sp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
-		upl="патч безопасности от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
-		if [[ "$vp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] && [ "$vp" != "$sp" ]; then
-			upl="$upl · исправления производителя${nb}от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
-		fi
-	fi
-	[ -n "$mm" ] && upl="${upl:+$upl · }системное обновление Google${nb}Play${nb}от${nb}${mm:8:2}.${mm:5:2}.${mm:0:4}"
-	[ -n "$upl" ] && kv "Обновления" "$upl"
-	kv "Статус AVB" "$VB_LABEL"
-	note "ядро: ${VB_REAL:-${VB_DEVSTATE:-—}} · свойства: ${VB_PROP:-—}/flash.locked=${VB_LOCKPROP:-—}"
-	note "Вердикт Play Integrity выносят серверы Google — локально его не проверить."
 	prop ro.product.cpu.abi; kv "ABI" "$REPLY"
 
 	[ "$EXTENDED" -eq 1 ] || return 0
@@ -3284,6 +3251,49 @@ print_system() {
 	fi
 	[ -n "$rev" ] && kv "Ревизия" "$rev"
 	kv "Драйверы" "Vulkan: ${vk:-по умолчанию} · EGL: ${egl:-по умолчанию}"
+}
+
+# [3.17] Безопасность — отдельной секцией после «Системы»: обновления, Verified
+# Boot, SELinux, root, биометрия; с -e — защита ядра и уязвимости процессора.
+check_security() {
+	section "БЕЗОПАСНОСТЬ"
+	# [3.15] Обновления: патч безопасности системы и вендора (если отличается) и
+	# дата обновления системы Google Play — versionName пакета modulemetadata
+	# («2026-09-01S+»); у прошивок без mainline Google его нет.
+	# Отставание вендора не подсвечивается: на кастомных прошивках для старых
+	# устройств (POCO F3) свежего vendor уже не будет, предупреждать не о чем.
+	# Неразрывный пробел (U+00A0) держит дату вместе с подписью при переносе.
+	local sp vp mm upl="" nb=$'\xc2\xa0'
+	prop ro.build.version.security_patch; sp="$REPLY"
+	prop ro.vendor.build.security_patch; vp="$REPLY"
+	jget pkg_mainline dumpsys package com.google.android.modulemetadata; mm=$(jout | sed -n 's/^ *versionName=\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9]\).*/\1/p' | head -n 1)
+	if [[ "$sp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
+		upl="патч безопасности от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
+		if [[ "$vp" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]] && [ "$vp" != "$sp" ]; then
+			upl="$upl · исправления производителя${nb}от${nb}${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
+		fi
+	fi
+	[ -n "$mm" ] && upl="${upl:+$upl · }системное обновление Google${nb}Play${nb}от${nb}${mm:8:2}.${mm:5:2}.${mm:0:4}"
+	[ -n "$upl" ] && kv "Обновления" "$upl"
+	kv "Статус AVB" "$VB_LABEL"
+	note "ядро: ${VB_REAL:-${VB_DEVSTATE:-—}} · свойства: ${VB_PROP:-—}/flash.locked=${VB_LOCKPROP:-—}"
+	note "Вердикт Play Integrity выносят серверы Google — локально его не проверить."
+	local se; se=$(getenforce 2>/dev/null)
+	case "$se" in
+		Enforcing)  kv "SELinux" "${GREEN}Enforcing${NC}" ;;
+		Permissive) kv "SELinux" "${YELLOW}Permissive${NC}" ;;
+		*)          kv "SELinux" "${se:-?}" ;;
+	esac
+	detect_root
+	kv "Root" "${GREEN}есть${NC} · $ROOT_INFO"
+	[ -n "$ZYGISK_INFO" ] && kv "Zygisk" "$ZYGISK_INFO"
+	bio_lines
+	[ -n "$BIO_FP" ] && kv "Отпечаток" "$BIO_FP"
+	[ -n "$BIO_FACE" ] && kv "Лицо" "$BIO_FACE"
+	if [ "$EXTENDED" -eq 1 ]; then
+		kernel_config; kernel_hardening "$REPLY"
+		kernel_vulns
+	fi
 }
 
 # ── Подмена (Evolution X) ────────────────────────────────────────────────────
@@ -3732,11 +3742,22 @@ print_lsposed() {
 	[ "$nocache" -eq 1 ] && note "Описания хранятся в ресурсах APK: откройте список модулей в менеджере $fork — он сохранит их в кэш, и скрипт их покажет."
 }
 
-# [3.17] Защита ядра (-e): что собрано в ядре (config.gz) и что умеет процессор
+# [3.17] Защита ядра (с -e, в «Безопасности»): что собрано в ядре (config.gz) и что умеет процессор
 # (Features в /proc/cpuinfo). Проба 3170: Pixel 8 Pro — CFI, SCS, KASLR, PAC, BTI
 # (только для приложений: ARM64_BTI_KERNEL не включён), MTE собран, но выключен
 # (arm64.nomte; включается в «Для разработчиков» — свойство arm64.memtag.bootctl);
 # POCO F3 (Cortex-A77, ARMv8.2) — CFI, SCS, KASLR, а PAC/BTI/MTE у процессора нет.
+# [3.17] Нужные строки /proc/config.gz — распаковываются один раз за проход
+# (частота тика в «Ядре», защита в «Безопасности»). REPLY — строки CONFIG_…=…
+KCFG=""; KCFG_LOADED=0
+kernel_config() {
+	if [ "$KCFG_LOADED" -eq 0 ]; then
+		KCFG_LOADED=1; KCFG=""
+		can_read "$R/proc/config.gz" && KCFG=$( (zcat "$R/proc/config.gz" || gzip -dc "$R/proc/config.gz") 2>/dev/null \
+			| grep -E '^CONFIG_(HZ|CFI_CLANG|SHADOW_CALL_STACK|RANDOMIZE_BASE|ARM64_PTR_AUTH|ARM64_BTI|ARM64_BTI_KERNEL|ARM64_MTE)=')
+	fi
+	REPLY="$KCFG"
+}
 kernel_hardening() {   # kernel_hardening ТЕКСТ_CONFIG
 	local c="$1" out="" feat="" cmd="" y
 	[ -n "$c" ] || return 0
@@ -3851,14 +3872,10 @@ print_kernel_extended() {
 	kv "TCP" "${tcp:-?} ${DIM}(доступно: ${avail:-?})${NC}"
 	if rd "$R/sys/module/wireguard/version"; then kv "WireGuard" "v$REPLY"; fi
 
-	# [3.17] config.gz распаковывается один раз: частота тика и защита ядра
-	local hz="" kcfg=""
-	can_read "$R/proc/config.gz" && kcfg=$( (zcat "$R/proc/config.gz" || gzip -dc "$R/proc/config.gz") 2>/dev/null \
-		| grep -E '^CONFIG_(HZ|CFI_CLANG|SHADOW_CALL_STACK|RANDOMIZE_BASE|ARM64_PTR_AUTH|ARM64_BTI|ARM64_BTI_KERNEL|ARM64_MTE)=')
-	[[ "$kcfg" =~ (^|$'\n')CONFIG_HZ=([0-9]+) ]] && hz="${BASH_REMATCH[2]}"
+	local hz=""
+	kernel_config
+	[[ "$REPLY" =~ (^|$'\n')CONFIG_HZ=([0-9]+) ]] && hz="${BASH_REMATCH[2]}"
 	if [ -n "$hz" ]; then kv "Частота тика" "$hz Гц"; else kv "Частота тика" "неизвестно (нет /proc/config.gz)"; fi
-	kernel_hardening "$kcfg"
-	kernel_vulns
 
 	# [3.5] Новый генератор случайных чисел (BLAKE2s, 5.18) в 2022 году перенесли
 	# во все стабильные ветки, включая 4.19 и 5.4 — поэтому 256 бывает и на старых
@@ -4093,7 +4110,7 @@ run_monitor() {
 	load_props
 	load_verified_boot
 	# [3.16] Кэши прохода: в режиме --loop каждый проход читает всё заново
-	sg_reset; PART_LOADED=0
+	sg_reset; PART_LOADED=0; KCFG_LOADED=0
 	jobs_init
 
 	if [ "$DRY_RUN" -eq 1 ]; then
@@ -4129,6 +4146,7 @@ run_monitor() {
 	check_partitions
 	check_pixel_security
 	print_system
+	check_security
 	if [ "$EXTENDED" -eq 1 ]; then
 		check_spoofing
 		print_modules
