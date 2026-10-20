@@ -2200,9 +2200,16 @@ net_modem() {
 # Доступность: 3 пинга на хост; среднее и разброс (mdev) из той же серии.
 # [3.16] Проверка 1 пакетом и сама серия идут в предзагрузке по всем трём хостам
 # сразу; хост выбирается в прежнем порядке — первый ответивший из списка.
+# [3.17.2] Каждый ping ограничен по времени целиком: -W ждёт только ответ, а имя
+# хоста (google.com) ping разрешает сам и без ограничения. Живой прогон на Pixel
+# с VPN и частным DNS: «Модем» → «Интернет» заняло 11 с при закрытом ICMP.
+net_tmo() {   # net_tmo СЕКУНДЫ команда… — с timeout, если он есть (в toybox есть)
+	local s="$1"; shift
+	if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; else "$@"; fi
+}
 net_ping_raw() {   # net_ping_raw ХОСТ: 1 пакет, затем серия из 3; код — успех серии
-	ping -c 1 -W 1 "$1" >/dev/null 2>&1 || return 1
-	ping -c 3 -i 0.3 -W 1 "$1" 2>/dev/null || ping -c 3 -W 1 "$1" 2>/dev/null
+	net_tmo 3 ping -c 1 -W 1 "$1" >/dev/null 2>&1 || return 1
+	net_tmo 4 ping -c 3 -i 0.3 -W 1 "$1" 2>/dev/null || net_tmo 4 ping -c 3 -W 1 "$1" 2>/dev/null
 }
 NET_PING_HOST=""; NET_PING_LAT=""
 net_ping() {   # → NET_PING_HOST (пусто — ни один не ответил), NET_PING_LAT («Задержка»)
