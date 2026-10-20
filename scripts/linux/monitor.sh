@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.17.1 — мониторинг состояния rooted Android
+# monitor.sh v3.17.2 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.17.1"
+readonly VERSION="3.17.2"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -2200,9 +2200,16 @@ net_modem() {
 # Доступность: 3 пинга на хост; среднее и разброс (mdev) из той же серии.
 # [3.16] Проверка 1 пакетом и сама серия идут в предзагрузке по всем трём хостам
 # сразу; хост выбирается в прежнем порядке — первый ответивший из списка.
+# [3.17.2] Каждый ping ограничен по времени целиком: -W ждёт только ответ, а имя
+# хоста (google.com) ping разрешает сам и без ограничения. Живой прогон на Pixel
+# с VPN и частным DNS: «Модем» → «Интернет» заняло 11 с при закрытом ICMP.
+net_tmo() {   # net_tmo СЕКУНДЫ команда… — с timeout, если он есть (в toybox есть)
+	local s="$1"; shift
+	if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; else "$@"; fi
+}
 net_ping_raw() {   # net_ping_raw ХОСТ: 1 пакет, затем серия из 3; код — успех серии
-	ping -c 1 -W 1 "$1" >/dev/null 2>&1 || return 1
-	ping -c 3 -i 0.3 -W 1 "$1" 2>/dev/null || ping -c 3 -W 1 "$1" 2>/dev/null
+	net_tmo 3 ping -c 1 -W 1 "$1" >/dev/null 2>&1 || return 1
+	net_tmo 4 ping -c 3 -i 0.3 -W 1 "$1" 2>/dev/null || net_tmo 4 ping -c 3 -W 1 "$1" 2>/dev/null
 }
 NET_PING_HOST=""; NET_PING_LAT=""
 net_ping() {   # → NET_PING_HOST (пусто — ни один не ответил), NET_PING_LAT («Задержка»)
@@ -2657,207 +2664,230 @@ bt_type() {
 	esac
 }
 
-check_connections() {
-	section "ДРУГИЕ ПОДКЛЮЧЕНИЯ"
-	local tether
-	jget tethering dumpsys tethering; tether=$(jout | awk '/^  Tether state:/ { f = 1; next } f && /^  [A-Za-z]/ { exit } f && / - TetheredState/ { printf "%s ", $1 }')
+# [3.17.2] «Другие подключения» разделены на сбор и вывод, как «Батарея» и «Сеть»:
+# каждая строка (или группа строк) собирается своей функцией conn_*, значение —
+# в REPLY или в глобальных CONN_*/BT_*; check_connections только печатает по
+# порядку. Логика строк прежняя, отчёт не меняется.
+CONN_TETHER=""
+conn_tether() {   # интерфейсы раздачи интернета (wlan…, rndis, ncm, bt-pan) → CONN_TETHER
+	jget tethering dumpsys tethering
+	CONN_TETHER=$(jout | awk '/^  Tether state:/ { f = 1; next } f && /^  [A-Za-z]/ { exit } f && / - TetheredState/ { printf "%s ", $1 }')
+}
 
-	# ── Bluetooth
-	local bt line typ mac c tr cod name k v
+# ── Bluetooth → BT_HEAD («Bluetooth»; пусто — секции нет), BT_CONN (строки
+# подключённых устройств), BT_SAVED_N и BT_SAVED (сохранённые, только с -e)
+BT_HEAD=""; BT_SAVED_N=0
+declare -a BT_CONN=() BT_SAVED=()
+conn_bluetooth() {
+	BT_HEAD=""; BT_CONN=(); BT_SAVED=(); BT_SAVED_N=0
+	local bt typ mac c tr cod name
 	jget bluetooth dumpsys bluetooth_manager; bt=$(jout | LC_ALL=C awk "$BT_AWK" 2>/dev/null)
-	if [ -n "$bt" ]; then
-		local state="" n_on=0
-		local -a macs=() conn=()
-		local -A BN=() BC=() BT=() MD=() CD=()
-		while IFS=$'\t' read -r typ mac c tr cod name; do
-			case "$typ" in
-				S) state="$mac" ;;
-				B) macs+=("$mac"); BN[$mac]="$name"; BC[$mac]="$cod"; BT[$mac]="$tr"
-				   [ "$c" = "1" ] && { conn+=("$mac"); n_on=$((n_on + 1)); } ;;
-				M) MD["$mac|$c"]="$tr" ;;
-				C) CD[$mac]="$c" ;;
-			esac
-		done <<< "$bt"
-		if [ "$state" = "ON" ]; then
-			local extra=""
-			[[ " $tether" == *" bt-pan "* ]] && extra=" · режим модема"
-			if [ "$n_on" -gt 0 ]; then
-				kv "Bluetooth" "${GREEN}вкл.${NC} · подключено: $n_on$extra"
-			else
-				kv "Bluetooth" "${GREEN}вкл.${NC}$extra"
-			fi
-			local d bat l r cs ch fp
-			for d in "${conn[@]}"; do
-				bat=""
-				l="${MD[$d|untethered_left_battery]:-}"; r="${MD[$d|untethered_right_battery]:-}"; cs="${MD[$d|untethered_case_battery]:-}"
-				if is_int "${l:-x}" || is_int "${r:-x}"; then
-					is_int "${l:-x}" && [ "$l" -ge 0 ] && bat="Л $l%"
-					is_int "${r:-x}" && [ "$r" -ge 0 ] && bat="${bat:+$bat · }П $r%"
-					[ "${MD[$d|untethered_left_charging]:-}" = "true" ] && [ "${MD[$d|untethered_right_charging]:-}" = "true" ] && bat="$bat (заряжаются)"
-					if is_int "${cs:-x}" && [ "$cs" -ge 0 ]; then
-						bat="$bat · кейс $cs%"
-						[ "${MD[$d|untethered_case_charging]:-}" = "true" ] && bat="$bat (заряжается)"
-					fi
-				elif is_int "${MD[$d|main_battery]:-x}" && [ "${MD[$d|main_battery]}" -ge 0 ]; then
-					bat="заряд ${MD[$d|main_battery]}%"
-					[ "${MD[$d|main_charging]:-}" = "true" ] && bat="$bat (заряжается)"
-				fi
-				ch="${CD[$d]:-}"
-				[ -z "$ch" ] && [ "${MD[$d|le_audio]:-}" = "true" ] && [ "${BT[$d]}" != "BR" ] && ch="LE Audio"
-				fp=""; [[ "${MD[$d|hardware_version]:-}" == FAST_PAIR_* ]] && fp=" ${DIM}· Fast Pair${NC}"
-				wrap_emit 18 "${BOLD}${BN[$d]:-$d}${NC}${ch:+ · $ch}${bat:+ · $bat}$fp"
-			done
-			if [ "$EXTENDED" -eq 1 ] && [ "${#macs[@]}" -gt 0 ]; then
-				kv "Сохранённые" "${#macs[@]}"
-				for d in "${macs[@]}"; do
-					bt_type "${BC[$d]}" "${MD[$d|device_type]:-}"
-					wrap_emit 18 "${BN[$d]:-$d}${REPLY:+ ${DIM}· $REPLY${NC}}"
-				done
-			fi
-		else
-			kv "Bluetooth" "выкл."
-		fi
+	[ -n "$bt" ] || return 0
+	local state="" n_on=0
+	local -a macs=() conn=()
+	local -A BN=() BC=() BT=() MD=() CD=()
+	while IFS=$'\t' read -r typ mac c tr cod name; do
+		case "$typ" in
+			S) state="$mac" ;;
+			B) macs+=("$mac"); BN[$mac]="$name"; BC[$mac]="$cod"; BT[$mac]="$tr"
+			   [ "$c" = "1" ] && { conn+=("$mac"); n_on=$((n_on + 1)); } ;;
+			M) MD["$mac|$c"]="$tr" ;;
+			C) CD[$mac]="$c" ;;
+		esac
+	done <<< "$bt"
+	if [ "$state" != "ON" ]; then
+		BT_HEAD="выкл."
+		return 0
 	fi
-	# [3.14.1] LE Audio и Auracast — по профилям, включённым в стеке Bluetooth:
-	#   bap.unicast.client — LE Audio (наушники по LE);
-	#   bap.broadcast.source — сам телефон ведёт трансляцию Auracast;
-	#   bap.broadcast.assist — помогает наушникам подключиться к чужой трансляции.
+	local extra=""
+	[[ " $CONN_TETHER" == *" bt-pan "* ]] && extra=" · режим модема"
+	if [ "$n_on" -gt 0 ]; then
+		BT_HEAD="${GREEN}вкл.${NC} · подключено: $n_on$extra"
+	else
+		BT_HEAD="${GREEN}вкл.${NC}$extra"
+	fi
+	local d bat l r cs ch fp
+	for d in "${conn[@]}"; do
+		bat=""
+		l="${MD[$d|untethered_left_battery]:-}"; r="${MD[$d|untethered_right_battery]:-}"; cs="${MD[$d|untethered_case_battery]:-}"
+		if is_int "${l:-x}" || is_int "${r:-x}"; then
+			is_int "${l:-x}" && [ "$l" -ge 0 ] && bat="Л $l%"
+			is_int "${r:-x}" && [ "$r" -ge 0 ] && bat="${bat:+$bat · }П $r%"
+			[ "${MD[$d|untethered_left_charging]:-}" = "true" ] && [ "${MD[$d|untethered_right_charging]:-}" = "true" ] && bat="$bat (заряжаются)"
+			if is_int "${cs:-x}" && [ "$cs" -ge 0 ]; then
+				bat="$bat · кейс $cs%"
+				[ "${MD[$d|untethered_case_charging]:-}" = "true" ] && bat="$bat (заряжается)"
+			fi
+		elif is_int "${MD[$d|main_battery]:-x}" && [ "${MD[$d|main_battery]}" -ge 0 ]; then
+			bat="заряд ${MD[$d|main_battery]}%"
+			[ "${MD[$d|main_charging]:-}" = "true" ] && bat="$bat (заряжается)"
+		fi
+		ch="${CD[$d]:-}"
+		[ -z "$ch" ] && [ "${MD[$d|le_audio]:-}" = "true" ] && [ "${BT[$d]}" != "BR" ] && ch="LE Audio"
+		fp=""; [[ "${MD[$d|hardware_version]:-}" == FAST_PAIR_* ]] && fp=" ${DIM}· Fast Pair${NC}"
+		BT_CONN+=("${BOLD}${BN[$d]:-$d}${NC}${ch:+ · $ch}${bat:+ · $bat}$fp")
+	done
+	if [ "$EXTENDED" -eq 1 ] && [ "${#macs[@]}" -gt 0 ]; then
+		BT_SAVED_N="${#macs[@]}"
+		for d in "${macs[@]}"; do
+			bt_type "${BC[$d]}" "${MD[$d|device_type]:-}"
+			BT_SAVED+=("${BN[$d]:-$d}${REPLY:+ ${DIM}· $REPLY${NC}}")
+		done
+	fi
+}
+
+# [3.14.1] LE Audio и Auracast — по профилям, включённым в стеке Bluetooth:
+#   bap.unicast.client — LE Audio (наушники по LE);
+#   bap.broadcast.source — сам телефон ведёт трансляцию Auracast;
+#   bap.broadcast.assist — помогает наушникам подключиться к чужой трансляции.
+conn_le_audio() {   # «LE Audio»
 	local lea="" aur=""
 	prop bluetooth.profile.bap.unicast.client.enabled; [ "$REPLY" = "true" ] && lea=1
 	prop bluetooth.profile.bap.broadcast.source.enabled; [ "$REPLY" = "true" ] && aur="трансляция"
 	prop bluetooth.profile.bap.broadcast.assist.enabled; [ "$REPLY" = "true" ] && aur="${aur:+$aur и }подключение"
-	if [ -n "$lea$aur" ]; then
-		if [ -n "$lea" ]; then lea="${GREEN}есть${NC}"; else lea="нет"; fi
-		kv "LE Audio" "$lea${aur:+ · Auracast: $aur}"
-	fi
+	REPLY=""
+	[ -n "$lea$aur" ] || return 0
+	if [ -n "$lea" ]; then lea="${GREEN}есть${NC}"; else lea="нет"; fi
+	REPLY="$lea${aur:+ · Auracast: $aur}"
+}
 
-	# ── NFC и бесконтактная оплата. Приложение оплаты с Android 15 — системная
-	# роль кошелька («Current wallet payment service»), а не настройка
-	# nfc_payment_default_component; на старых — «Preferred payment service».
+# ── NFC и бесконтактная оплата → CONN_NFC («NFC»; пусто — строк нет), CONN_PAY
+# («Оплата»). Приложение оплаты с Android 15 — системная роль кошелька
+# («Current wallet payment service»), а не настройка nfc_payment_default_component;
+# на старых — «Preferred payment service».
+CONN_NFC=""; CONN_PAY=""
+conn_nfc() {
+	CONN_NFC=""; CONN_PAY=""
 	local nfc
 	jget nfc dumpsys nfc; nfc="$REPLY"
-	if [[ "$nfc" == *mState=* ]]; then
-		local ns chip="" sec="" pay pkg desc
-		ns=$(printf '%s\n' "$nfc" | sed -n 's/^mState=//p' | head -n 1)
-		if compgen -G "$R/dev/st21nfc" >/dev/null || compgen -G "$R/dev/st54*" >/dev/null; then chip="STMicroelectronics"
-		elif compgen -G "$R/dev/nq-nci" >/dev/null || compgen -G "$R/dev/pn5*" >/dev/null || compgen -G "$R/dev/nxp*" >/dev/null; then chip="NXP"
-		elif compgen -G "$R/dev/sec-nfc" >/dev/null; then chip="Samsung"; fi
-		prop vendor.qti.nfc.fwver; [ -n "$REPLY" ] && chip="${chip:-контроллер} · прошивка $REPLY"
-		[[ "$nfc" == *mIsSecureNfcEnabled=true* ]] && sec=" · только при разблокировке"
-		case "$ns" in
-			on)  kv "NFC" "${GREEN}вкл.${NC}${chip:+ · $chip}$sec" ;;
-			off) kv "NFC" "выкл.${chip:+ · $chip}" ;;
-			*)   kv "NFC" "${ns:-?}${chip:+ · $chip}" ;;
-		esac
-		pay=$(printf '%s\n' "$nfc" | sed -n 's/.*Current wallet payment service: ComponentInfo{\([^}]*\)}.*/\1/p' | head -n 1)
-		[ -z "$pay" ] && pay=$(printf '%s\n' "$nfc" | sed -n 's/.*[Pp]referred payment service: ComponentInfo{\([^}]*\)}.*/\1/p' | head -n 1)
-		if [ -n "$pay" ]; then
-			pkg="${pay%%/*}"
-			desc=$(printf '%s\n' "$nfc" | grep -F "ComponentInfo{$pay} (Description: " | head -n 1 | sed 's/.*(Description: \([^)]*\)).*/\1/')
-			[ "$desc" = "null" ] && desc=""
-			if [ -n "$desc" ]; then kv "Оплата" "$desc ${DIM}($pkg)${NC}"; else kv "Оплата" "$pkg"; fi
-		else
-			kv "Оплата" "${YELLOW}приложение не выбрано${NC}"
-		fi
+	[[ "$nfc" == *mState=* ]] || return 0
+	local ns chip="" sec="" pay pkg desc
+	ns=$(printf '%s\n' "$nfc" | sed -n 's/^mState=//p' | head -n 1)
+	if compgen -G "$R/dev/st21nfc" >/dev/null || compgen -G "$R/dev/st54*" >/dev/null; then chip="STMicroelectronics"
+	elif compgen -G "$R/dev/nq-nci" >/dev/null || compgen -G "$R/dev/pn5*" >/dev/null || compgen -G "$R/dev/nxp*" >/dev/null; then chip="NXP"
+	elif compgen -G "$R/dev/sec-nfc" >/dev/null; then chip="Samsung"; fi
+	prop vendor.qti.nfc.fwver; [ -n "$REPLY" ] && chip="${chip:-контроллер} · прошивка $REPLY"
+	[[ "$nfc" == *mIsSecureNfcEnabled=true* ]] && sec=" · только при разблокировке"
+	case "$ns" in
+		on)  CONN_NFC="${GREEN}вкл.${NC}${chip:+ · $chip}$sec" ;;
+		off) CONN_NFC="выкл.${chip:+ · $chip}" ;;
+		*)   CONN_NFC="${ns:-?}${chip:+ · $chip}" ;;
+	esac
+	pay=$(printf '%s\n' "$nfc" | sed -n 's/.*Current wallet payment service: ComponentInfo{\([^}]*\)}.*/\1/p' | head -n 1)
+	[ -z "$pay" ] && pay=$(printf '%s\n' "$nfc" | sed -n 's/.*[Pp]referred payment service: ComponentInfo{\([^}]*\)}.*/\1/p' | head -n 1)
+	if [ -n "$pay" ]; then
+		pkg="${pay%%/*}"
+		desc=$(printf '%s\n' "$nfc" | grep -F "ComponentInfo{$pay} (Description: " | head -n 1 | sed 's/.*(Description: \([^)]*\)).*/\1/')
+		[ "$desc" = "null" ] && desc=""
+		if [ -n "$desc" ]; then CONN_PAY="$desc ${DIM}($pkg)${NC}"; else CONN_PAY="$pkg"; fi
+	else
+		CONN_PAY="${YELLOW}приложение не выбрано${NC}"
 	fi
+}
 
-	# ── Точка доступа: настройки из WifiConfigStoreSoftAp.xml (на Android 17 —
-	# в /data/misc_ce, на 16 — в /data/misc); состояние — по dumpsys tethering,
-	# а частоты и клиенты — из dumpsys wifi, только если точка работает.
+# ── Точка доступа («Точка доступа»): настройки из WifiConfigStoreSoftAp.xml (на
+# Android 17 — в /data/misc_ce, на 16 — в /data/misc); состояние — по dumpsys
+# tethering, а частоты и клиенты — из dumpsys wifi, только если точка работает.
+conn_hotspot() {
+	REPLY=""
 	local ap="" f
 	for f in "$R/data/misc_ce/0/apexdata/com.android.wifi/WifiConfigStoreSoftAp.xml" \
 		"$R/data/misc/apexdata/com.android.wifi/WifiConfigStoreSoftAp.xml"; do
 		can_read "$f" && grep -q '<SoftAp>' "$f" 2>/dev/null && { ap="$f"; break; }
 	done
 	local ap_on=0 i
-	for i in $tether; do case "$i" in wlan*|softap*|ap_br*|swlan*) ap_on=1 ;; esac; done
-	if [ -n "$ap" ] || [ "$ap_on" -eq 1 ]; then
-		local ssid="" secu="" bands="" hid="" maxc="" auto="" tmo="" out=""
-		if [ -n "$ap" ]; then
-			IFS=$'\t' read -r ssid secu bands hid maxc auto tmo < <(awk '
-				/name="WifiSsid"/ {
-					s = $0; sub(/.*name="WifiSsid">/, "", s); sub(/<\/string>.*/, "", s)
-					# [3.13.1] Значение экранировано по правилам XML: &quot;Имя&quot;
-					gsub(/&quot;/, "\"", s); gsub(/&apos;/, "\047", s); gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s)
-					gsub(/^"|"$/, "", s)
-				}
-				/name="SecurityType"/ { t = $0; sub(/.*value="/, "", t); sub(/".*/, "", t) }
-				/name="Band"/ { b = $0; sub(/.*value="/, "", b); sub(/".*/, "", b); bl = bl (bl == "" ? "" : ",") b }
-				/name="HiddenSSID"/ { h = ($0 ~ /value="true"/) }
-				/name="MaxNumberOfClients"/ { m = $0; sub(/.*value="/, "", m); sub(/".*/, "", m) }
-				/name="AutoShutdownEnabled"/ { a = ($0 ~ /value="true"/) }
-				/name="ShutdownTimeoutMillis"/ { o = $0; sub(/.*value="/, "", o); sub(/".*/, "", o) }
-				END { printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s, t, bl, h + 0, m, a + 0, o }' "$ap" 2>/dev/null)
-		fi
-		# SoftApConfiguration.SECURITY_TYPE_*: 0 открытая, 1 WPA2, 2 WPA2/WPA3,
-		# 3 WPA3, 4/5 OWE. Band — битовая маска: 1 = 2,4 ГГц, 2 = 5, 4 = 6.
-		case "$secu" in
-			0) secu="${YELLOW}без пароля${NC}" ;; 1) secu="WPA2" ;; 2) secu="WPA2/WPA3" ;;
-			3) secu="WPA3" ;; 4|5) secu="OWE" ;; *) secu="" ;;
-		esac
-		# Две записи — мостовой режим (две сети одновременно): у каждой берём
-		# старший диапазон. Одна запись с несколькими битами — выбор системы.
-		local bl="" b bt2 nb=0
-		for b in ${bands//,/ }; do nb=$((nb + 1)); done
-		for b in ${bands//,/ }; do
-			if [ "$nb" -gt 1 ]; then
-				case "$b" in 1) bt2="2,4" ;; 2|3) bt2="5" ;; 4|5|6|7) bt2="6" ;; *) bt2="" ;; esac
-			else
-				case "$b" in 1) bt2="2,4" ;; 2) bt2="5" ;; 3) bt2="2,4/5" ;; 4) bt2="6" ;; 6) bt2="5/6" ;; 7) bt2="2,4/5/6" ;; *) bt2="" ;; esac
-			fi
-			[ -n "$bt2" ] && bl="${bl:+$bl + }$bt2"
-		done
-		[ -n "$bl" ] && bl="$bl ГГц"
-		if [ "$ap_on" -eq 1 ]; then
-			local live fr="" cl="" std="" idle=""
-			live=$(dumpsys wifi 2>/dev/null | awk '
-				/^Dump of SoftApManager/ { f = 1 }
-				f && /^getConnectedClientList\(\)\.size\(\):/ { c = $2 }
-				f && /^mCurrentSoftApInfoMap/ {
-					s = $0
-					while (match(s, /frequency= *[0-9]+/)) { q = substr(s, RSTART, RLENGTH); gsub(/[^0-9]/, "", q); fl = fl " " q; s = substr(s, RSTART + RLENGTH) }
-					if (match($0, /wifiStandard= *[0-9]+/)) { w = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", w) }
-					if (match($0, /mIdleShutdownTimeoutMillis= *[0-9]+/)) { t = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", t) }
-				}
-				f && /^SoftApManager:/ { exit }
-				END { printf "%s\t%s\t%s\t%s\n", fl, c, w, t }')
-			IFS=$'\t' read -r fr cl std idle <<< "$live"
-			local fq h24=0 h5=0 h6=0 fb=""
-			for fq in $fr; do
-				if [ "$fq" -lt 3000 ]; then h24=1; elif [ "$fq" -lt 5925 ]; then h5=1; else h6=1; fi
-			done
-			[ "$h24" -eq 1 ] && fb="2,4"
-			[ "$h5" -eq 1 ] && fb="${fb:+$fb + }5"
-			[ "$h6" -eq 1 ] && fb="${fb:+$fb + }6"
-			[ -n "$fb" ] && bl="$fb ГГц"
-			{ is_int "${tmo:-x}" && [ "$tmo" -gt 0 ]; } || { is_int "${idle:-x}" && tmo="$idle"; }
-			# ScanResult.WIFI_STANDARD_*: 4 — 802.11n, 5 — ac, 6 — ax, 8 — be
-			case "$std" in 4) std="Wi-Fi 4" ;; 5) std="Wi-Fi 5" ;; 6) std="Wi-Fi 6" ;; 8) std="Wi-Fi 7" ;; *) std="" ;; esac
-			out="${GREEN}вкл.${NC}"
-			[ -n "$ssid" ] && out="$out · «$ssid»"
-			out="$out${secu:+ · $secu}${bl:+ · $bl}${std:+ · $std}${cl:+ · клиентов: $cl}"
-		else
-			out="выкл."
-			[ -n "$ssid" ] && out="$out · «$ssid»"
-			out="$out${secu:+ · $secu}${bl:+ · $bl}"
-		fi
-		[ "$hid" = "1" ] && out="$out · скрытая"
-		is_int "${maxc:-x}" && [ "$maxc" -gt 0 ] && out="$out · до $maxc клиентов"
-		if [ "$auto" = "1" ]; then
-			if is_int "${tmo:-x}" && [ "$tmo" -gt 0 ]; then out="$out · автоотключение $((tmo / 60000)) мин"
-			else out="$out · автоотключение"; fi
-		fi
-		kv "Точка доступа" "$out"
+	for i in $CONN_TETHER; do case "$i" in wlan*|softap*|ap_br*|swlan*) ap_on=1 ;; esac; done
+	[ -n "$ap" ] || [ "$ap_on" -eq 1 ] || return 0
+	local ssid="" secu="" bands="" hid="" maxc="" auto="" tmo="" out=""
+	if [ -n "$ap" ]; then
+		IFS=$'\t' read -r ssid secu bands hid maxc auto tmo < <(awk '
+			/name="WifiSsid"/ {
+				s = $0; sub(/.*name="WifiSsid">/, "", s); sub(/<\/string>.*/, "", s)
+				# [3.13.1] Значение экранировано по правилам XML: &quot;Имя&quot;
+				gsub(/&quot;/, "\"", s); gsub(/&apos;/, "\047", s); gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&amp;/, "\\&", s)
+				gsub(/^"|"$/, "", s)
+			}
+			/name="SecurityType"/ { t = $0; sub(/.*value="/, "", t); sub(/".*/, "", t) }
+			/name="Band"/ { b = $0; sub(/.*value="/, "", b); sub(/".*/, "", b); bl = bl (bl == "" ? "" : ",") b }
+			/name="HiddenSSID"/ { h = ($0 ~ /value="true"/) }
+			/name="MaxNumberOfClients"/ { m = $0; sub(/.*value="/, "", m); sub(/".*/, "", m) }
+			/name="AutoShutdownEnabled"/ { a = ($0 ~ /value="true"/) }
+			/name="ShutdownTimeoutMillis"/ { o = $0; sub(/.*value="/, "", o); sub(/".*/, "", o) }
+			END { printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s, t, bl, h + 0, m, a + 0, o }' "$ap" 2>/dev/null)
 	fi
-
-	# [3.14.1] Геолокация: settings secure location_mode (0 — выключена)
-	local lm; sget secure location_mode; lm="$REPLY"
-	case "$lm" in
-		0) kv "Геолокация" "выкл." ;;
-		[1-3]) kv "Геолокация" "${GREEN}вкл.${NC}" ;;
+	# SoftApConfiguration.SECURITY_TYPE_*: 0 открытая, 1 WPA2, 2 WPA2/WPA3,
+	# 3 WPA3, 4/5 OWE. Band — битовая маска: 1 = 2,4 ГГц, 2 = 5, 4 = 6.
+	case "$secu" in
+		0) secu="${YELLOW}без пароля${NC}" ;; 1) secu="WPA2" ;; 2) secu="WPA2/WPA3" ;;
+		3) secu="WPA3" ;; 4|5) secu="OWE" ;; *) secu="" ;;
 	esac
+	# Две записи — мостовой режим (две сети одновременно): у каждой берём
+	# старший диапазон. Одна запись с несколькими битами — выбор системы.
+	local bl="" b bt2 nb=0
+	for b in ${bands//,/ }; do nb=$((nb + 1)); done
+	for b in ${bands//,/ }; do
+		if [ "$nb" -gt 1 ]; then
+			case "$b" in 1) bt2="2,4" ;; 2|3) bt2="5" ;; 4|5|6|7) bt2="6" ;; *) bt2="" ;; esac
+		else
+			case "$b" in 1) bt2="2,4" ;; 2) bt2="5" ;; 3) bt2="2,4/5" ;; 4) bt2="6" ;; 6) bt2="5/6" ;; 7) bt2="2,4/5/6" ;; *) bt2="" ;; esac
+		fi
+		[ -n "$bt2" ] && bl="${bl:+$bl + }$bt2"
+	done
+	[ -n "$bl" ] && bl="$bl ГГц"
+	if [ "$ap_on" -eq 1 ]; then
+		local live fr="" cl="" std="" idle=""
+		live=$(dumpsys wifi 2>/dev/null | awk '
+			/^Dump of SoftApManager/ { f = 1 }
+			f && /^getConnectedClientList\(\)\.size\(\):/ { c = $2 }
+			f && /^mCurrentSoftApInfoMap/ {
+				s = $0
+				while (match(s, /frequency= *[0-9]+/)) { q = substr(s, RSTART, RLENGTH); gsub(/[^0-9]/, "", q); fl = fl " " q; s = substr(s, RSTART + RLENGTH) }
+				if (match($0, /wifiStandard= *[0-9]+/)) { w = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", w) }
+				if (match($0, /mIdleShutdownTimeoutMillis= *[0-9]+/)) { t = substr($0, RSTART, RLENGTH); gsub(/[^0-9]/, "", t) }
+			}
+			f && /^SoftApManager:/ { exit }
+			END { printf "%s\t%s\t%s\t%s\n", fl, c, w, t }')
+		IFS=$'\t' read -r fr cl std idle <<< "$live"
+		local fq h24=0 h5=0 h6=0 fb=""
+		for fq in $fr; do
+			if [ "$fq" -lt 3000 ]; then h24=1; elif [ "$fq" -lt 5925 ]; then h5=1; else h6=1; fi
+		done
+		[ "$h24" -eq 1 ] && fb="2,4"
+		[ "$h5" -eq 1 ] && fb="${fb:+$fb + }5"
+		[ "$h6" -eq 1 ] && fb="${fb:+$fb + }6"
+		[ -n "$fb" ] && bl="$fb ГГц"
+		{ is_int "${tmo:-x}" && [ "$tmo" -gt 0 ]; } || { is_int "${idle:-x}" && tmo="$idle"; }
+		# ScanResult.WIFI_STANDARD_*: 4 — 802.11n, 5 — ac, 6 — ax, 8 — be
+		case "$std" in 4) std="Wi-Fi 4" ;; 5) std="Wi-Fi 5" ;; 6) std="Wi-Fi 6" ;; 8) std="Wi-Fi 7" ;; *) std="" ;; esac
+		out="${GREEN}вкл.${NC}"
+		[ -n "$ssid" ] && out="$out · «$ssid»"
+		out="$out${secu:+ · $secu}${bl:+ · $bl}${std:+ · $std}${cl:+ · клиентов: $cl}"
+	else
+		out="выкл."
+		[ -n "$ssid" ] && out="$out · «$ssid»"
+		out="$out${secu:+ · $secu}${bl:+ · $bl}"
+	fi
+	[ "$hid" = "1" ] && out="$out · скрытая"
+	is_int "${maxc:-x}" && [ "$maxc" -gt 0 ] && out="$out · до $maxc клиентов"
+	if [ "$auto" = "1" ]; then
+		if is_int "${tmo:-x}" && [ "$tmo" -gt 0 ]; then out="$out · автоотключение $((tmo / 60000)) мин"
+		else out="$out · автоотключение"; fi
+	fi
+	REPLY="$out"
+}
 
-	# ── USB: порт Type-C, источник питания, функции и максимальная скорость порта
+# [3.14.1] Геолокация («Геолокация»): settings secure location_mode (0 — выключена)
+conn_location() {
+	sget secure location_mode
+	case "$REPLY" in
+		0) REPLY="выкл." ;;
+		[1-3]) REPLY="${GREEN}вкл.${NC}" ;;
+		*) REPLY="" ;;
+	esac
+}
+
+# ── USB («USB»): порт Type-C, источник питания, функции и максимальная скорость порта
+conn_usb() {
 	local pres="" typ2="" pr="" dr="" fn="" spd="" u
 	rd "$R/sys/class/power_supply/usb/present" && pres="$REPLY"
 	rd "$R/sys/class/power_supply/usb/real_type" && typ2="$REPLY"
@@ -2877,35 +2907,58 @@ check_connections() {
 		high-speed)        spd="USB 2.0 ${DIM}(480 Мбит/с)${NC}" ;;
 		*) spd="" ;;
 	esac
-	if [ -n "$pres$pr$spd" ]; then
-		local st2=""
-		if [ "$dr" = "host" ]; then st2="${GREEN}OTG${NC} (устройство подключено к телефону)"
-		elif [ "$pres" = "1" ]; then
-			case "$typ2" in
-				USB_PD|USB_PD_DRP) st2="зарядка USB PD" ;;
-				DCP|USB_DCP|USB_HVDCP*|HVDCP*) st2="зарядное устройство" ;;
-				SDP|USB) st2="компьютер" ;;
-				CDP|USB_CDP) st2="компьютер (зарядный порт)" ;;
-				*) st2="подключён" ;;
-			esac
-		else st2="не подключён"; fi
-		local fns=""
-		[ -n "$fn" ] && [ "$fn" != "none" ] && fns="${fn^^}" && fns="${fns//,/, }"
-		[[ " $tether" == *" ncm"* || " $tether" == *" rndis"* || " $tether" == *" usb"* ]] && fns="${fns:+$fns, }режим модема"
-		kv "USB" "$st2${spd:+ · $spd}${fns:+ · $fns}"
-	fi
+	REPLY=""
+	[ -n "$pres$pr$spd" ] || return 0
+	local st2=""
+	if [ "$dr" = "host" ]; then st2="${GREEN}OTG${NC} (устройство подключено к телефону)"
+	elif [ "$pres" = "1" ]; then
+		case "$typ2" in
+			USB_PD|USB_PD_DRP) st2="зарядка USB PD" ;;
+			DCP|USB_DCP|USB_HVDCP*|HVDCP*) st2="зарядное устройство" ;;
+			SDP|USB) st2="компьютер" ;;
+			CDP|USB_CDP) st2="компьютер (зарядный порт)" ;;
+			*) st2="подключён" ;;
+		esac
+	else st2="не подключён"; fi
+	local fns=""
+	[ -n "$fn" ] && [ "$fn" != "none" ] && fns="${fn^^}" && fns="${fns//,/, }"
+	[[ " $CONN_TETHER" == *" ncm"* || " $CONN_TETHER" == *" rndis"* || " $CONN_TETHER" == *" usb"* ]] && fns="${fns:+$fns, }режим модема"
+	REPLY="$st2${spd:+ · $spd}${fns:+ · $fns}"
+}
 
-	# ── UWB (перенесено из «Google Pixel»): служба и переключатель в настройках
+# ── UWB («UWB», перенесено из «Google Pixel»): служба и переключатель в настройках
+conn_uwb() {
 	local uwb
 	jget uwb dumpsys uwb; uwb=$(jout | awk '/settings_toggle=/ { t = ($0 ~ /settings_toggle=true/) ? "on" : "off" } /^Device state =/ { s = $4 } END { if (s != "") print t " " s }')
-	if [ -n "$uwb" ]; then
-		case "$uwb" in
-			"on READY"*) kv "UWB" "${GREEN}включён${NC}" ;;
-			off*)        kv "UWB" "выключен" ;;
-			*)           kv "UWB" "${uwb#* } ${DIM}(состояние службы)${NC}" ;;
-		esac
-	fi
+	REPLY=""
+	[ -n "$uwb" ] || return 0
+	case "$uwb" in
+		"on READY"*) REPLY="${GREEN}включён${NC}" ;;
+		off*)        REPLY="выключен" ;;
+		*)           REPLY="${uwb#* } ${DIM}(состояние службы)${NC}" ;;
+	esac
+}
 
+check_connections() {
+	section "ДРУГИЕ ПОДКЛЮЧЕНИЯ"
+	local l
+	conn_tether
+	conn_bluetooth
+	if [ -n "$BT_HEAD" ]; then
+		kv "Bluetooth" "$BT_HEAD"
+		for l in "${BT_CONN[@]}"; do wrap_emit 18 "$l"; done
+		if [ "$BT_SAVED_N" -gt 0 ]; then
+			kv "Сохранённые" "$BT_SAVED_N"
+			for l in "${BT_SAVED[@]}"; do wrap_emit 18 "$l"; done
+		fi
+	fi
+	conn_le_audio;  [ -n "$REPLY" ] && kv "LE Audio" "$REPLY"
+	conn_nfc
+	if [ -n "$CONN_NFC" ]; then kv "NFC" "$CONN_NFC"; kv "Оплата" "$CONN_PAY"; fi
+	conn_hotspot;   [ -n "$REPLY" ] && kv "Точка доступа" "$REPLY"
+	conn_location;  [ -n "$REPLY" ] && kv "Геолокация" "$REPLY"
+	conn_usb;       [ -n "$REPLY" ] && kv "USB" "$REPLY"
+	conn_uwb;       [ -n "$REPLY" ] && kv "UWB" "$REPLY"
 	# ── ИК-порт (пульт): устройство lirc
 	compgen -G "$R/dev/lirc*" >/dev/null && kv "ИК-порт" "есть"
 	return 0
