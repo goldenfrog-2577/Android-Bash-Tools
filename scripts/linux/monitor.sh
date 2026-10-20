@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.17 — мониторинг состояния rooted Android
+# monitor.sh v3.17.1 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.17"
+readonly VERSION="3.17.1"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -371,11 +371,27 @@ jobs_init() {
 	done
 	return 1
 }
+# [3.17.1] Остановка задачи вместе с её потомками (dumpsys, settings, ping…):
+# раньше kill доставался только подоболочке-обёртке, а сама команда дорабатывала.
+# Потомки ищутся по PPID в /proc/<pid>/stat (поле после «) »), без pgrep.
+kill_tree() {
+	local p="$1" f st c kids=()
+	for f in /proc/[0-9]*/stat; do
+		IFS= read -r st 2>/dev/null < "$f" || continue
+		st="${st##*) }"; st="${st#* }"           # «состояние ppid …» → «ppid …»
+		[ "${st%% *}" = "$p" ] || continue
+		c="${f#/proc/}"; kids+=("${c%/stat}")
+	done
+	kill "$p" 2>/dev/null
+	for c in "${kids[@]}"; do kill_tree "$c"; done
+}
 jobs_done() {   # конец прохода: недождавшиеся задачи останавливаем, папку удаляем
 	local n p
 	for n in "${!JOB_PID[@]}"; do
 		p="${JOB_PID[$n]}"
-		[ "$p" = done ] || { kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; }
+		[ "$p" = done ] && continue
+		if [ -d "/proc/$p" ]; then kill_tree "$p"; fi
+		wait "$p" 2>/dev/null
 	done
 	JOB_PID=()
 	[ -n "$JOB_DIR" ] && rm -rf "$JOB_DIR" 2>/dev/null
@@ -3575,6 +3591,9 @@ END { for (p in rec) print p "\t" rec[p] }
 # [3.16] Фреймворк и его CLI ищутся отдельно: CLI (два запуска Java, ~2.5 с)
 # стартует в предзагрузке, а секция забирает готовый ответ.
 LSP_FW=""; LSP_CLI=""
+# первая строка «  versionName=…» / «  codePath=…» в dumpsys package (как sed -n …p | head -n 1)
+LSP_RE_VER=$'(^|\n) *versionName=([^\n]*)'
+LSP_RE_CP=$'(^|\n) *codePath=([^\n]*)'
 lsp_locate() {
 	LSP_FW=""; LSP_CLI=""
 	local m id
@@ -3678,8 +3697,11 @@ print_lsposed() {
 		tag="${stc}${st}${NC}${sp}"
 
 		jget "pkg_$pkg" dumpsys package "$pkg"; out="$REPLY"
-		ver=$(printf '%s\n' "$out" | sed -n 's/^ *versionName=//p' | head -n 1)
-		cp=$(printf '%s\n' "$out" | sed -n 's/^ *codePath=//p' | head -n 1)
+		# [3.17.1] Версия и путь — регулярным выражением bash, без sed | head
+		# (было 2 процесса на модуль с перегоном всего вывода dumpsys, ~1,5 с на Pixel)
+		ver=""; cp=""
+		[[ "$out" =~ $LSP_RE_VER ]] && ver="${BASH_REMATCH[2]}"
+		[[ "$out" =~ $LSP_RE_CP ]] && cp="${BASH_REMATCH[2]}"
 
 		# Метаданные из APK: module.prop нового API и манифест (двоичный AXML)
 		p_desc=""; p_min=""; p_tgt=""; m_dsc=""; m_min=""; dref=0
