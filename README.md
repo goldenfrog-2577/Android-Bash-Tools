@@ -97,7 +97,7 @@ sh unpacker.sh --help                               # все опции
 
 Кроме двух основных устройств, проверен на Redmi Note 13 Pro 5G (Snapdragon 7s Gen 2, KernelSU).
 
-Подробная документация — [здесь](./monitor.md).
+Подробная документация — [здесь](./monitor_documentation.md).
 
 ### 🧰 6. [otg_kit.sh](./scripts/linux/otg_kit.sh) — OTG Rescue Toolkit
 Спасение Android-устройства с другого телефона по OTG-кабелю: bootloop, неудачная прошивка, конфликт модулей Magisk.
