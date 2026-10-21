@@ -1,6 +1,6 @@
 # monitor.sh — история изменений
 
-Журнал изменений `scripts/linux/monitor.sh` (до 3.14.1 жил в конце самого скрипта). Описание секций и флагов — в [monitor.md](monitor.md).
+Журнал изменений [monitor.sh](./scripts/linux/monitor.sh) (до 3.14.1 жил в конце самого скрипта). Описание секций и флагов — в [monitor.md](monitor.md).
 
 ## 3.17.2
 
