@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # shellcheck shell=bash
 #
-# monitor.sh v3.17.2 — мониторинг состояния rooted Android
+# monitor.sh v3.18 — мониторинг состояния rooted Android
 # Автор: GoldenFrog
 # Проверено на: Pixel 8 Pro (husky, Tensor G3) и POCO F3 (alioth, SM8250)
 #
@@ -42,7 +42,7 @@ shopt -s extglob nullglob
 # а printf/awk не путаются в многобайтовых символах на bionic.
 export LC_ALL=C
 
-readonly VERSION="3.17.2"
+readonly VERSION="3.18"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
@@ -445,7 +445,11 @@ declare -A SG_LOADED=() SG=()
 # (вместе со строками-продолжениями, если значение многострочное): его содержимое
 # не попадает ни во временный файл, ни в память скрипта.
 settings_list_raw() {
-	if [ "$1" = secure ]; then settings list secure 2>/dev/null | awk '/^[A-Za-z0-9_.:-]+=/ { s = 0 }
+	# [3.18] Внутри keybox новой записью считается только строка с ключом из строчных
+	# букв (или конец XML): строка base64 из сертификата без отступа, оканчивающаяся
+	# на «=», раньше принималась за новый ключ и проходила дальше в кэш.
+	if [ "$1" = secure ]; then settings list secure 2>/dev/null | awk 's && /<\/AndroidAttestation>/ { s = 0; next }
+		/^[a-z][a-z0-9_.]*=/ { s = 0 }
 		/^spoof_trickystore_keybox=./ { print "spoof_trickystore_keybox=1"; s = 1; next } !s'
 	else settings list "$1" 2>/dev/null; fi
 }
@@ -1027,6 +1031,29 @@ zone_max() {
 # [3.3] Строка «Перегрев»: «нет (0)», «лёгкий (1)» … — читается как обычная фраза
 THERMAL_STATUS_NAMES=(нет лёгкий умеренный сильный критический аварийный отключение)
 
+# [3.18] Профиль mi_thermald (Xiaomi): номер в /sys/class/thermal/thermal_message/sconfig
+# → название. Таблица — из Parts дерева alioth (ThermalProfiles.kt, PocoF3Releases),
+# названия — из его русского перевода. temp_state пишет сам mi_thermald: в пробе 3180
+# 0 в покое и ненулевой код под нагрузкой; что значат разряды кода, не документировано,
+# поэтому код показывается как есть. board_sensor_temp не обновляется — не используем.
+declare -A MI_SCONFIG=([0]="Сбалансированный" [8]="Звонки" [9]="Игровой приоритет"
+	[10]="Минимальный троттлинг" [11]="Консервативный" [12]="Камера" [19]="Навигация"
+	[20]="Длительная игра" [21]="Воспроизведение видео" [30]="Сбалансированная производительность"
+	[41]="Консервативная производительность" [49]="Производительность навигации"
+	[51]="Производительность видео")
+mi_thermal() {   # → REPLY: «mi_thermald · профиль «…» [· India] [· состояние N]»
+	local d="$R/sys/class/thermal/thermal_message" sc="" ts="" s="mi_thermald ${DIM}(Xiaomi)${NC}"
+	rd "$d/sconfig" && is_int "$REPLY" && sc="$REPLY"
+	rd "$d/temp_state" && is_int "$REPLY" && ts="$REPLY"
+	if [ -n "$sc" ]; then
+		if [ -n "${MI_SCONFIG[$sc]:-}" ]; then s="$s · профиль «${MI_SCONFIG[$sc]}»"
+		else s="$s · профиль $sc"; fi
+	fi
+	prop persist.sys.xiaomi.thermal.map; [ "$REPLY" = "india" ] && s="$s ${DIM}(India)${NC}"
+	[ -n "$ts" ] && [ "$ts" != "0" ] && s="$s · ${YELLOW}состояние нагрева $ts${NC}"
+	REPLY="$s"
+}
+
 check_thermal() {
 	section "ТЕМПЕРАТУРА И ТРОТТЛИНГ"
 	local shown=0 name t max=-999
@@ -1111,7 +1138,13 @@ check_thermal() {
 	[ -n "$skin" ] && kv "Корпус" "$skin"
 
 	# Статус Thermal HAL (0–6)
-	if [ "$HAL_READY" = "false" ]; then
+	# [3.18] У Xiaomi (POCO F3 и др.) Thermal HAL нет по замыслу: нагревом управляет демон
+	# mi_thermald по своим конфигам. Показываем его профиль, а не «HAL не готов».
+	prop init.svc.mi_thermald
+	if [ "$HAL_READY" = "false" ] && [ "$REPLY" = "running" ]; then
+		mi_thermal; kv "Охлаждение" "$REPLY"
+		kv "Перегрев" "${DIM}Android не видит — у Xiaomi нагревом управляет mi_thermald${NC}"
+	elif [ "$HAL_READY" = "false" ]; then
 		kv "Перегрев" "${DIM}неизвестно — Thermal HAL не готов на этой прошивке${NC}"
 	elif is_int "${HAL_STATUS:-x}"; then
 		local s="$HAL_STATUS" lbl="${THERMAL_STATUS_NAMES[$HAL_STATUS]:-$HAL_STATUS}"
@@ -1427,7 +1460,7 @@ check_cameras() {
 BAT=""; BMS=""
 BAT_CAP=""; BAT_STATUS=""; BAT_TEMP=""; BAT_TDEG=""; BAT_VOLT=""; BAT_CUR=""
 BAT_HEALTH=""; BAT_CYCLES=""; BAT_FULL=""; BAT_DESIGN=""; BAT_TECH=""
-BAT_DBAT=""; BAT_USB_IN=0; BAT_SRC=""; BAT_SHARE=""
+BAT_DBAT=""; BAT_USB_IN=0; BAT_SRC=""; BAT_SHARE=""; BAT_CUR_KNOWN=0
 
 bat_read() {   # узлы батареи → BAT_*; нет батареи — код 1
 	BAT="$R/sys/class/power_supply/battery"; BMS="$R/sys/class/power_supply/bms"
@@ -1450,7 +1483,14 @@ bat_read() {   # узлы батареи → BAT_*; нет батареи — к
 
 	# Знак тока у вендоров разный (Pixel: разряд < 0, Qualcomm: разряд > 0) — приводим к
 	# «минус = разряд» по статусу
-	if [ -n "$BAT_CUR" ]; then
+	# [3.18] Топливомер Qualcomm (есть power_supply/bms) всегда отдаёт «плюс = разряд»:
+	# так пишет Health HAL alioth, проба 3180 подтвердила (от батареи +, на зарядке −).
+	# Знак берётся из драйвера, а не из статуса: на зарядке под нагрузкой батарея может
+	# разряжаться, и при «заряжена» / «не заряжается» направление тоже известно.
+	BAT_CUR_KNOWN=0
+	if [ -n "$BAT_CUR" ] && [ -f "$BMS/current_now" ]; then
+		BAT_CUR=$(( -BAT_CUR )); BAT_CUR_KNOWN=1
+	elif [ -n "$BAT_CUR" ]; then
 		case "$BAT_STATUS" in
 			Discharging) [ "$BAT_CUR" -gt 0 ] && BAT_CUR=$(( -BAT_CUR )) ;;
 			Charging) [ "$BAT_CUR" -lt 0 ] && BAT_CUR=$(( -BAT_CUR )) ;;
@@ -1637,7 +1677,8 @@ bat_modes() {
 		local ttf="" dl="" ua=0 now tgt=100 rate_eta="" full="$BAT_FULL"
 		rd "$b/time_to_full_now" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && ttf="$REPLY"
 		rd "$b/charge_deadline" && is_int "$REPLY" && [ "$REPLY" -gt 0 ] && dl="$REPLY"
-		[ -n "$BAT_CUR" ] && ua=${BAT_CUR#-}
+		# [3.18] Только ток заряда: при известном знаке на зарядке он может быть и разрядным
+		[ -n "$BAT_CUR" ] && [ "$BAT_CUR" -gt 0 ] && ua="$BAT_CUR"
 		[ "$pol" = "2" ] && tgt=80
 		# Своя оценка по току: недостающие проценты × ёмкость / ток. Оптимистична —
 		# к концу заряда ток падает, поэтому со знаком «≈» и только при токе ≥ 50 мА.
@@ -1772,8 +1813,10 @@ bat_current() {   # «Ток» (или «Напряжение», если ток
 		# (у Qualcomm и Pixel знак противоположный) — показываем модуль без знака.
 		case "$BAT_STATUS" in
 			Charging|Discharging) ;;
-			*) ma=${ma#-}; dir=" ${DIM}(направление не определено)${NC}" ;;
+			*) [ "$BAT_CUR_KNOWN" -eq 1 ] || { ma=${ma#-}; dir=" ${DIM}(направление не определено)${NC}"; } ;;
 		esac
+		# [3.18] Зарядка есть, а батарея садится: нагрузка больше, чем даёт зарядное
+		[ "$BAT_STATUS" = "Charging" ] && [ "$BAT_CUR" -lt 0 ] && dir=" ${YELLOW}(нагрузка больше зарядки)${NC}"
 		REPLY_K="Ток"; REPLY="$ma мА$dir · ${w#-} Вт · $BAT_VOLT мВ"
 	elif [ -n "$BAT_VOLT" ]; then
 		REPLY_K="Напряжение"; REPLY="$BAT_VOLT мВ"
@@ -3376,6 +3419,15 @@ check_security() {
 #   secure pi_pp_spoof (1), pi_pp_model, pi_pp_targets — свойства Pixel;
 #   secure pi_tensor_spoof (0), tensor_targets — подмена Tensor;
 #   secure pi_photos_spoof (1), pi_snapchat_spoof (0).
+# [3.18] Под Evolver с Compose-интерфейсом (ветки bka/cnb, проба 3180s):
+#   secure spoof_trickystore_last_fetched (мс) — когда скачан официальный keybox;
+#   secure spoof_trickystore_target — список целей TrickyStore, по пакету в строке;
+#   PIF-конфиг: _canary_release_date / _canary_month — срок Canary-отпечатка (Evolver
+#     считает 42 дня от даты выпуска, иначе от 1-го числа месяца), manually_imported,
+#     spoofVendingSdk («Spoof SDK to DroidGuard»);
+#   secure per_apps_device_spoof_enabled (1) и per_apps_device_spoof («пакет:профиль,…») —
+#     «App & game spoofing»;
+#   переключатели Google Фото и Snapchat Evolver показывает, только если приложение стоит.
 # Содержимое keybox (spoof_trickystore_keybox) не читается и не выводится.
 check_spoofing() {
 	prop ro.evolution.version; [ -n "$REPLY" ] || return 0
@@ -3385,7 +3437,7 @@ check_spoofing() {
 	local sysl secl kb
 	settings_list system; sysl=$(printf '%s\n' "$REPLY" | grep -E '^spoof_(trickystore|pif)_enabled=')
 	# keybox уже заменён на «1» в settings_list_raw: его содержимого в памяти нет
-	settings_list secure; secl=$(printf '%s\n' "$REPLY" | grep -E '^(spoof_trickystore_(keybox|keybox_source|patch|last_revocation_status|last_revocation_reason|last_revocation_check)|pi_pp_spoof|pi_pp_model|pi_pp_targets|pi_tensor_spoof|tensor_targets|pi_photos_spoof|pi_snapchat_spoof)=')
+	settings_list secure; secl=$(printf '%s\n' "$REPLY" | grep -E '^(spoof_trickystore_(keybox|keybox_source|patch|last_fetched|last_revocation_status|last_revocation_reason|last_revocation_check)|per_apps_device_spoof(_enabled)?|pi_pp_spoof|pi_pp_model|pi_pp_targets|pi_tensor_spoof|tensor_targets|pi_photos_spoof|pi_snapchat_spoof)=')
 	sv() {   # sv СПИСОК КЛЮЧ ПО_УМОЛЧАНИЮ → REPLY
 		REPLY=$(printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1)
 		[ -z "$REPLY" ] || [ "$REPLY" = "null" ] && REPLY="$3"
@@ -3394,6 +3446,10 @@ check_spoofing() {
 	onoff() { if [ "$1" = "1" ]; then REPLY="${GREEN}вкл.${NC}"; else REPLY="выкл."; fi; }
 	ymd() { [[ "$1" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2}) ]] && REPLY="${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}" || REPLY="$1"; }
 	cnt() { local n; n=$(printf '%s' "$1" | tr ',' '\n' | grep -c .); REPLY="$n"; }
+	jstr() { REPLY=$(printf '%s' "$cfg" | grep -oE "\"$1\" *: *\"?[^\",}]*" | head -n 1 | sed 's/.*: *"\{0,1\}//'); }
+	inst() { [ -f "$R/data/system/packages.list" ] || return 0; grep -q "^$1 " "$R/data/system/packages.list"; }
+	# Дата сборки Evolution X (v11.10-20260907 → 20260907): нужна для ошибки проверки keybox
+	local bdate=""; [[ "$ver" =~ ([0-9]{8}) ]] && bdate="${BASH_REMATCH[1]}"
 
 	# Tricky Store: включён ли, keybox (есть ли и что сказала проверка прошивки), патч
 	local ts src st rs chk patch line
@@ -3411,17 +3467,31 @@ check_spoofing() {
 			EXPIRING_SOON)  line="keybox: ${YELLOW}скоро истечёт${NC}" ;;
 			REVOKED)        line="keybox: ${RED}отозван${NC}" ;;
 			SUSPENDED)      line="keybox: ${RED}приостановлен${NC}" ;;
-			CHAIN_INVALID)  line="keybox: ${RED}цепочка недействительна${NC}" ;;
+			CHAIN_INVALID)
+				# [3.18] Evolver до 30.09.2026 проверял цепочки EC и RSA одним списком и на
+				# любом keybox получал BAD_SIGNATURE_AT_N, а в интерфейсе показывал «Valid».
+				# В таких сборках это не вердикт — keybox просто не был проверен.
+				if [[ "$rs" == BAD_SIGNATURE_AT_* ]] && [ -n "$bdate" ] && [ "$bdate" -lt 20260930 ]; then
+					line="keybox: ${YELLOW}не проверен${NC}"; rs="ошибка проверки в Evolver до 30.09.2026"
+				else line="keybox: ${RED}цепочка недействительна${NC}"; fi ;;
 			UNTRUSTED_ROOT) line="keybox: ${RED}недоверенный корень${NC}" ;;
 			CHECKING)       line="keybox: проверяется" ;;
 			*)              line="keybox: есть ${DIM}(не проверялся)${NC}" ;;
 		esac
 		case "$src" in official) line="$line ${DIM}· официальный${NC}" ;; user) line="$line ${DIM}· свой${NC}" ;; esac
 	fi
-	kv "Tricky Store" "$ts · $line${patch:+ · патч $patch}"
-	if [ -n "$rs" ] || is_int "${chk:-x}"; then
-		local when=""
+	# [3.18] Список целей: по пакету в строке (формат target.txt) или через запятую
+	local tg=""; sget secure spoof_trickystore_target
+	if [ -n "$REPLY" ] && [ "$REPLY" != "null" ]; then
+		tg=$(printf '%s\n' "$REPLY" | tr ',' '\n' | grep -c '[^[:space:]]'); tg=" · приложений: $tg"
+	fi
+	kv "Tricky Store" "$ts · $line${patch:+ · патч $patch}$tg"
+	local fet=""; sv "$secl" spoof_trickystore_last_fetched ""; fet="$REPLY"
+	if [ -n "$rs" ] || is_int "${chk:-x}" || is_int "${fet:-x}"; then
+		local when="" got=""
+		is_int "${fet:-x}" && [ "$fet" -gt 0 ] && printf -v got 'скачан %(%d.%m.%Y %H:%M)T' $((fet / 1000))
 		is_int "${chk:-x}" && [ "$chk" -gt 0 ] && printf -v when 'проверка %(%d.%m.%Y %H:%M)T' $((chk / 1000))
+		[ -n "$got" ] && when="$got${when:+ · $when}"
 		note "${when}${rs:+${when:+ · }причина: $rs}"
 	fi
 
@@ -3433,8 +3503,21 @@ check_spoofing() {
 	prod=$(printf '%s' "$cfg" | grep -oE '"PRODUCT" *: *"[^"]*"' | head -n 1 | sed 's/.*: *"//; s/"$//')
 	pp=$(printf '%s' "$cfg" | grep -oE '"SECURITY_PATCH" *: *"[^"]*"' | head -n 1 | sed 's/.*: *"//; s/"$//')
 	[ -n "$pp" ] && { ymd "$pp"; pp="$REPLY"; }
+	# [3.18] Canary-отпечаток: срок как в Evolver — 42 дня от даты выпуска (или от 1-го
+	# числа месяца), дни — с отбрасыванием дробной части; ручной импорт; SDK для DroidGuard
+	local can="" rel mon exp now d extra=""
+	jstr _canary_release_date; rel="$REPLY"; jstr _canary_month; mon="$REPLY"
+	[ -z "$rel" ] && [[ "$mon" =~ ^[0-9]{4}-[0-9]{2}$ ]] && rel="$mon-01"
+	if [[ "$rel" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && exp=$(date -d "$rel" +%s 2>/dev/null); then
+		printf -v now '%(%s)T' -1
+		d=$(( (exp + 42 * 86400 - now) / 86400 ))
+		if [ $(( exp + 42 * 86400 )) -lt "$now" ]; then can=" · Canary ${YELLOW}истёк${NC}"
+		else can=" · Canary, осталось $d дн."; fi
+	fi
+	jstr manually_imported; [ "$REPLY" = "true" ] && extra="$extra · импортирован вручную"
+	jstr spoofVendingSdk; [ "$REPLY" = "1" ] && extra="$extra · SDK для DroidGuard"
 	if [ -n "$model" ]; then
-		kv "PIF" "$pif · $model${prod:+ ${DIM}($prod)${NC}}${pp:+ · патч $pp}"
+		kv "PIF" "$pif · $model${prod:+ ${DIM}($prod)${NC}}${pp:+ · патч $pp}$can$extra"
 	else
 		kv "PIF" "$pif ${DIM}· конфиг не загружен${NC}"
 	fi
@@ -3457,11 +3540,20 @@ check_spoofing() {
 	sv "$secl" tensor_targets ""; if [ -n "$REPLY" ]; then cnt "$REPLY"; n=" · приложений: $REPLY"; else n=""; fi
 	kv "Tensor Props" "$v$n"
 
-	local ph sc
-	sv "$secl" pi_photos_spoof 1; onoff "$REPLY"; ph="$REPLY"
-	sv "$secl" pi_snapchat_spoof 0; onoff "$REPLY"; sc="$REPLY"
-	kv "Приложения" "Google Фото — $ph · Snapchat — $sc"
-	unset -f sv onoff ymd cnt
+	# [3.18] «App & game spoofing»: свои профили устройства для приложений и игр
+	sv "$secl" per_apps_device_spoof_enabled 1; onoff "$REPLY"; v="$REPLY"
+	sv "$secl" per_apps_device_spoof ""
+	if [ -n "$REPLY" ]; then cnt "$REPLY"; n=" · приложений: $REPLY"; else n=" · список пуст"; fi
+	[ "$v" = "выкл." ] && n=""
+	kv "Прил. и игры" "$v$n"
+
+	# [3.18] Как в Evolver: переключатель есть, только если приложение установлено
+	local ph="" sc="" apps=""
+	sv "$secl" pi_photos_spoof 1; onoff "$REPLY"; inst com.google.android.apps.photos && ph="Google Фото — $REPLY"
+	sv "$secl" pi_snapchat_spoof 0; onoff "$REPLY"; inst com.snapchat.android && sc="Snapchat — $REPLY"
+	apps="$ph${ph:+${sc:+ · }}$sc"
+	[ -n "$apps" ] && kv "Приложения" "$apps"
+	unset -f sv onoff ymd cnt jstr inst
 	return 0
 }
 
