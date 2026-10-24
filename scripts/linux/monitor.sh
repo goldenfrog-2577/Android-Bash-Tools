@@ -1487,9 +1487,13 @@ bat_read() {   # узлы батареи → BAT_*; нет батареи — к
 	# так пишет Health HAL alioth, проба 3180 подтвердила (от батареи +, на зарядке −).
 	# Знак берётся из драйвера, а не из статуса: на зарядке под нагрузкой батарея может
 	# разряжаться, и при «заряжена» / «не заряжается» направление тоже известно.
+	# [3.18] Pixel (драйвер google,charger) отдаёт «минус = разряд» и при «не заряжается»:
+	# проба bd — защита батареи на кабеле, 100%, ток −414…−522 мА, уровень уходит к 80%.
 	BAT_CUR_KNOWN=0
 	if [ -n "$BAT_CUR" ] && [ -f "$BMS/current_now" ]; then
 		BAT_CUR=$(( -BAT_CUR )); BAT_CUR_KNOWN=1
+	elif [ -n "$BAT_CUR" ] && [ -d "$R/sys/devices/platform/google,charger" ]; then
+		BAT_CUR_KNOWN=1
 	elif [ -n "$BAT_CUR" ]; then
 		case "$BAT_STATUS" in
 			Discharging) [ "$BAT_CUR" -gt 0 ] && BAT_CUR=$(( -BAT_CUR )) ;;
@@ -1667,7 +1671,16 @@ bat_modes() {
 	# Battery Defender (Pixel): сам ограничивает заряд, если телефон долго на
 	# зарядке в тепле. DISCONNECTED/CONNECTED — штатные состояния «не активен».
 	prop vendor.battery.defender.state; bd="$REPLY"
-	case "$bd" in ""|DISCONNECTED|CONNECTED) ;; *) modes="${modes:+$modes · }${YELLOW}защита батареи${NC} ${DIM}($bd)${NC}" ;; esac
+	case "$bd" in ""|DISCONNECTED|CONNECTED) bd="" ;; *) modes="${modes:+$modes · }${YELLOW}защита батареи${NC} ${DIM}($bd)${NC}" ;; esac
+	# [3.18] На Android 17 (Pixel 8 Pro) свойство при активной защите остаётся CONNECTED,
+	# и ни dumpsys battery, ни узлы bd_* драйвера её не выдают: решение принимает демон
+	# google_battery, а видно его только по уведомлению SystemUI с тегом battery_defender
+	# (проба bd). Смахнутое уведомление монитор не увидит.
+	if [ -z "$bd" ] && [ -d "$R/sys/devices/platform/google,charger" ]; then
+		jget notif_list cmd notification list
+		[[ "$REPLY" == *"|com.android.systemui|"*"|battery_defender|"* ]] &&
+			modes="${modes:+$modes · }${YELLOW}защита батареи${NC} ${DIM}(долго была тёплой на зарядке)${NC}"
+	fi
 	# [3.15.5] Энергосбережение — в конце строки, после подсказки режима зарядки,
 	# иначе «… · энергосбережение · включится при зарядке» читалось как про него.
 	local saver=""
@@ -4264,6 +4277,7 @@ prefetch() {
 		job sensors dumpsys sensorservice
 		job pkg_aicore dumpsys package com.google.android.aicore
 	fi
+	[ -d "$R/sys/devices/platform/google,charger" ] && job notif_list cmd notification list
 	job home cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME
 	job usagestats dumpsys usagestats
 	job pkg_mainline dumpsys package com.google.android.modulemetadata
